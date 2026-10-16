@@ -446,12 +446,16 @@ pub fn decodePayload(comptime T: type, bytes: []const u8) ?T {
     return copy;
 }
 
-/// Map 0..255 onto 0..2π and back (DESIGN.md §2, velocity/orientation).
+/// Map an angle in radians onto 0..255 (DESIGN.md §2, velocity/orientation).
 pub fn angleToByte(angle_rad: f32) u8 {
-    const wrapped = @mod(angle_rad, 2 * std.math.pi);
     const two_pi: f32 = 6.283185307179586476925286766559;
-    const turns = wrapped / two_pi;
-    return @as(u8, @intFromFloat(@round(turns * 256.0))) & 0xff;
+    if (!std.math.isFinite(angle_rad)) return 0;
+    const turns = @mod(angle_rad, two_pi) / two_pi;
+    // Round through a wide integer and mask afterwards: rounding a turn count
+    // just below one lands on exactly 256, and converting 256.0 straight to a
+    // u8 is out of bounds, so the mask has to happen after the conversion.
+    const scaled: i32 = @intFromFloat(@round(turns * 256.0));
+    return @as(u8, @intCast(scaled & 0xff));
 }
 
 pub fn byteToAngle(angle_byte: u8) f32 {
@@ -606,6 +610,26 @@ test "angle bytes wrap onto the full circle" {
     try std.testing.expect(@as(u8, 64) == angleToByte(half_pi) or
         @as(u8, 65) == angleToByte(half_pi));
     try std.testing.expectApproxEqAbs(half_pi, byteToAngle(64), 0.03);
+}
+
+test "angle bytes are total across the circle" {
+    // `atan2` feeds every direction an enemy can face into the encoder, so no
+    // in-range angle may panic. A turn count just under one rounds to 256,
+    // which overflowed the u8 conversion before the mask was applied.
+    try std.testing.expectEqual(@as(u8, 0), angleToByte(2 * std.math.pi - 0.0001));
+
+    // Every degree of a full turn, negatives included, round-trips within half
+    // a byte step (2π / 512 ≈ 0.012).
+    const two_pi = 2 * std.math.pi;
+    var degrees: i32 = -360;
+    while (degrees < 360) : (degrees += 1) {
+        const angle = @as(f32, @floatFromInt(degrees)) * (std.math.pi / 180.0);
+        const error_rad = @abs(byteToAngle(angleToByte(angle)) - @mod(angle, two_pi));
+        try std.testing.expect(error_rad < 0.05);
+    }
+
+    // A non-finite angle must not panic either.
+    try std.testing.expectEqual(@as(u8, 0), angleToByte(std.math.nan(f32)));
 }
 
 test "sink encodes integers little-endian and arrays verbatim" {
