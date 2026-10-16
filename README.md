@@ -146,11 +146,11 @@ quietly serving less than the DoD names.
 
 `zig build -Doptimize=ReleaseFast` then
 `shaped-haven-server --stress-enemies 1000 --stress-projectiles 500`, with the
-client's own `--frames 600 --verbose` run against it: a steady 136 fps, 20
+client's own `--frames 600 --verbose` run against it: a steady 138 fps, 20
 snapshots/second, no dropped or malformed frames, and every snapshot carrying
 exactly 1,000 enemies and 500 projectiles.
 
-The client *draws* somewhat fewer than that — 850–970 enemies and 340–460
+The client *draws* somewhat fewer than that — 845–950 enemies and 385–440
 projectiles over the run. That is the client's interpolation, not the server's
 load: it only draws an entity once two consecutive snapshots bracketing its
 render time both carry it, so an entity younger than the 100 ms interpolation
