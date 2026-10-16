@@ -9,6 +9,12 @@ const sim = @import("sim.zig");
 const wire = @import("wire.zig");
 const server = @import("server.zig");
 const net_opt = @import("net_opt.zig");
+const rng = @import("rng.zig");
+const spatial = @import("spatial.zig");
+const enemy = @import("enemy.zig");
+const weapon = @import("weapon.zig");
+const combat = @import("combat.zig");
+const bench = @import("bench.zig");
 
 test "all modules are reachable" {
     try std.testing.expectEqual(root.tick_hz, 60);
@@ -18,4 +24,10 @@ test "all modules are reachable" {
     try std.testing.expect(@sizeOf(server.Server) > 0);
     try std.testing.expect(@sizeOf(server.ClientConn) > 0);
     _ = net_opt.SetNoDelayError;
+    _ = rng.Rng.init(0);
+    try std.testing.expectEqual(spatial.cell_size, 4.0);
+    try std.testing.expect(enemy.implemented.len == 2);
+    try std.testing.expect(weapon.specs.len == 4);
+    try std.testing.expect(combat.max_hits_per_projectile >= 1);
+    try std.testing.expect(bench.default_enemies == 1000);
 }

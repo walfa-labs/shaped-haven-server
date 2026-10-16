@@ -25,6 +25,9 @@ pub const max_enemies: usize = 4096;
 pub const max_projectiles: usize = 2048;
 pub const max_gems: usize = 4096;
 
+/// Weapon slots per player (DESIGN.md §2 `weapons: [4]WeaponSlot`).
+pub const max_weapons: usize = 4;
+
 /// Number of simulation ticks between snapshots.
 pub const ticks_per_snapshot: u32 = tick_hz / snapshot_hz;
 
@@ -40,7 +43,10 @@ pub const player_max_hp: f32 = 100.0;
 /// `n` copies of `T`, with every field at its declared default (or zero).
 ///
 /// Used to initialize the fixed entity pools. The array-repeat operator is not
-/// available in this Zig toolchain, so this is the replacement.
+/// available in this Zig toolchain, so this is the replacement. Struct field
+/// defaults are evaluated at comptime, which is why the big flat arrays use
+/// `@splat` directly instead: filling 4096 elements one at a time blows the
+/// compiler's evaluation branch quota.
 pub fn filledWithDefault(comptime T: type, comptime n: usize) [n]T {
     var out: [n]T = undefined;
     for (0..n) |i| {

@@ -216,6 +216,42 @@ pub const GemNet = packed struct {
     reserved: u8,
 };
 
+/// `EnemyNet.archetype` values.
+///
+/// Neither PROTOCOL.md nor DESIGN.md fixes the numbering, so this repository
+/// chooses it and the client must agree: the order DESIGN.md §2 lists the
+/// archetypes in, which is shape-major (every circle tier, then every triangle
+/// tier, then the boss). Phase 2 emits only `circle_t1` and `triangle_t1`.
+pub const EnemyArchetype = enum(u8) {
+    circle_t1 = 0,
+    circle_t2 = 1,
+    circle_t3 = 2,
+    triangle_t1 = 3,
+    triangle_t2 = 4,
+    triangle_t3 = 5,
+    boss = 6,
+};
+
+/// `ProjNet.shape` values, in the order DESIGN.md §2 lists them.
+///
+/// `arc` is the instantaneous melee sweep: the damage is already applied when
+/// the record is emitted, and the record exists so the client can draw the
+/// swing. `circle` and `ray` are travelling projectiles that do the damage
+/// themselves, on the server, as they move.
+pub const ProjShape = enum(u8) {
+    arc = 0,
+    circle = 1,
+    ray = 2,
+};
+
+/// `ProjNet.weapon_id` values, in the order DESIGN.md §3 lists the weapons.
+pub const WeaponId = enum(u8) {
+    sword = 0,
+    axe = 1,
+    bow = 2,
+    gun = 3,
+};
+
 /// Quantization step for positions and velocities (DESIGN.md §2, PROTOCOL.md).
 pub const quant_step: f32 = 0.05;
 
