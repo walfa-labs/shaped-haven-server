@@ -27,13 +27,17 @@ Source layout:
 | --- | --- |
 | `root.zig` | Tick rate, entity caps and the other DESIGN.md constants. |
 | `wire.zig` | Protocol v1: framing, payload layouts, quantization, and the byte values for the enums PROTOCOL.md leaves open. |
-| `sim.zig` | The tick loop, the player pool and the player integrator. |
+| `sim.zig` | The tick loop, the player pool, the integrator and the level-up pause. |
 | `enemy.zig` | Enemy pool, Tier 1 archetypes, the spawn formula and the darter's AI. |
-| `weapon.zig` | The weapon table (DESIGN.md §3). |
-| `combat.zig` | Projectile pool, arc/circle hit detection, damage and knockback. |
+| `weapon.zig` | The weapon table: all four weapons across eight levels, plus the eight evolutions. |
+| `upgrade.zig` | The item id space, the ten passives, the eight evolutions, the five synergies, the XP curve, stat resolution and the level-up choice generator. |
+| `combat.zig` | Projectile pool, arc/circle/ray hit detection, damage, knockback and the projectile-level evolution effects. |
+| `evolve.zig` | The evolved weapons' lingering effects: ground rifts and Cryo Flechette shatters. |
+| `gem.zig` | The XP gem pool. |
 | `spatial.zig` | Uniform spatial hash grid used as the combat broadphase. |
 | `rng.zig` | Deterministic SplitMix64, so a run is reproducible from its seed. |
 | `server.zig` | TCP listener, per-connection threads, the 60 Hz wall-clock loop. |
+| `smoke.zig` | The phase-3 smoke test: one scripted run from gems to game over. |
 | `bench.zig` | The phase-2 load measurement. |
 
 The full design — entity fields, weapon/upgrade tables, escalation curves,
@@ -43,18 +47,22 @@ message list, phase plan — is in [DESIGN.md](DESIGN.md).
 
 Determinism depends on this order, so it is part of the contract:
 
-1. players integrate their input;
-2. enemies run their AI, integrate, and are clamped to the arena;
+1. players integrate their input, and regen/timers tick;
+2. enemies run their AI (slowed or frozen), integrate, and are clamped to the arena;
 3. the broadphase grid is rebuilt from the enemies' new positions;
-4. every ready weapon acquires the nearest enemy and fires;
+4. every ready weapon fires — resolved through the loadout, with the evolution and synergy effects;
 5. projectiles travel and resolve what they overlap;
-6. enemies touching a player deal contact damage;
-7. dead enemies and spent projectiles are compacted out of their pools;
-8. once a second, the spawn formula is evaluated.
+6. enemies touching a player deal contact damage, reduced by armor and absorbed by shield;
+7. dead enemies drop a gem; dead enemies and spent projectiles are compacted;
+8. gems magnetize, fly, and are collected, awarding XP;
+9. ground rifts damage what stands in them and expire;
+10. a filled XP bar pauses the run and offers three choices;
+11. once a second, the spawn formula is evaluated.
 
 Nothing moves between step 3 and step 7 except knockback *velocity*, so every
 grid query in a tick sees a consistent set of indices and the pools are
-compacted once, at the end.
+compacted once, at the end. `reapDead` compacts the enemy pool, so the grid is
+rebuilt again before the Cryo Flechette shatter query reads it.
 
 ### Protocol values this repository had to choose
 
@@ -71,6 +79,17 @@ meaning of their enum bytes. This repository chooses:
 instantaneously through a sector test and then emit a short-lived, non-colliding
 ARC record so the client can draw the swing. CIRCLE and RAY are travelling
 projectiles that damage what they overlap as they move.
+
+### Choices DESIGN.md and PROTOCOL.md left open
+
+| Question | Choice |
+| --- | --- |
+| Does an evolution consume its passive? | No. The fusion replaces the weapon slot's item id with the evolution's and keeps the passive, so the passive can still arm a synergy. DESIGN.md §3 says nothing about consuming it, and consuming it would make the evolution a downgrade for synergy builds. |
+| How are the three choices weighted? | Levelling a held weapon or passive 4, a new weapon or passive 3, an evolution 2, Overclock 1. Drawn three at a time, distinct, without replacement. |
+| When is Overclock offered? | Only when all four weapon slots are filled *and* at level 8, and every held passive is at its max. An empty weapon slot is itself something left to fill, so it blocks the fallback. |
+| How does a scripted client pick an option? | `C2S_LEVELUP_CHOICE` carries the `event_id` from the offer and a `choice_idx` of 0..2; the server ignores a stale or repeated event. |
+| Is XP pooled across the party? | No — per player, in phase 3. DESIGN.md §5's party-pooled XP and the synchronised party pause are phase 5. |
+| What does a restart reset? | The whole run: the world, the tick counter and every connected player. Phase 3 is single-player; a per-player restart is phase 5. |
 
 ## Requirements
 
@@ -113,14 +132,41 @@ joins, so even the first snapshot a client receives carries the full load.
 
 ## Status
 
-Phase 2 — combat core. The server simulates the four level 1 weapons of
-DESIGN.md §3, the two Tier 1 enemies and spawn curve of §4, and arc/circle hit
-detection with pierce and knockback over a uniform spatial hash grid. The
-snapshot's existing enemy and projectile arrays are filled; the wire format
-itself is unchanged from phase 1.
+Phase 3 — XP, level-up and the upgrade engine. The server simulates the phase-2
+combat core plus the whole upgrade system of DESIGN.md §3:
 
-Verified: `zig build test` — 115 tests pass. `zig build test
--Doptimize=ReleaseFast` — 115 pass.
+- **XP gems.** Every enemy drops a gem worth its tier's XP on death; a gem is
+  magnetized when a player comes inside that player's pickup radius, flies in,
+  and is collected for XP. The Magnet Array passive scales the radius.
+- **The XP curve and the level-up.** `XP(L) = floor(10 + 5L + 1.5L²)`. A filled
+  bar pauses the run (`game_state = 1`), offers three weighted choices and
+  waits for `C2S_LEVELUP_CHOICE`, auto-selecting option 0 after 15 s.
+- **A real stat-resolution layer.** All ten passives and all four weapons'
+  eight-level tables change what the combat code does: damage, area, cooldown,
+  projectile speed, lifetime, projectile count, pickup radius, move speed,
+  armor, regen, and the per-level breakpoints (the sword's rear slash, the
+  axe's knockback and double hit, the bow's ricochet, the gun's explosive
+  rounds).
+- **Eight evolutions**, each a level-8 weapon fused with its named passive, and
+  **five synergies**, each active when both items reach level 3.
+- **Unlimited progression.** Once every held weapon and passive is maxed, the
+  three repeatable Overclock upgrades (global damage, attack speed, max HP)
+  take over with no cap.
+- **Death and restart.** HP reaching 0 ends the run (`game_state = 2` plus
+  `S2C_GAME_OVER`); `C2S_RESTART` starts a fresh run.
+- **`S2C_LOADOUT`** whenever level, XP or the item set changes.
+
+Verified: `zig build test` — 169 tests pass. `zig build test
+-Doptimize=ReleaseFast` — 169 pass.
+
+### The phase-3 smoke test
+
+`smoke.test.phase 3 smoke: a full run from gems to game over` drives the real
+`Simulation` API through the whole definition of done in one scripted run:
+enemies spawn and die, XP is collected, an upgrade is offered and applied, all
+eight evolutions trigger, all five synergies arm and fire, the difficulty
+escalates without bound, and the run ends at 0 HP and restarts. It lives in
+`src/smoke.zig` and runs as part of `zig build test`.
 
 ### The phase-2 load measurement
 
@@ -132,8 +178,8 @@ build the server ships at. Both are quoted so the two are not confused:
 
 | Build | Command | Mean | Worst |
 | --- | --- | --- | --- |
-| ReleaseFast | `zig build test -Doptimize=ReleaseFast` | 0.033 ms/tick | 0.06 – 0.15 ms/tick |
-| Debug | `zig build test` | 0.33 ms/tick | 0.5 – 0.7 ms/tick |
+| ReleaseFast | `zig build test -Doptimize=ReleaseFast` | 0.052 ms/tick | 0.17 ms/tick |
+| Debug | `zig build test` | 0.585 ms/tick | 0.99 ms/tick |
 
 Both over 240 ticks with 1,000 enemies and 500 projectiles live, measured on
 this machine. The mean is stable; the worst tick is a single sample and moves
@@ -141,6 +187,12 @@ around between runs, so it is quoted as a range. The benchmark asserts that
 the load it measured *was* that load — the mean live counts over the run must
 equal the requested ones — so the number cannot come from a run that was
 quietly serving less than the DoD names.
+
+Phase 3 made the benchmark hold the player's level and HP: the load's own
+weapons kill stressed enemies, so gems drop and the run would pause on a
+level-up, and a thousand enemies swarming the player would kill it. A paused or
+over tick measures nothing, so both are pinned out of the way and the number is
+again the sustained cost of the load the DoD names.
 
 ### Against a real client
 
@@ -160,8 +212,7 @@ replaced — so there is always a fraction too young to draw. The counts the
 server puts on the wire are exact; the counts a client renders are a
 consequence of its own delay.
 
-Deliberately not in this phase (DESIGN.md §6 puts them later): XP gems and
-pickups, upgrades, level-ups, evolutions, boss and elite enemies, floating
-damage numbers, and player death. Enemy contact damage floors a player's HP at
-1 so a run cannot end yet.
+Deliberately not in this phase (DESIGN.md §6 puts them later): the Tier 2 and
+Tier 3 enemies, the elite modifiers and the boss of §4, and `S2C_SNAPSHOT_DELTA`
+(phase 4). The upgrade system, the XP gems and player death are all in.
 

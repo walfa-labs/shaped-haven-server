@@ -89,6 +89,13 @@ pub fn run(
 
     const player = s.spawnPlayer(0).?;
     player.pos = .{ 0.0, 0.0 };
+    // The load is what is being measured, not the level curve or the death
+    // rule: the player's weapons kill stressed enemies, so gems drop and the
+    // run would pause on a level-up, and 1000 enemies swarming it would kill
+    // it — and a paused or over tick measures nothing.
+    player.xp_next = std.math.maxInt(u32);
+    player.max_hp = 1.0e9;
+    player.hp = 1.0e9;
 
     topUp(s, want_enemies, want_projectiles);
 
