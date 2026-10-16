@@ -14,6 +14,9 @@ const spatial = @import("spatial.zig");
 const enemy = @import("enemy.zig");
 const weapon = @import("weapon.zig");
 const combat = @import("combat.zig");
+const upgrade = @import("upgrade.zig");
+const gem = @import("gem.zig");
+const evolve = @import("evolve.zig");
 const bench = @import("bench.zig");
 
 test "all modules are reachable" {
@@ -30,4 +33,11 @@ test "all modules are reachable" {
     try std.testing.expect(weapon.specs.len == 4);
     try std.testing.expect(combat.max_hits_per_projectile >= 1);
     try std.testing.expect(bench.default_enemies == 1000);
+    try std.testing.expectEqual(@as(usize, 10), upgrade.passive_table.len);
+    try std.testing.expectEqual(@as(usize, 8), upgrade.evolutions.len);
+    try std.testing.expectEqual(@as(usize, 5), upgrade.synergies.len);
+    try std.testing.expectEqual(@as(u16, 16), upgrade.xpForLevel(1));
+    try std.testing.expectEqual(gem.small_xp, 2);
+    try std.testing.expectEqual(@as(usize, 64), root.max_rifts);
+    try std.testing.expect(@sizeOf(evolve.RiftPool) > 0);
 }

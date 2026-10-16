@@ -189,6 +189,22 @@ pub const Pool = struct {
     radius: [root.max_enemies]f32 = @splat(0.0),
     contact_dmg: [root.max_enemies]f32 = @splat(0.0),
     move_speed: [root.max_enemies]f32 = @splat(0.0),
+    /// Vulcan Minigun: multiplier on damage taken (1.0 = no debuff).
+    debuff_mult: [root.max_enemies]f32 = @splat(1.0),
+    /// Cryo Flechette: ticks of slow left, and the speed factor while slowed.
+    slow_ticks: [root.max_enemies]u16 = @splat(0),
+    slow_factor: [root.max_enemies]f32 = @splat(1.0),
+    /// Cryo Flechette: slow stacks, and ticks of freeze once the stacks land.
+    cryo_stacks: [root.max_enemies]u8 = @splat(0),
+    freeze_ticks: [root.max_enemies]u16 = @splat(0),
+    /// Target Painter: ticks of mark left by a Gun hit (DESIGN.md §3).
+    marked_ticks: [root.max_enemies]u16 = @splat(0),
+    /// Enemies that died while frozen, queued for Cryo Flechette's shatter
+    /// (DESIGN.md §3). `sim.zig` drains this after `reapDead`.
+    shatter_pos: [root.max_enemies][2]f32 = @splat(.{ 0.0, 0.0 }),
+    shatter_radius: [root.max_enemies]f32 = @splat(0.0),
+    shatter_damage: [root.max_enemies]f32 = @splat(0.0),
+    shatter_count: usize = 0,
 
     /// Reserve a slot. Returns `null` when the pool is full or the archetype is
     /// not implemented in this phase — a full pool must degrade, not crash.
@@ -212,6 +228,11 @@ pub const Pool = struct {
         self.radius[i] = s.radius;
         self.contact_dmg[i] = s.contact_dmg;
         self.move_speed[i] = s.move_speed;
+        self.debuff_mult[i] = 1.0;
+        self.slow_ticks[i] = 0;
+        self.slow_factor[i] = 1.0;
+        self.cryo_stacks[i] = 0;
+        self.freeze_ticks[i] = 0;
         self.count += 1;
         return i;
     }
@@ -226,7 +247,13 @@ pub const Pool = struct {
         if (i != last) {
             inline for (@typeInfo(Pool).@"struct".field_names) |name| {
                 if (comptime !std.mem.eql(u8, name, "count") and
-                    !std.mem.eql(u8, name, "next_id"))
+                    !std.mem.eql(u8, name, "next_id") and
+                    !std.mem.eql(u8, name, "shatter_count") and
+                    // The shatter queue is indexed by its own count, not by
+                    // the entity slot, so it must not follow a swap.
+                    !std.mem.eql(u8, name, "shatter_pos") and
+                    !std.mem.eql(u8, name, "shatter_radius") and
+                    !std.mem.eql(u8, name, "shatter_damage"))
                 {
                     @field(self, name)[i] = @field(self, name)[last];
                 }
@@ -236,11 +263,21 @@ pub const Pool = struct {
     }
 
     /// Compact away every enemy at or below zero HP. Returns the kill count.
+    ///
+    /// An enemy that dies while frozen is queued for Cryo Flechette's shatter
+    /// (DESIGN.md §3); `sim.zig` drains `shatter_*` after this returns.
     pub fn reapDead(self: *Pool) usize {
         var killed: usize = 0;
         var i: usize = 0;
         while (i < self.count) {
             if (self.hp[i] <= 0.0) {
+                if (self.freeze_ticks[i] > 0 and self.shatter_count < root.max_enemies) {
+                    const k = self.shatter_count;
+                    self.shatter_pos[k] = self.pos[i];
+                    self.shatter_radius[k] = 3.0;
+                    self.shatter_damage[k] = 120.0;
+                    self.shatter_count += 1;
+                }
                 self.swapRemove(i);
                 killed += 1;
             } else {
@@ -252,8 +289,11 @@ pub const Pool = struct {
 
     /// Apply `amount` damage and `impulse` knockback along `dir`. Returns true
     /// when this hit killed the enemy.
+    ///
+    /// The Vulcan Minigun's stacking debuff multiplies the damage taken, so a
+    /// debuffed enemy takes more than the raw amount.
     pub fn applyHit(self: *Pool, i: usize, amount: f32, dir: [2]f32, impulse: f32) bool {
-        self.hp[i] -= amount;
+        self.hp[i] -= amount * self.debuff_mult[i];
         self.kb[i][0] += dir[0] * impulse;
         self.kb[i][1] += dir[1] * impulse;
         return self.hp[i] <= 0.0;

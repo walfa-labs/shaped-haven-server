@@ -28,6 +28,18 @@ pub const max_gems: usize = 4096;
 /// Weapon slots per player (DESIGN.md §2 `weapons: [4]WeaponSlot`).
 pub const max_weapons: usize = 4;
 
+/// Passive slots per player (DESIGN.md §2 `passives: [10]u8`).
+pub const max_passives: usize = 10;
+
+/// Live ground rifts a Gravity Cleaver sweep can leave at once.
+pub const max_rifts: usize = 64;
+
+/// Highest weapon level (DESIGN.md §3: eight levels per weapon).
+pub const max_weapon_level: u8 = 8;
+
+/// Base XP gem pickup radius in world units (DESIGN.md §1).
+pub const xp_pickup_radius: f32 = 3.0;
+
 /// Number of simulation ticks between snapshots.
 pub const ticks_per_snapshot: u32 = tick_hz / snapshot_hz;
 
@@ -48,10 +60,23 @@ pub const player_max_hp: f32 = 100.0;
 /// `@splat` directly instead: filling 4096 elements one at a time blows the
 /// compiler's evaluation branch quota.
 pub fn filledWithDefault(comptime T: type, comptime n: usize) [n]T {
+    @setEvalBranchQuota(20000);
     var out: [n]T = undefined;
     for (0..n) |i| {
         out[i] = std.mem.zeroInit(T, .{});
     }
+    return out;
+}
+
+/// `n` copies of a comptime-known `value`.
+///
+/// Cheaper than `filledWithDefault` for a type whose `zeroInit` walks a large
+/// field list, because it copies one value rather than evaluating every field's
+/// default.
+pub fn repeated(comptime T: type, comptime n: usize, comptime value: T) [n]T {
+    @setEvalBranchQuota(20000);
+    var out: [n]T = undefined;
+    for (0..n) |i| out[i] = value;
     return out;
 }
 
