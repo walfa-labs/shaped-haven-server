@@ -535,7 +535,7 @@ test "a bow arrow pierces two enemies and then stops" {
     for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.bow)).?;
-    const arrow = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
+    try std.testing.expect(projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }) != null);
 
     const dt = 1.0 / 60.0;
     var ticks: usize = 0;
@@ -550,7 +550,6 @@ test "a bow arrow pierces two enemies and then stops" {
     // The third was never reached: the arrow was spent after two hits.
     try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[third], 1e-5);
     try std.testing.expectEqual(@as(usize, 0), projectiles.count);
-    _ = arrow;
 }
 
 test "a projectile that never hits expires on its lifetime" {

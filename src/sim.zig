@@ -222,13 +222,13 @@ pub const Simulation = struct {
             if (requested_slot >= root.max_players) return null;
             if (self.players[requested_slot].active) return null;
             self.players[requested_slot].active = true;
-            self.equipStarterWeapons(&self.players[requested_slot]);
+            equipStarterWeapons(&self.players[requested_slot]);
             return &self.players[requested_slot];
         }
         for (&self.players) |*p| {
             if (!p.active) {
                 p.active = true;
-                self.equipStarterWeapons(p);
+                equipStarterWeapons(p);
                 return p;
             }
         }
@@ -238,8 +238,7 @@ pub const Simulation = struct {
     /// Give a joining player the four level 1 weapons of DESIGN.md §3.
     ///
     /// Cooldowns start at zero, so all four fire on the player's first tick.
-    fn equipStarterWeapons(self: *Simulation, p: *PlayerState) void {
-        _ = self;
+    fn equipStarterWeapons(p: *PlayerState) void {
         p.weapons = root.filledWithDefault(WeaponSlot, root.max_weapons);
         for (&p.weapons, 0..) |*slot, i| {
             slot.id = @intCast(i);

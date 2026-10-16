@@ -348,6 +348,20 @@ pub const Server = struct {
 
     /// Encode one snapshot and queue it on every connection that wants it.
     fn broadcast(self: *Server) void {
+        // Encoding for nobody is worth avoiding: a snapshot carrying a thousand
+        // enemies is around 18 KB, and a client that has dropped mid-run would
+        // otherwise leave the server allocating and freeing one every 50 ms.
+        self.lock();
+        var wanted = false;
+        for (self.clients.items) |conn| {
+            if (receivesSnapshots(conn)) {
+                wanted = true;
+                break;
+            }
+        }
+        self.unlock();
+        if (!wanted) return;
+
         const bytes = wire.encodeSnapshotFull(self.gpa, self.sim.snapshotView()) catch |e| {
             std.debug.print("[server] error: could not encode snapshot: {s}\n", .{@errorName(e)});
             return;

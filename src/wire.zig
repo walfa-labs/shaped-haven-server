@@ -705,3 +705,24 @@ test "entity net records are fixed size" {
     try std.testing.expectEqual(@as(usize, 12), wireSize(ProjNet));
     try std.testing.expectEqual(@as(usize, 12), wireSize(GemNet));
 }
+
+test "the enum byte values PROTOCOL.md leaves open are the documented ones" {
+    // These are the values the client has to agree with; changing one is a
+    // protocol change, so the assertion is deliberately by number.
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(EnemyArchetype.circle_t1));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(EnemyArchetype.circle_t2));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(EnemyArchetype.circle_t3));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(EnemyArchetype.triangle_t1));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(EnemyArchetype.triangle_t2));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(EnemyArchetype.triangle_t3));
+    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(EnemyArchetype.boss));
+
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ProjShape.arc));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ProjShape.circle));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ProjShape.ray));
+
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(WeaponId.sword));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(WeaponId.axe));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(WeaponId.bow));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(WeaponId.gun));
+}

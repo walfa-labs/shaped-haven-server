@@ -117,10 +117,12 @@ detection with pierce and knockback over a uniform spatial hash grid. The
 snapshot's existing enemy and projectile arrays are filled; the wire format
 itself is unchanged from phase 1.
 
-Verified: `zig build test` — 106 tests pass. `zig build test
--Doptimize=ReleaseFast` — 106 pass, and the phase-2 load measurement reports
-**0.030 ms/tick mean (0.115 ms worst) over 240 ticks with 1,000 enemies and 500
-projectiles live**, against the 4.0 ms budget DESIGN.md §6 sets.
+Verified: `zig build test` — 107 tests pass. `zig build test
+-Doptimize=ReleaseFast` — 107 pass, and the phase-2 load measurement reports
+**0.031 ms/tick mean (0.44 ms worst) over 240 ticks with 1,000 enemies and 500
+projectiles live**, against the 4.0 ms budget DESIGN.md §6 sets. Against a real
+client over loopback the same load is served at a steady 20 snapshots/second
+with no drops.
 
 Deliberately not in this phase (DESIGN.md §6 puts them later): XP gems and
 pickups, upgrades, level-ups, evolutions, boss and elite enemies, floating
