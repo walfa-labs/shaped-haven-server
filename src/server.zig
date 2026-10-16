@@ -1519,6 +1519,26 @@ const TestClient = struct {
         try std.Io.Writer.flush(&self.writer.interface);
     }
 
+    /// Send a `C2S_LEVELUP_CHOICE` for `event_id`.
+    fn levelupChoice(self: *TestClient, event_id: u16, choice_idx: u8) !void {
+        var payload = wire.Sink.init();
+        defer payload.deinit(self.gpa);
+        try payload.leU16(self.gpa, event_id);
+        try payload.byte(self.gpa, choice_idx);
+        const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_levelup_choice, payload.bytes(), 0);
+        defer self.gpa.free(frame);
+        try self.writer.interface.writeAll(frame);
+        try std.Io.Writer.flush(&self.writer.interface);
+    }
+
+    /// Send a `C2S_RESTART`.
+    fn restart(self: *TestClient) !void {
+        const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_restart, &.{}, 0);
+        defer self.gpa.free(frame);
+        try self.writer.interface.writeAll(frame);
+        try std.Io.Writer.flush(&self.writer.interface);
+    }
+
     /// Read one complete frame. Bounded to the bytes still needed: `readVec`
     /// will happily return more than asked for, and a read that runs past the
     /// frame boundary would consume the next frame's bytes and lose them.
@@ -1800,4 +1820,96 @@ test "a client that stops reading cannot stall the tick" {
     // every third tick. Two seconds is a generous ceiling that a blocked socket
     // write would blow straight through.
     try std.testing.expect(elapsed_ms < 2000);
+}
+
+test "a level-up offer goes out, the choice is applied, and the loadout follows" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [2048]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    // The handshake also queued an immediate full snapshot and a loadout.
+    _ = try client.readFrame(&got);
+    _ = try client.readFrame(&got);
+
+    // Fill the XP bar; the next step offers the level-up and pauses.
+    loop.server.sim.players[0].xp = loop.server.sim.players[0].xp_next;
+    loop.server.step();
+    try std.testing.expectEqual(sim.GameState.level_up_pause, loop.server.sim.state);
+
+    const offer = try client.expectFrame(&got, wire.msg.s2c_levelup_offer, 8);
+    const ev = wire.decodePayload(wire.LevelupOffer, offer[wire.header_size..]).?;
+    try std.testing.expectEqual(@as(u16, 2), ev.new_level);
+    // Three distinct options.
+    try std.testing.expect(ev.opt0_item_id != ev.opt1_item_id);
+    try std.testing.expect(ev.opt1_item_id != ev.opt2_item_id);
+    try std.testing.expect(ev.opt0_item_id != ev.opt2_item_id);
+
+    // Answer it, and the run resumes with the loadout the HUD needs.
+    try client.levelupChoice(ev.event_id, 0);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    try std.testing.expectEqual(sim.GameState.running, loop.server.sim.state);
+
+    const loadout = try client.expectFrame(&got, wire.msg.s2c_loadout, 8);
+    const l = wire.decodePayload(wire.Loadout, loadout[wire.header_size..]).?;
+    try std.testing.expectEqual(@as(u16, 2), l.level);
+    try std.testing.expect(l.weapon_count > 0);
+}
+
+test "game over goes out, and a restart returns to a running game" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x5678);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [2048]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got);
+    _ = try client.readFrame(&got);
+
+    // One swarmer on top of a 1 HP player ends the run.
+    loop.server.sim.players[0].hp = 1.0;
+    _ = loop.server.sim.enemies.spawn(.circle_t1, .{ 0.6, 0.0 }).?;
+    var ticks: usize = 0;
+    while (loop.server.sim.state != .game_over and ticks < 600) : (ticks += 1) {
+        loop.server.step();
+    }
+    try std.testing.expectEqual(sim.GameState.game_over, loop.server.sim.state);
+    try std.testing.expect(!loop.server.sim.players[0].flags.alive);
+
+    const over = try client.expectFrame(&got, wire.msg.s2c_game_over, 8);
+    const go = wire.decodePayload(wire.GameOver, over[wire.header_size..]).?;
+    try std.testing.expect(go.final_tick > 0);
+    try std.testing.expect(go.score > 0);
+
+    // Restart: the run is fresh and the snapshot says so.
+    try client.restart();
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    try std.testing.expectEqual(sim.GameState.running, loop.server.sim.state);
+    try std.testing.expect(loop.server.sim.players[0].flags.alive);
+    try std.testing.expectEqual(@as(u16, 1), loop.server.sim.players[0].level);
+    try std.testing.expectEqual(@as(usize, 0), loop.server.sim.enemies.count);
+
+    const view = loop.server.sim.snapshotView();
+    try std.testing.expectEqual(@as(u8, @intFromEnum(sim.GameState.running)), view.game_state);
 }
