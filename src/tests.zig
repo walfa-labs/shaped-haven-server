@@ -18,6 +18,7 @@ const upgrade = @import("upgrade.zig");
 const gem = @import("gem.zig");
 const evolve = @import("evolve.zig");
 const bench = @import("bench.zig");
+const smoke = @import("smoke.zig");
 
 test "all modules are reachable" {
     try std.testing.expectEqual(root.tick_hz, 60);
@@ -40,4 +41,6 @@ test "all modules are reachable" {
     try std.testing.expectEqual(gem.small_xp, 2);
     try std.testing.expectEqual(@as(usize, 64), root.max_rifts);
     try std.testing.expect(@sizeOf(evolve.RiftPool) > 0);
+    try std.testing.expectEqual(sim.levelup_timeout_ticks, 15 * 60);
+    _ = smoke;
 }

@@ -702,7 +702,10 @@ pub const Simulation = struct {
 
         // Cross-Slash Mastery: every third axe sweep resets the sword's
         // cooldown and grants +50% reach to its next attack.
-        if (p.synergy_mask & upgrade.synergy_cross_slash != 0 and spec_mut.id == upgrade.ids.axe) {
+        // An evolved axe is still an axe, so the check is on the base weapon.
+        if (p.synergy_mask & upgrade.synergy_cross_slash != 0 and
+            upgrade.baseWeaponId(spec_mut.id) == upgrade.ids.axe)
+        {
             p.axe_swings +%= 1;
             if (p.axe_swings % 3 == 0) {
                 if (upgrade.weaponSlot(&p.weapons, upgrade.ids.sword)) |si| {
@@ -711,7 +714,9 @@ pub const Simulation = struct {
                 p.sword_reach_bonus = 0.5;
             }
         }
-        if (p.sword_reach_bonus > 0.0 and spec_mut.id == upgrade.ids.sword) {
+        if (p.sword_reach_bonus > 0.0 and
+            upgrade.baseWeaponId(spec_mut.id) == upgrade.ids.sword)
+        {
             spec_mut.reach *= 1.0 + p.sword_reach_bonus;
             p.sword_reach_bonus = 0.0;
         }
