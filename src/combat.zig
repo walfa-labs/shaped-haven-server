@@ -534,7 +534,7 @@ test "an arc fires once, damages the whole sector, and leaves a record behind" {
     const front_b = enemies.spawn(.circle_t1, .{ 2.5, 1.0 }).?;
     const front_far = enemies.spawn(.circle_t1, .{ 9.0, 0.0 }).?;
     const behind = enemies.spawn(.circle_t1, .{ -1.0, 0.0 }).?;
-    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.sword)).?;
     const hits = fireArc(&enemies, &grid, &projectiles, 0, spec, .{ 0, 0 }, .{ 1, 0 }, &scratch);
@@ -565,7 +565,7 @@ test "the axe reaches further and hits a wider sector than the sword" {
     const a = @as(f32, 60.0) * std.math.pi / 180.0;
     const p = [2]f32{ @cos(a) * 4.5, @sin(a) * 4.5 };
     const target = enemies.spawn(.circle_t1, p).?;
-    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const sword = weapon.spec(@intFromEnum(weapon.Id.sword)).?;
     try std.testing.expectEqual(@as(usize, 0), fireArc(&enemies, &grid, &projectiles, 0, sword, .{ 0, 0 }, .{ 1, 0 }, &scratch));
@@ -583,7 +583,7 @@ test "a gun bullet damages one enemy, is spent, and cannot hit it twice" {
     var scratch: [64]u32 = undefined;
 
     const target = enemies.spawn(.circle_t1, .{ 1.0, 0.0 }).?;
-    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
     _ = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
@@ -612,7 +612,7 @@ test "a bow arrow pierces two enemies and then stops" {
     const first = enemies.spawn(.circle_t1, .{ 1.0, 0.0 }).?;
     const second = enemies.spawn(.circle_t1, .{ 3.0, 0.0 }).?;
     const third = enemies.spawn(.circle_t1, .{ 5.0, 0.0 }).?;
-    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.bow)).?;
     try std.testing.expect(projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }) != null);
@@ -645,7 +645,7 @@ test "a limited-pierce arc spends its pierce on the nearest enemy in the sector"
     const near = enemies.spawn(.circle_t1, .{ 1.0, 0.0 }).?;
     const mid = enemies.spawn(.circle_t1, .{ 2.0, 0.0 }).?;
     const far = enemies.spawn(.circle_t1, .{ 3.0, 0.0 }).?;
-    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     var spec = weapon.spec(@intFromEnum(weapon.Id.sword)).?;
     spec.pierce = 1;
@@ -672,7 +672,7 @@ test "a limited-pierce projectile spends its pierce on the enemies it reaches fi
     const near = enemies.spawn(.circle_t1, .{ 0.8, 0.0 }).?;
     const mid = enemies.spawn(.circle_t1, .{ 1.3, 0.0 }).?;
     const far = enemies.spawn(.circle_t1, .{ 1.45, 0.0 }).?;
-    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.bow)).?;
     _ = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
@@ -762,7 +762,7 @@ test "nearestEnemy picks the closest candidate inside the range" {
     _ = enemies.spawn(.circle_t1, .{ 30.0, 0.0 }).?;
     const near = enemies.spawn(.circle_t1, .{ 2.0, 2.0 }).?;
     _ = enemies.spawn(.circle_t1, .{ -9.0, 0.0 }).?;
-    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     try std.testing.expectEqual(near, nearestEnemy(&grid, &enemies, .{ 0, 0 }, 45.0, &scratch).?);
     // Nothing within 1 unit.
