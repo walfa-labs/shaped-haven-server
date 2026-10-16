@@ -99,6 +99,10 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
             .target = target,
+            // Wired in so `zig build test -Doptimize=ReleaseFast` measures the
+            // load benchmark at the speed the server actually ships at; Debug
+            // keeps its safety checks and is an order of magnitude slower.
+            .optimize = optimize,
         }),
     });
 

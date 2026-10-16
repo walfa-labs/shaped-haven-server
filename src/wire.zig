@@ -216,6 +216,42 @@ pub const GemNet = packed struct {
     reserved: u8,
 };
 
+/// `EnemyNet.archetype` values.
+///
+/// Neither PROTOCOL.md nor DESIGN.md fixes the numbering, so this repository
+/// chooses it and the client must agree: the order DESIGN.md §2 lists the
+/// archetypes in, which is shape-major (every circle tier, then every triangle
+/// tier, then the boss). Phase 2 emits only `circle_t1` and `triangle_t1`.
+pub const EnemyArchetype = enum(u8) {
+    circle_t1 = 0,
+    circle_t2 = 1,
+    circle_t3 = 2,
+    triangle_t1 = 3,
+    triangle_t2 = 4,
+    triangle_t3 = 5,
+    boss = 6,
+};
+
+/// `ProjNet.shape` values, in the order DESIGN.md §2 lists them.
+///
+/// `arc` is the instantaneous melee sweep: the damage is already applied when
+/// the record is emitted, and the record exists so the client can draw the
+/// swing. `circle` and `ray` are travelling projectiles that do the damage
+/// themselves, on the server, as they move.
+pub const ProjShape = enum(u8) {
+    arc = 0,
+    circle = 1,
+    ray = 2,
+};
+
+/// `ProjNet.weapon_id` values, in the order DESIGN.md §3 lists the weapons.
+pub const WeaponId = enum(u8) {
+    sword = 0,
+    axe = 1,
+    bow = 2,
+    gun = 3,
+};
+
 /// Quantization step for positions and velocities (DESIGN.md §2, PROTOCOL.md).
 pub const quant_step: f32 = 0.05;
 
@@ -410,12 +446,16 @@ pub fn decodePayload(comptime T: type, bytes: []const u8) ?T {
     return copy;
 }
 
-/// Map 0..255 onto 0..2π and back (DESIGN.md §2, velocity/orientation).
+/// Map an angle in radians onto 0..255 (DESIGN.md §2, velocity/orientation).
 pub fn angleToByte(angle_rad: f32) u8 {
-    const wrapped = @mod(angle_rad, 2 * std.math.pi);
     const two_pi: f32 = 6.283185307179586476925286766559;
-    const turns = wrapped / two_pi;
-    return @as(u8, @intFromFloat(@round(turns * 256.0))) & 0xff;
+    if (!std.math.isFinite(angle_rad)) return 0;
+    const turns = @mod(angle_rad, two_pi) / two_pi;
+    // Round through a wide integer and mask afterwards: rounding a turn count
+    // just below one lands on exactly 256, and converting 256.0 straight to a
+    // u8 is out of bounds, so the mask has to happen after the conversion.
+    const scaled: i32 = @intFromFloat(@round(turns * 256.0));
+    return @as(u8, @intCast(scaled & 0xff));
 }
 
 pub fn byteToAngle(angle_byte: u8) f32 {
@@ -572,6 +612,26 @@ test "angle bytes wrap onto the full circle" {
     try std.testing.expectApproxEqAbs(half_pi, byteToAngle(64), 0.03);
 }
 
+test "angle bytes are total across the circle" {
+    // `atan2` feeds every direction an enemy can face into the encoder, so no
+    // in-range angle may panic. A turn count just under one rounds to 256,
+    // which overflowed the u8 conversion before the mask was applied.
+    try std.testing.expectEqual(@as(u8, 0), angleToByte(2 * std.math.pi - 0.0001));
+
+    // Every degree of a full turn, negatives included, round-trips within half
+    // a byte step (2π / 512 ≈ 0.012).
+    const two_pi = 2 * std.math.pi;
+    var degrees: i32 = -360;
+    while (degrees < 360) : (degrees += 1) {
+        const angle = @as(f32, @floatFromInt(degrees)) * (std.math.pi / 180.0);
+        const error_rad = @abs(byteToAngle(angleToByte(angle)) - @mod(angle, two_pi));
+        try std.testing.expect(error_rad < 0.05);
+    }
+
+    // A non-finite angle must not panic either.
+    try std.testing.expectEqual(@as(u8, 0), angleToByte(std.math.nan(f32)));
+}
+
 test "sink encodes integers little-endian and arrays verbatim" {
     const gpa = std.testing.allocator;
     var s = Sink.init();
@@ -668,4 +728,25 @@ test "entity net records are fixed size" {
     try std.testing.expectEqual(@as(usize, 12), wireSize(EnemyNet));
     try std.testing.expectEqual(@as(usize, 12), wireSize(ProjNet));
     try std.testing.expectEqual(@as(usize, 12), wireSize(GemNet));
+}
+
+test "the enum byte values PROTOCOL.md leaves open are the documented ones" {
+    // These are the values the client has to agree with; changing one is a
+    // protocol change, so the assertion is deliberately by number.
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(EnemyArchetype.circle_t1));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(EnemyArchetype.circle_t2));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(EnemyArchetype.circle_t3));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(EnemyArchetype.triangle_t1));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(EnemyArchetype.triangle_t2));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(EnemyArchetype.triangle_t3));
+    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(EnemyArchetype.boss));
+
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ProjShape.arc));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ProjShape.circle));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ProjShape.ray));
+
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(WeaponId.sword));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(WeaponId.axe));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(WeaponId.bow));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(WeaponId.gun));
 }

@@ -348,6 +348,20 @@ pub const Server = struct {
 
     /// Encode one snapshot and queue it on every connection that wants it.
     fn broadcast(self: *Server) void {
+        // Encoding for nobody is worth avoiding: a snapshot carrying a thousand
+        // enemies is around 18 KB, and a client that has dropped mid-run would
+        // otherwise leave the server allocating and freeing one every 50 ms.
+        self.lock();
+        var wanted = false;
+        for (self.clients.items) |conn| {
+            if (receivesSnapshots(conn)) {
+                wanted = true;
+                break;
+            }
+        }
+        self.unlock();
+        if (!wanted) return;
+
         const bytes = wire.encodeSnapshotFull(self.gpa, self.sim.snapshotView()) catch |e| {
             std.debug.print("[server] error: could not encode snapshot: {s}\n", .{@errorName(e)});
             return;
@@ -553,6 +567,15 @@ fn handleHello(self: *Server, conn: *ClientConn, hello: wire.Hello) void {
     conn.player_id = player.id;
     @memcpy(&conn.name, &hello.name);
     std.debug.print("[server] player {d} joined as '{s}'\n", .{ player.id, conn.name });
+
+    // The stress load is topped up at the end of a tick, so the snapshot below
+    // would otherwise be taken before this player's first one — the client's
+    // first view of the world would be short of the load it is there to
+    // measure. Placing it here as well costs nothing: the tick tops it up
+    // again immediately afterwards.
+    if (self.sim.stress) |load| {
+        self.sim.topUpLoad(load.enemies, load.projectiles, load.radius);
+    }
 
     // The welcome and an immediate full snapshot, so the client need not wait
     // 50 ms for its first state. Both go to this connection's write queue and
