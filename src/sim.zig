@@ -591,8 +591,12 @@ pub const Simulation = struct {
         self.spawn_accum += rate;
         var owed: usize = @intFromFloat(@floor(self.spawn_accum));
         self.spawn_accum -= @floatFromInt(owed);
-        // Whatever the last wave could not place is still owed.
-        owed += self.spawn_debt;
+        // Whatever the last wave could not place is still owed. Saturating
+        // addition, not a clamp at the pool size: the debt is paid out over as
+        // many waves as it takes, so clamping it to what a single wave could
+        // place would silently drop the rest in exactly the saturated,
+        // endlessly-escalating case the debt exists for.
+        owed +|= self.spawn_debt;
         self.spawn_debt = 0;
 
         const cap = enemy.activeCap(t);
@@ -605,11 +609,11 @@ pub const Simulation = struct {
         while (owed > 0) : (owed -= 1) {
             if (self.enemies.count >= cap) {
                 // Banked rather than discarded: a later wave places these as
-                // soon as the cap allows. Bounded by the pool, which is the
-                // most that could ever be placed at once — a bound any tighter
-                // than that could never be paid out, because the pool cannot
-                // hold more than the pool.
-                self.spawn_debt = @min(self.spawn_debt + owed, root.max_enemies);
+                // soon as the cap allows. The debt is only bounded by the
+                // counter's range — it drains a wave's worth at a time, so any
+                // clamp smaller than the total owed would lose spawns under
+                // sustained saturation.
+                self.spawn_debt +|= owed;
                 break;
             }
             const archetype = enemy.pickArchetype(&self.rng, self.tick);
@@ -1171,6 +1175,27 @@ test "enemies owed to a full active cap are placed by a later wave" {
     sim.spawnWave();
     try std.testing.expectEqual(cap, sim.enemies.count);
     try std.testing.expect(sim.spawn_debt < banked);
+}
+
+test "spawn debt past the pool size is still owed, not truncated" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.pos = .{ 0.0, 0.0 };
+
+    // Late enough that a single wave owes far more than the pool can hold, and
+    // the pool is then filled, so every following wave banks its whole output.
+    sim.tick = 3600 * 60 * 40;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) sim.spawnWave();
+    try std.testing.expectEqual(root.max_enemies, sim.enemies.count);
+
+    // Banked output has to keep accumulating past the pool size: a clamp there
+    // would silently drop spawns in exactly the saturated, endlessly
+    // escalating case the debt exists for.
+    i = 0;
+    while (i < 12) : (i += 1) sim.spawnWave();
+    try std.testing.expect(sim.spawn_debt > root.max_enemies);
 }
 
 test "no spawn happens without a player, and the cap bounds the pool" {
