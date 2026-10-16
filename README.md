@@ -151,13 +151,23 @@ combat core plus the whole upgrade system of DESIGN.md §3:
   **five synergies**, each active when both items reach level 3.
 - **Unlimited progression.** Once every held weapon and passive is maxed, the
   three repeatable Overclock upgrades (global damage, attack speed, max HP)
-  take over with no cap.
+  take over with no cap. The counts are `u32` and increment with a plain
+  `+=`, so they cannot wrap — the phase-3 review caught a `u8` counter with a
+  wrapping add that silently dropped every bonus on the 256th purchase.
+  Attack speed is the one Overclock with a floor: its per-purchase factor
+  `1 - 0.015 * n` turns negative at 67 purchases, so the factor is clamped at
+  `overclock_cooldown_floor` (0.05) — the cooldown can shrink to 5% of base,
+  a 20x attack rate, and the multiplier stays positive at any count.
 - **Death and restart.** HP reaching 0 ends the run (`game_state = 2` plus
   `S2C_GAME_OVER`); `C2S_RESTART` starts a fresh run.
 - **`S2C_LOADOUT`** whenever level, XP or the item set changes.
 
-Verified: `zig build test` — 169 tests pass. `zig build test
--Doptimize=ReleaseFast` — 169 pass.
+Verified: `zig build test` — 172 tests pass. `zig build test
+-Doptimize=ReleaseFast` — 172 pass. Three of them are the phase-3 review
+regressions: the Overclock wrap test fails against the old `u8` code (the
+counter reads 0 after 256 purchases), the boundary tests do not even compile
+against it (256 and 1000 do not fit a `u8`), and the attack-speed test fails
+where the old formula first went negative.
 
 ### The phase-3 smoke test
 
@@ -211,6 +221,22 @@ every tick and the top-up replaces them, and projectiles expire and are
 replaced — so there is always a fraction too young to draw. The counts the
 server puts on the wire are exact; the counts a client renders are a
 consequence of its own delay.
+
+### The phase-3 integration check
+
+A normal run (no stress flags) against the real client at its `phase-3-progress`
+branch, driven by `--input-script` and `--choice-script`: 12,000 frames in
+83.5 s, a steady **143.7 fps**, 1,668 snapshots received, no malformed, stale
+or dropped frames, and a worst prediction error of 0.091 world units. The
+level-up flow works end to end — the server offered three choices
+(`S2C_LEVELUP_OFFER`), the client answered (`C2S_LEVELUP_CHOICE`), the run
+resumed and the new loadout went out (`S2C_LOADOUT`). The run reached level 2
+in 140 s of scripted play; an evolution (a level-8 weapon fused with its maxed
+passive) takes far more level-ups than that, so none was reached — the
+upgrade path is exercised by the smoke test and the unit tests instead. One
+transient 5-tick client-side hiccup near frame 9,420 recovered on its own; the
+TCP connection stayed up for the whole run (the server logged a single join
+and a single final disconnect).
 
 Deliberately not in this phase (DESIGN.md §6 puts them later): the Tier 2 and
 Tier 3 enemies, the elite modifiers and the boss of §4, and `S2C_SNAPSHOT_DELTA`
