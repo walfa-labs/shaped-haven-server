@@ -94,9 +94,9 @@ pub const Hello = struct {
     name: [16]u8,
 };
 
-/// Decode a `C2S_HELLO` payload; `null` when fewer than 26 bytes arrive.
+/// Decode a `C2S_HELLO` payload; `null` unless exactly 26 bytes arrive.
 pub fn decodeHello(bytes: []const u8) ?Hello {
-    if (bytes.len < hello_wire_size) return null;
+    if (bytes.len != hello_wire_size) return null;
     var name: [16]u8 = undefined;
     @memcpy(&name, bytes[10..hello_wire_size]);
     return .{
@@ -398,11 +398,12 @@ pub fn writeLe(comptime T: type, bytes: []u8, offset: usize, value: anytype) voi
 
 /// Read a fixed-size packed payload struct out of `bytes`.
 ///
-/// `null` when the payload is shorter than `@sizeOf(T)`. No length validation
-/// is performed on structs that are not defined by DESIGN.md §5, because
-/// those layouts are this repository's own choice.
+/// `null` unless the payload is exactly `wireSize(T)` long. Every payload
+/// struct here is fixed size, so a longer payload is a malformed frame rather
+/// than a newer version of the message: accepting it would let a peer smuggle
+/// trailing bytes past the parser.
 pub fn decodePayload(comptime T: type, bytes: []const u8) ?T {
-    if (bytes.len < wireSize(T)) return null;
+    if (bytes.len != wireSize(T)) return null;
     var copy: T = undefined;
     const dest: [*]u8 = @ptrCast(@alignCast(&copy));
     @memcpy(dest[0..wireSize(T)], bytes[0..wireSize(T)]);
@@ -466,9 +467,13 @@ test "hello payload matches the DESIGN.md field order" {
     try std.testing.expectEqual(@as(u64, 0x1122334455667788), decoded.session_token);
     try std.testing.expectEqualStrings("abc", decoded.name[0..3]);
 
-    // Short payloads are rejected.
+    // The length must match exactly: short and over-long payloads are both
+    // malformed frames.
     try std.testing.expect(decodeHello(raw[0..25]) == null);
     try std.testing.expect(decodeHello(&.{}) == null);
+    var too_long = std.mem.zeroes([27]u8);
+    @memcpy(too_long[0..26], &raw);
+    try std.testing.expect(decodeHello(&too_long) == null);
 }
 
 test "input payload matches DESIGN.md field list" {
@@ -491,8 +496,14 @@ test "input payload matches DESIGN.md field list" {
     try std.testing.expectEqual(@as(u16, 65535), decoded.aim_angle);
     try std.testing.expectEqual(@as(u8, 0xff), decoded.buttons);
 
-    // A short payload is rejected rather than partially decoded.
+    // A payload that is not exactly the message size is rejected rather than
+    // partially decoded.
     try std.testing.expect(decodePayload(Input, payload.bytes()[0..12]) == null);
+    var too_long: [14]u8 = undefined;
+    @memcpy(too_long[0..13], payload.bytes());
+    too_long[13] = 0;
+    try std.testing.expect(decodePayload(Input, &too_long) == null);
+    try std.testing.expect(decodePayload(Input, payload.bytes()) != null);
 }
 
 test "welcome payload matches DESIGN.md field list" {
