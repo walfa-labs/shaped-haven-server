@@ -186,6 +186,11 @@ pub const Simulation = struct {
     /// Fractional spawns carried between spawn evaluations, so the rate curve
     /// is not rounded down once per second.
     spawn_accum: f32 = 0.0,
+    /// Enemies a wave owed but could not place because the active cap was
+    /// reached. They are placed by a later wave rather than discarded, so
+    /// sitting at the cap for a minute does not permanently lose the output of
+    /// the curve during it.
+    spawn_debt: usize = 0,
     /// When set, the world is held at this load every tick instead of being
     /// populated by the spawn curve. See `StressLoad`.
     stress: ?StressLoad = null,
@@ -318,29 +323,41 @@ pub const Simulation = struct {
         radius: f32,
     ) void {
         const around = self.playerCentroid() orelse return;
-        const limit = root.arena_half_size - enemy.max_radius;
         const gun = weapon.spec(@intFromEnum(weapon.Id.gun)) orelse return;
 
         while (self.projectiles.count < want_projectiles) {
             const angle = self.rng.range(0.0, 2.0 * std.math.pi);
             const dist = self.rng.range(2.0, radius);
             const dir = [2]f32{ @cos(angle), @sin(angle) };
-            const pos = [2]f32{
-                std.math.clamp(around[0] + dir[0] * dist, -limit, limit),
-                std.math.clamp(around[1] + dir[1] * dist, -limit, limit),
-            };
+            const pos = placeFrom(around, angle, dist);
             if (self.projectiles.spawn(0, gun, pos, dir) == null) break;
         }
 
         while (self.enemies.count < want_enemies) {
             const angle = self.rng.range(0.0, 2.0 * std.math.pi);
             const dist = self.rng.range(1.0, radius);
-            const pos = [2]f32{
-                std.math.clamp(around[0] + @cos(angle) * dist, -limit, limit),
-                std.math.clamp(around[1] + @sin(angle) * dist, -limit, limit),
-            };
+            const pos = placeFrom(around, angle, dist);
             if (self.enemies.spawn(.circle_t1, pos) == null) break;
         }
+    }
+
+    /// Place `dist` units from `centre` along `angle`, inside the arena.
+    ///
+    /// The ring the spawn curve draws is wider than the room left when the
+    /// players stand against a wall, so an offset that would leave the arena is
+    /// mirrored back across the centre rather than clamped per axis. Clamping
+    /// per axis is what this used to do: it shortens the offset, so an enemy
+    /// could end up closer to the players than the ring's inner radius — on top
+    /// of them, against a wall — and the radial distribution flattened against
+    /// the wall. Mirroring keeps the distance exact and biases only the angle,
+    /// which is the smaller distortion and the only one available in a finite
+    /// arena.
+    fn placeFrom(centre: [2]f32, angle: f32, dist: f32) [2]f32 {
+        const limit = root.arena_half_size - enemy.max_radius;
+        var off = [2]f32{ @cos(angle) * dist, @sin(angle) * dist };
+        if (@abs(centre[0] + off[0]) > limit) off[0] = -off[0];
+        if (@abs(centre[1] + off[1]) > limit) off[1] = -off[1];
+        return .{ centre[0] + off[0], centre[1] + off[1] };
     }
 
     /// Centroid of the alive players, or `null` when nobody is connected.
@@ -479,8 +496,12 @@ pub const Simulation = struct {
         self.grid.clear();
         var i: usize = 0;
         while (i < self.enemies.count) : (i += 1) {
-            self.grid.insert(@intCast(i), self.enemies.pos[i]);
+            _ = self.grid.insert(@intCast(i), self.enemies.pos[i]);
         }
+        // The grid is sized for the whole pool, so a rebuild covers all of it.
+        // An enemy missing from the broadphase is one no weapon can ever hit,
+        // and nothing would say so — hence the assert rather than a comment.
+        std.debug.assert(self.grid.len == self.enemies.count);
     }
 
     /// Tick every weapon cooldown and fire what is ready.
@@ -570,24 +591,31 @@ pub const Simulation = struct {
         self.spawn_accum += rate;
         var owed: usize = @intFromFloat(@floor(self.spawn_accum));
         self.spawn_accum -= @floatFromInt(owed);
+        // Whatever the last wave could not place is still owed.
+        owed += self.spawn_debt;
+        self.spawn_debt = 0;
 
         const cap = enemy.activeCap(t);
         const centroid = self.playerCentroid() orelse return;
-        const limit = root.arena_half_size - enemy.max_radius;
         // One axis per wave: a surge has to cluster the whole wave into two
         // opposing arcs, which only works if every enemy is measured from the
         // same direction.
         const axis = enemy.surgeAxis(&self.rng, self.tick);
 
         while (owed > 0) : (owed -= 1) {
-            if (self.enemies.count >= cap) break;
+            if (self.enemies.count >= cap) {
+                // Banked rather than discarded: a later wave places these as
+                // soon as the cap allows. Bounded by the pool, which is the
+                // most that could ever be placed at once — a bound any tighter
+                // than that could never be paid out, because the pool cannot
+                // hold more than the pool.
+                self.spawn_debt = @min(self.spawn_debt + owed, root.max_enemies);
+                break;
+            }
             const archetype = enemy.pickArchetype(&self.rng, self.tick);
             const angle = enemy.spawnAngle(&self.rng, axis);
             const dist = self.rng.range(enemy.spawn_min_radius, enemy.spawn_max_radius);
-            const pos = [2]f32{
-                std.math.clamp(centroid[0] + @cos(angle) * dist, -limit, limit),
-                std.math.clamp(centroid[1] + @sin(angle) * dist, -limit, limit),
-            };
+            const pos = placeFrom(centroid, angle, dist);
             // A full pool stops the loop rather than being skipped: the next
             // evaluation will try again.
             if (self.enemies.spawn(archetype, pos) == null) break;
@@ -1060,6 +1088,89 @@ test "the spawn wave follows the players' centroid" {
         try std.testing.expect(d >= enemy.spawn_min_radius - 0.01);
         try std.testing.expect(d <= enemy.spawn_max_radius + 0.01);
     }
+}
+
+test "placeFrom keeps the ring's radius and stays inside the arena" {
+    const limit = root.arena_half_size - enemy.max_radius;
+    // The last two are the corners: the ring is wider than the room left there.
+    const centres = [_][2]f32{
+        .{ limit, 0.0 },
+        .{ 0.0, limit },
+        .{ limit, limit },
+        .{ -limit, limit },
+        .{ 0.0, 0.0 },
+    };
+    for (centres) |c| {
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            const angle = @as(f32, @floatFromInt(i)) * (2.0 * std.math.pi / 200.0);
+            const dist = enemy.spawn_min_radius +
+                (@as(f32, @floatFromInt(i % 17)) / 17.0) *
+                (enemy.spawn_max_radius - enemy.spawn_min_radius);
+            const p = Simulation.placeFrom(c, angle, dist);
+            // The distance from the centre is exactly what was asked for, so the
+            // ring's inner radius holds even against a wall.
+            const d = std.math.hypot(p[0] - c[0], p[1] - c[1]);
+            try std.testing.expectApproxEqAbs(dist, d, 1e-4);
+            // ... and the body still fits inside the arena.
+            try std.testing.expect(@abs(p[0]) <= limit);
+            try std.testing.expect(@abs(p[1]) <= limit);
+        }
+    }
+}
+
+test "a wave spawned against the arena wall keeps its 48 unit inner radius" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    // Hard against the +x wall, where clamping each enemy to the wall would
+    // pull it inside the ring.
+    p.pos = .{ root.arena_half_size - enemy.max_radius - 1.0, 0.0 };
+
+    var i: usize = 0;
+    while (i < enemy.spawn_interval_ticks - 1) : (i += 1) sim.advance();
+    sim.advance();
+
+    try std.testing.expect(sim.enemies.count > 0);
+    for (0..sim.enemies.count) |e| {
+        const d = std.math.hypot(
+            sim.enemies.pos[e][0] - p.pos[0],
+            sim.enemies.pos[e][1] - p.pos[1],
+        );
+        try std.testing.expect(d >= enemy.spawn_min_radius - 0.01);
+        try std.testing.expect(d <= enemy.spawn_max_radius + 0.01);
+    }
+}
+
+test "enemies owed to a full active cap are placed by a later wave" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.pos = .{ 0.0, 0.0 };
+
+    // Fill the pool to the cap at t = 10 s, however many waves that takes.
+    sim.tick = 600;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) sim.spawnWave();
+    const cap = enemy.activeCap(600.0 / 3600.0);
+    try std.testing.expectEqual(cap, sim.enemies.count);
+
+    // The pool is full, so every wave's whole output is owed, not discarded.
+    sim.spawnWave();
+    try std.testing.expectEqual(cap, sim.enemies.count);
+    const banked = sim.spawn_debt;
+    try std.testing.expect(banked > 0);
+
+    // Emptying the pool makes the whole bank payable at once, so the next wave
+    // refills the pool to the cap. Without the bank it would place only its own
+    // handful of enemies and leave the pool nearly empty.
+    for (0..sim.enemies.count) |k| sim.enemies.hp[k] = 0.0;
+    _ = sim.enemies.reapDead();
+    try std.testing.expectEqual(@as(usize, 0), sim.enemies.count);
+
+    sim.spawnWave();
+    try std.testing.expectEqual(cap, sim.enemies.count);
+    try std.testing.expect(sim.spawn_debt < banked);
 }
 
 test "no spawn happens without a player, and the cap bounds the pool" {

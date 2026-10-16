@@ -60,11 +60,17 @@ pub const SpatialHash = struct {
         self.len = 0;
     }
 
-    /// Insert `index` at `pos`. Silently dropped once the grid is full: a full
-    /// pool must degrade, and the entity is still simulated either way — it
-    /// just stops being a broadphase candidate.
-    pub fn insert(self: *SpatialHash, index: u32, pos: [2]f32) void {
-        if (self.len >= capacity) return;
+    /// Insert `index` at `pos`. Returns false when the grid is full and the
+    /// entry was dropped.
+    ///
+    /// A full grid degrades rather than crashing: the entity is still
+    /// simulated either way, it just stops being a broadphase candidate. It
+    /// cannot happen to a rebuild of the enemy pool, because `capacity` is
+    /// `root.max_enemies` — the same cap the pool enforces — so the pool can
+    /// never offer more entries than the grid can hold. `Simulation.rebuildGrid`
+    /// asserts that rather than trusting it.
+    pub fn insert(self: *SpatialHash, index: u32, pos: [2]f32) bool {
+        if (self.len >= capacity) return false;
         const slot = self.len;
         const cx = cellOf(pos[0]);
         const cy = cellOf(pos[1]);
@@ -77,6 +83,7 @@ pub const SpatialHash = struct {
         self.next[slot] = self.buckets[bucket];
         self.buckets[bucket] = @intCast(slot);
         self.len += 1;
+        return true;
     }
 
     /// Entity indices whose stored position lies within `radius` of `center`,
@@ -156,12 +163,12 @@ test "a cleared grid holds nothing" {
 test "queryCircle finds what was inserted and nothing else" {
     var grid = SpatialHash{};
     grid.clear();
-    grid.insert(10, .{ 0.0, 0.0 });
-    grid.insert(11, .{ 3.9, 0.0 }); // same cell as the origin
-    grid.insert(12, .{ 4.1, 0.0 }); // next cell along
-    grid.insert(13, .{ -4.1, 0.0 }); // next cell the other way
-    grid.insert(14, .{ 0.0, 4.1 });
-    grid.insert(15, .{ 500.0, -500.0 }); // far away
+    _ = grid.insert(10, .{ 0.0, 0.0 });
+    _ = grid.insert(11, .{ 3.9, 0.0 }); // same cell as the origin
+    _ = grid.insert(12, .{ 4.1, 0.0 }); // next cell along
+    _ = grid.insert(13, .{ -4.1, 0.0 }); // next cell the other way
+    _ = grid.insert(14, .{ 0.0, 4.1 });
+    _ = grid.insert(15, .{ 500.0, -500.0 }); // far away
     try std.testing.expectEqual(@as(usize, 6), grid.len);
 
     var out: [16]u32 = undefined;
@@ -197,7 +204,7 @@ test "no entity is reported twice, even when cells collide in a bucket" {
     while (cy < rows) : (cy += 1) {
         var cx: i32 = 0;
         while (cx < cols) : (cx += 1) {
-            grid.insert(id, .{
+            _ = grid.insert(id, .{
                 @as(f32, @floatFromInt(cx)) * cell_size + 0.5,
                 @as(f32, @floatFromInt(cy)) * cell_size + 0.5,
             });
@@ -224,7 +231,7 @@ test "queryCircle reaches across cell boundaries" {
     var i: usize = 0;
     while (i < 64) : (i += 1) {
         const a = @as(f32, @floatFromInt(i)) * (2.0 * std.math.pi / 64.0);
-        grid.insert(@intCast(i), .{ @cos(a) * 20.0, @sin(a) * 20.0 });
+        _ = grid.insert(@intCast(i), .{ @cos(a) * 20.0, @sin(a) * 20.0 });
     }
 
     var out: [128]u32 = undefined;
@@ -244,9 +251,11 @@ test "a full grid drops entries instead of overrunning" {
     var grid = SpatialHash{};
     grid.clear();
     var i: usize = 0;
-    while (i < SpatialHash.capacity + 32) : (i += 1) {
-        grid.insert(@intCast(i), .{ @as(f32, @floatFromInt(i)) * 0.1, 0.0 });
+    while (i < SpatialHash.capacity) : (i += 1) {
+        try std.testing.expect(grid.insert(@intCast(i), .{ @as(f32, @floatFromInt(i)) * 0.1, 0.0 }));
     }
+    // The next one is refused rather than written past the end.
+    try std.testing.expect(!grid.insert(9999, .{ 0.0, 0.0 }));
     try std.testing.expectEqual(SpatialHash.capacity, grid.len);
 
     var out: [SpatialHash.capacity]u32 = undefined;
@@ -259,7 +268,7 @@ test "a query buffer smaller than the result set truncates rather than overflows
     grid.clear();
     var i: usize = 0;
     while (i < 100) : (i += 1) {
-        grid.insert(@intCast(i), .{ @as(f32, @floatFromInt(i)) * 0.01, 0.0 });
+        _ = grid.insert(@intCast(i), .{ @as(f32, @floatFromInt(i)) * 0.01, 0.0 });
     }
     var out: [8]u32 = undefined;
     try std.testing.expectEqual(@as(usize, 8), grid.queryCircle(.{ 0, 0 }, 100.0, &out));
@@ -268,13 +277,13 @@ test "a query buffer smaller than the result set truncates rather than overflows
 test "clear resets the chains so stale entries cannot be found" {
     var grid = SpatialHash{};
     grid.clear();
-    grid.insert(1, .{ 5.0, 5.0 });
+    _ = grid.insert(1, .{ 5.0, 5.0 });
     var out: [8]u32 = undefined;
     try std.testing.expectEqual(@as(usize, 1), grid.queryCircle(.{ 5.0, 5.0 }, 1.0, &out));
 
     grid.clear();
     try std.testing.expectEqual(@as(usize, 0), grid.queryCircle(.{ 5.0, 5.0 }, 1.0, &out));
-    grid.insert(2, .{ 5.0, 5.0 });
+    _ = grid.insert(2, .{ 5.0, 5.0 });
     const n = grid.queryCircle(.{ 5.0, 5.0 }, 1.0, &out);
     try std.testing.expectEqualSlices(u32, &.{2}, out[0..n]);
 }
@@ -282,7 +291,7 @@ test "clear resets the chains so stale entries cannot be found" {
 test "a negative radius finds nothing" {
     var grid = SpatialHash{};
     grid.clear();
-    grid.insert(1, .{ 0.0, 0.0 });
+    _ = grid.insert(1, .{ 0.0, 0.0 });
     var out: [8]u32 = undefined;
     try std.testing.expectEqual(@as(usize, 0), grid.queryCircle(.{ 0, 0 }, -1.0, &out));
 }
