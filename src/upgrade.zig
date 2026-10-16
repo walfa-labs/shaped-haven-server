@@ -298,14 +298,26 @@ pub const Stats = struct {
     max_hp_bonus: f32 = 0.0,
 };
 
+/// Floor for the attack-speed Overclock's per-purchase cooldown factor.
+///
+/// Each attack-speed Overclock multiplies the cooldown by `1 - 0.015`. That
+/// linear factor is exact for the first 63 purchases but turns negative at 67,
+/// and a negative multiplier is not a faster attack — it is a broken one:
+/// `scaleTicks` would silently floor every weapon's cooldown at 1 tick. So
+/// unlimited attack speed means the factor approaches this floor instead: the
+/// cooldown can shrink to 5% of base (a 20x attack rate) and no further, and
+/// the multiplier stays positive and meaningful at any count.
+pub const overclock_cooldown_floor: f32 = 0.05;
+
 /// Resolve a loadout into its multipliers.
 ///
 /// `overclock` holds the three Overclock counts, indexed by
-/// `id - ids.overclock_damage` (48 -> 0, 49 -> 1, 50 -> 2).
+/// `id - ids.overclock_damage` (48 -> 0, 49 -> 1, 50 -> 2). The counts are
+/// `u32` because they are uncapped; see `PlayerState.overclock` in `sim.zig`.
 pub fn resolveStats(
     weapons: []const WeaponSlot,
     passives: []const u8,
-    overclock: []const u8,
+    overclock: []const u32,
 ) Stats {
     _ = weapons;
     var s = Stats{};
@@ -329,7 +341,10 @@ pub fn resolveStats(
     }
 
     if (overclock.len >= 1) s.damage_mult *= 1.0 + 0.02 * @as(f32, @floatFromInt(overclock[0]));
-    if (overclock.len >= 2) s.cooldown_mult *= 1.0 - 0.015 * @as(f32, @floatFromInt(overclock[1]));
+    if (overclock.len >= 2) {
+        const factor = 1.0 - 0.015 * @as(f32, @floatFromInt(overclock[1]));
+        s.cooldown_mult *= @max(factor, overclock_cooldown_floor);
+    }
     if (overclock.len >= 3) s.max_hp_bonus += 25.0 * @as(f32, @floatFromInt(overclock[2]));
 
     return s;
@@ -415,7 +430,7 @@ pub fn allMaxed(weapons: []const WeaponSlot, passives: []const u8) bool {
 pub fn generateOptions(
     weapons: []const WeaponSlot,
     passives: []const u8,
-    overclock: []const u8,
+    overclock: []const u32,
     r: *rng.Rng,
 ) [3]UpgradeOption {
     _ = overclock;
@@ -651,7 +666,7 @@ test "synergy ids and the level-3 gate" {
 test "resolveStats applies the ten passives" {
     var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
     var passives: [root.max_passives]u8 = @splat(0);
-    var overclock = [_]u8{ 0, 0, 0 };
+    var overclock = [_]u32{ 0, 0, 0 };
 
     // Nothing held: the defaults.
     const base = resolveStats(&weapons, &passives, &overclock);
@@ -696,7 +711,7 @@ test "resolveStats applies the ten passives" {
 test "overclock scales damage, attack speed and max HP without a cap" {
     var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
     var passives: [root.max_passives]u8 = @splat(0);
-    var overclock = [_]u8{ 0, 0, 0 };
+    var overclock = [_]u32{ 0, 0, 0 };
     _ = &weapons;
     _ = &passives;
 
@@ -715,6 +730,63 @@ test "overclock scales damage, attack speed and max HP without a cap" {
         resolveStats(&weapons, &passives, &overclock).damage_mult,
         1e-6,
     );
+}
+
+test "Overclock counts crossing 255 keep their bonuses" {
+    var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
+    var passives: [root.max_passives]u8 = @splat(0);
+    var overclock = [_]u32{ 0, 0, 0 };
+    _ = &weapons;
+    _ = &passives;
+
+    // 255 was the old `u8` ceiling; 256 is where the wrapping add fell back
+    // to zero. The bonus must be continuous across that boundary.
+    overclock[0] = 255;
+    overclock[2] = 255;
+    var s = resolveStats(&weapons, &passives, &overclock);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.1), s.damage_mult, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 6375.0), s.max_hp_bonus, 1e-6);
+
+    overclock[0] = 256;
+    overclock[2] = 256;
+    s = resolveStats(&weapons, &passives, &overclock);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.12), s.damage_mult, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 6400.0), s.max_hp_bonus, 1e-6);
+
+    // And far beyond any byte: 1000 stacks.
+    overclock[0] = 1000;
+    overclock[2] = 1000;
+    s = resolveStats(&weapons, &passives, &overclock);
+    try std.testing.expectApproxEqAbs(@as(f32, 21.0), s.damage_mult, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 25000.0), s.max_hp_bonus, 1e-6);
+}
+
+test "attack speed cooldown never goes non-positive" {
+    var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
+    var passives: [root.max_passives]u8 = @splat(0);
+    var overclock = [_]u32{ 0, 0, 0 };
+    _ = &weapons;
+    _ = &passives;
+
+    // 63 purchases is the last count where the linear factor is still above
+    // the floor: 1 - 0.015 * 63 = 0.055.
+    overclock[1] = 63;
+    var s = resolveStats(&weapons, &passives, &overclock);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.055), s.cooldown_mult, 1e-6);
+    try std.testing.expect(s.cooldown_mult > 0.0);
+
+    // 67 is where the old linear formula first went negative (-0.005); the
+    // clamp holds the multiplier at the floor instead.
+    overclock[1] = 67;
+    s = resolveStats(&weapons, &passives, &overclock);
+    try std.testing.expectApproxEqAbs(overclock_cooldown_floor, s.cooldown_mult, 1e-6);
+    try std.testing.expect(s.cooldown_mult > 0.0);
+
+    // The floor holds at any count, however large.
+    overclock[1] = 1000;
+    s = resolveStats(&weapons, &passives, &overclock);
+    try std.testing.expectApproxEqAbs(overclock_cooldown_floor, s.cooldown_mult, 1e-6);
+    try std.testing.expect(s.cooldown_mult > 0.0);
 }
 
 test "resolveSpec scales a weapon by the loadout" {
@@ -740,7 +812,7 @@ test "generateOptions offers three distinct choices" {
     var r = rng.Rng.init(42);
     var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
     var passives: [root.max_passives]u8 = @splat(0);
-    var overclock = [_]u8{ 0, 0, 0 };
+    var overclock = [_]u32{ 0, 0, 0 };
 
     // A fresh player: four level-1 weapons, no passives.
     for (&weapons, 0..) |*slot, i| slot.id = @intCast(i);
@@ -762,7 +834,7 @@ test "a maxed loadout offers only Overclock" {
     var r = rng.Rng.init(7);
     var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
     var passives: [root.max_passives]u8 = @splat(0);
-    var overclock = [_]u8{ 0, 0, 0 };
+    var overclock = [_]u32{ 0, 0, 0 };
     for (&weapons, 0..) |*slot, i| {
         slot.id = @intCast(i);
         slot.level = 8;
@@ -788,7 +860,7 @@ test "an evolution is offered once its weapon and passive are maxed" {
     var r = rng.Rng.init(99);
     var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
     var passives: [root.max_passives]u8 = @splat(0);
-    var overclock = [_]u8{ 0, 0, 0 };
+    var overclock = [_]u32{ 0, 0, 0 };
 
     weapons[0].id = ids.sword;
     weapons[0].level = 8;
@@ -813,7 +885,7 @@ test "the weighted draw never repeats an option" {
     var r = rng.Rng.init(1234);
     var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
     var passives: [root.max_passives]u8 = @splat(0);
-    var overclock = [_]u8{ 0, 0, 0 };
+    var overclock = [_]u32{ 0, 0, 0 };
     for (&weapons, 0..) |*slot, i| slot.id = @intCast(i);
     passives[0] = 1;
     passives[1] = 1;

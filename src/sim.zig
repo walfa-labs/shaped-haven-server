@@ -158,7 +158,12 @@ pub const PlayerState = struct {
     /// Passive levels, indexed 0..9 in DESIGN.md §3 table order; 0 = unowned.
     passives: [root.max_passives]u8 = @splat(0),
     /// Overclock counts, indexed by `id - 48` (damage, attack speed, max HP).
-    overclock: [3]u8 = [_]u8{ 0, 0, 0 },
+    ///
+    /// `u32`, not `u8`: the counts are uncapped by design (DESIGN.md §3
+    /// "Unlimited limit-break"), and a `u8` wrapped at 256 purchases, silently
+    /// dropping the player's bonus. A `u32` cannot wrap in any reachable run —
+    /// it would take more than four billion level-ups.
+    overclock: [3]u32 = [_]u32{ 0, 0, 0 },
     /// Bit mask of the active synergies (DESIGN.md §3).
     synergy_mask: u16 = 0,
     input: InputFrame = .{},
@@ -320,7 +325,7 @@ pub const Simulation = struct {
         p.level = 1;
         p.xp_next = upgrade.xpForLevel(1);
         p.passives = @splat(0);
-        p.overclock = [_]u8{ 0, 0, 0 };
+        p.overclock = [_]u32{ 0, 0, 0 };
         p.synergy_mask = 0;
         p.invuln_ticks = 0;
         p.kinetic_charge = 0.0;
@@ -1023,7 +1028,10 @@ pub const Simulation = struct {
             }
         } else if (upgrade.isOverclockId(opt.item_id)) {
             const i: usize = opt.item_id - upgrade.ids.overclock_damage;
-            p.overclock[i] +%= 1;
+            // Plain `+=` on the `u32` counter: no wrapping add, so the count
+            // cannot silently fall back to zero the way the old `+%=` on `u8`
+            // did at 256 purchases.
+            p.overclock[i] += 1;
             if (i == 2) {
                 p.max_hp += 25.0;
                 p.hp += 25.0;
@@ -2361,6 +2369,35 @@ test "Overclock raises max HP without a cap" {
     p.hp = p.max_hp;
     try std.testing.expectEqual(@as(f32, 200.0), p.max_hp);
     try std.testing.expectEqual(@as(u8, 100), Simulation.hpPercent(p.hp, p.max_hp));
+}
+
+test "Overclock purchases past 255 do not wrap" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+
+    // One purchase away from the old `u8` wrap on each counter.
+    p.overclock[0] = 255;
+    p.overclock[1] = 255;
+    p.overclock[2] = 255;
+    const hp_before = p.max_hp;
+
+    sim.applyOption(0, .{ .item_id = upgrade.ids.overclock_damage, .next_level = 1, .is_evo = false });
+    sim.applyOption(0, .{ .item_id = upgrade.ids.overclock_attack_speed, .next_level = 1, .is_evo = false });
+    sim.applyOption(0, .{ .item_id = upgrade.ids.overclock_max_hp, .next_level = 1, .is_evo = false });
+
+    // The counts land on 256, where the old `u8` + `+%=` wrapped to 0 and
+    // silently dropped every bonus the player had bought.
+    try std.testing.expectEqual(@as(u32, 256), p.overclock[0]);
+    try std.testing.expectEqual(@as(u32, 256), p.overclock[1]);
+    try std.testing.expectEqual(@as(u32, 256), p.overclock[2]);
+
+    // The bonuses keep scaling instead of collapsing: +512% damage, the
+    // clamped attack-speed floor, and another +25 max HP.
+    const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.12), stats.damage_mult, 1e-6);
+    try std.testing.expectApproxEqAbs(upgrade.overclock_cooldown_floor, stats.cooldown_mult, 1e-6);
+    try std.testing.expectEqual(@as(f32, hp_before + 25.0), p.max_hp);
 }
 
 test "a restart resets the run and revives the player" {
