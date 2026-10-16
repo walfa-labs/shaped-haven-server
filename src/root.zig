@@ -45,11 +45,14 @@ pub const xp_pickup_radius: f32 = 3.0;
 /// this distance of the receiving player. It is sent to the client in
 /// `S2C_WELCOME` as a `u16`.
 ///
-/// The orthographic viewport covers 80 x 45 units (DESIGN.md §1), a
-/// half-diagonal of about 45.9 units, so 50 covers the whole screen with a
-/// small margin for the client's 100 ms interpolation delay and for enemies
-/// walking in from the spawn ring at 48–56 units.
-pub const interest_radius: f32 = 50.0;
+/// The orthographic viewport covers 80 x 45 units (DESIGN.md §1), so this is
+/// sized to cover the screen: a circle of this radius reaches the viewport's
+/// left and right edges (40 units) and its top and bottom (22.5) with margin,
+/// while leaving the far corners — the least valuable, hardest-to-see part of
+/// the screen — outside the radius. A smaller radius is what makes the phase-4
+/// bandwidth budget reachable at all: the wire carries only this neighbourhood,
+/// not the whole horde.
+pub const interest_radius: f32 = 40.0;
 
 /// Number of simulation ticks between snapshots.
 pub const ticks_per_snapshot: u32 = tick_hz / snapshot_hz;

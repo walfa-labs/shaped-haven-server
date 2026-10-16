@@ -18,6 +18,7 @@ const upgrade = @import("upgrade.zig");
 const gem = @import("gem.zig");
 const evolve = @import("evolve.zig");
 const bench = @import("bench.zig");
+const bandwidth = @import("bandwidth.zig");
 const smoke = @import("smoke.zig");
 
 test "all modules are reachable" {
@@ -34,6 +35,8 @@ test "all modules are reachable" {
     try std.testing.expect(weapon.specs.len == 4);
     try std.testing.expect(combat.max_hits_per_projectile >= 1);
     try std.testing.expect(bench.default_enemies == 1000);
+    try std.testing.expectEqual(@as(usize, 2500), bandwidth.enemy_count);
+    try std.testing.expectEqual(@as(u32, 20 * 60 * 60), bandwidth.stress_tick);
     try std.testing.expectEqual(@as(usize, 10), upgrade.passive_table.len);
     try std.testing.expectEqual(@as(usize, 8), upgrade.evolutions.len);
     try std.testing.expectEqual(@as(usize, 5), upgrade.synergies.len);
