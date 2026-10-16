@@ -172,6 +172,13 @@ pub const ProjectilePool = struct {
         self.count -= 1;
     }
 
+    /// Spend one tick of lifetime. A record already at zero is left at zero
+    /// rather than wrapped, so a caller that has just spent one does not
+    /// resurrect it.
+    fn age(self: *ProjectilePool, i: usize) void {
+        if (self.ttl_ticks[i] != 0) self.ttl_ticks[i] -= 1;
+    }
+
     /// True when this projectile has already damaged `enemy_id`.
     pub fn alreadyHit(self: *const ProjectilePool, i: usize, enemy_id: u32) bool {
         var k: usize = 0;
@@ -206,6 +213,54 @@ pub const ProjectilePool = struct {
 // ---------------------------------------------------------------------------
 // Hit resolution
 // ---------------------------------------------------------------------------
+
+/// Orders an arc's candidates nearest-first, by distance from the swing's
+/// origin.
+///
+/// A swing is instantaneous, so "who it reaches first" has to be decided by
+/// geometry rather than by time: the nearest enemy inside the sector is the one
+/// the blade gets to first, and that is where a limited-pierce swing spends its
+/// pierce. Left to the broadphase, the order is cell order inside the hash
+/// grid and chain order inside a bucket, so which enemies a pierce-limited
+/// swing hits would depend on internal container layout — and two runs of the
+/// same fight could damage different enemies.
+///
+/// Stable, so two enemies at the same distance keep the broadphase's order and
+/// the result stays reproducible.
+const ByRange = struct {
+    origin: [2]f32,
+    enemies: *const enemy.Pool,
+
+    fn lessThan(ctx: ByRange, a: u32, b: u32) bool {
+        const da = sub(ctx.enemies.pos[a], ctx.origin);
+        const db = sub(ctx.enemies.pos[b], ctx.origin);
+        return da[0] * da[0] + da[1] * da[1] < db[0] * db[0] + db[1] * db[1];
+    }
+};
+
+/// Orders a projectile's candidates by how far along its travel path they are,
+/// the closest ahead of it first.
+///
+/// A projectile covers a fraction of a unit per tick, so several enemies can be
+/// inside its hitbox on the same tick and the order they are *visited* in has to
+/// be the order they are *reached* in along the path. The key is the projection
+/// onto the travel direction measured from where the projectile started this
+/// tick, so an enemy behind it sorts last and one it has already passed is never
+/// revisited.
+const ByPath = struct {
+    origin: [2]f32,
+    dir: [2]f32,
+    enemies: *const enemy.Pool,
+
+    fn lessThan(ctx: ByPath, a: u32, b: u32) bool {
+        return ctx.along(ctx.enemies.pos[a]) < ctx.along(ctx.enemies.pos[b]);
+    }
+
+    fn along(self: ByPath, p: [2]f32) f32 {
+        const d = sub(p, self.origin);
+        return d[0] * self.dir[0] + d[1] * self.dir[1];
+    }
+};
 
 /// Index of the nearest live enemy within `max_range` of `from`, or `null`.
 ///
@@ -250,6 +305,14 @@ pub fn fireArc(
 ) usize {
     const half_arc = spec.arc_rad * 0.5;
     const n = grid.queryCircle(origin, spec.reach + enemy.max_radius, scratch);
+    // Nearest first: the swing reaches the closest enemy in the sector before
+    // it reaches the far one, so that is where its pierce goes.
+    std.mem.sort(
+        u32,
+        scratch[0..n],
+        ByRange{ .origin = origin, .enemies = enemies },
+        ByRange.lessThan,
+    );
 
     var pierce = spec.pierce;
     var hits: usize = 0;
@@ -284,11 +347,18 @@ pub fn updateProjectiles(
 
     var i: usize = 0;
     while (i < projectiles.count) : (i += 1) {
+        // A record only ever acts while it still has lifetime. The counter is
+        // spent at the end of the tick's work, so a record never travels or
+        // collides with its lifetime already at zero: the tick it runs out is
+        // its last, and `reapSpent` takes it at the end of that tick.
         if (projectiles.ttl_ticks[i] == 0) continue; // spent, reaped at the end of the tick
-        projectiles.ttl_ticks[i] -= 1;
 
-        if (!projectiles.collides(i)) continue;
+        if (!projectiles.collides(i)) {
+            projectiles.age(i); // an arc record does not travel; it only ages
+            continue;
+        }
 
+        const from = projectiles.pos[i];
         projectiles.pos[i][0] += projectiles.vel[i][0] * dt;
         projectiles.pos[i][1] += projectiles.vel[i][1] * dt;
 
@@ -308,6 +378,14 @@ pub fn updateProjectiles(
             spec.radius + enemy.max_radius,
             scratch,
         );
+        // Along the path: the enemy the projectile reaches first is the one it
+        // hits first, so that is where its pierce goes.
+        std.mem.sort(
+            u32,
+            scratch[0..n],
+            ByPath{ .origin = from, .dir = dir, .enemies = enemies },
+            ByPath.lessThan,
+        );
 
         for (scratch[0..n]) |ei| {
             const e: usize = ei;
@@ -324,6 +402,8 @@ pub fn updateProjectiles(
                 break;
             }
         }
+
+        projectiles.age(i);
     }
 }
 
@@ -549,6 +629,95 @@ test "a bow arrow pierces two enemies and then stops" {
     try std.testing.expectApproxEqAbs(@as(f32, -15.0), enemies.hp[second], 1e-5);
     // The third was never reached: the arrow was spent after two hits.
     try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[third], 1e-5);
+    try std.testing.expectEqual(@as(usize, 0), projectiles.count);
+}
+
+test "a limited-pierce arc spends its pierce on the nearest enemy in the sector" {
+    var enemies = enemy.Pool{};
+    var grid = emptyGrid();
+    var projectiles = ProjectilePool{};
+    var scratch: [64]u32 = undefined;
+
+    // All three in cell (0, 0) — 1.0, 2.0 and 3.0 are all under the 4.0 cell
+    // edge — inserted near to far, so the broadphase hands them back farthest
+    // first: the opposite of the order a swing reaches them in. A pierce-1
+    // swing that spent its pierce in broadphase order would hit the farthest.
+    const near = enemies.spawn(.circle_t1, .{ 1.0, 0.0 }).?;
+    const mid = enemies.spawn(.circle_t1, .{ 2.0, 0.0 }).?;
+    const far = enemies.spawn(.circle_t1, .{ 3.0, 0.0 }).?;
+    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+
+    var spec = weapon.spec(@intFromEnum(weapon.Id.sword)).?;
+    spec.pierce = 1;
+    const hits = fireArc(&enemies, &grid, &projectiles, 0, spec, .{ 0, 0 }, .{ 1, 0 }, &scratch);
+
+    try std.testing.expectEqual(@as(usize, 1), hits);
+    // 15 HP against a 20 damage sword leaves -5, which is the death marker.
+    try std.testing.expectApproxEqAbs(@as(f32, -5.0), enemies.hp[near], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[mid], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[far], 1e-6);
+}
+
+test "a limited-pierce projectile spends its pierce on the enemies it reaches first" {
+    var enemies = enemy.Pool{};
+    var grid = emptyGrid();
+    var projectiles = ProjectilePool{};
+    var scratch: [64]u32 = undefined;
+
+    // Three swarmers in cell (0, 0), inserted near to far so the broadphase
+    // hands them back farthest first. The arrow starts at the origin and
+    // travels +x at 0.3 units a tick: on its first tick only the nearest is
+    // inside its hitbox, and on its second all three are, so the order it
+    // visits them in decides which two of the three it pierces.
+    const near = enemies.spawn(.circle_t1, .{ 0.8, 0.0 }).?;
+    const mid = enemies.spawn(.circle_t1, .{ 1.3, 0.0 }).?;
+    const far = enemies.spawn(.circle_t1, .{ 1.45, 0.0 }).?;
+    for (0..enemies.count) |k| grid.insert(@intCast(k), enemies.pos[k]);
+
+    const spec = weapon.spec(@intFromEnum(weapon.Id.bow)).?;
+    _ = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
+
+    const dt = 1.0 / 60.0;
+    var ticks: usize = 0;
+    while (ticks < 60) : (ticks += 1) {
+        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt);
+        projectiles.reapSpent();
+        if (projectiles.count == 0) break;
+    }
+
+    // The two the arrow reached first took exactly one 30 damage hit each.
+    try std.testing.expectApproxEqAbs(@as(f32, -15.0), enemies.hp[near], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -15.0), enemies.hp[mid], 1e-5);
+    // The third was still ahead of it when the pierce ran out.
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[far], 1e-5);
+    try std.testing.expectEqual(@as(usize, 0), projectiles.count);
+}
+
+test "a projectile travels once per tick of lifetime and never after it" {
+    var enemies = enemy.Pool{};
+    var grid = emptyGrid();
+    var projectiles = ProjectilePool{};
+    var scratch: [64]u32 = undefined;
+
+    var spec = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
+    spec.ttl_ticks = 1;
+    const i = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
+    try std.testing.expectEqual(@as(u16, 1), projectiles.ttl_ticks[i]);
+
+    updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 1), projectiles.count); // reaped separately
+    const step = projectiles.pos[i][0];
+    // It travelled on the one tick of lifetime it had, and is now spent.
+    try std.testing.expect(step > 0.0);
+    try std.testing.expectEqual(@as(u16, 0), projectiles.ttl_ticks[i]);
+
+    // However long it sits there, an expired record never moves again.
+    var k: usize = 0;
+    while (k < 10) : (k += 1) {
+        updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0);
+        try std.testing.expectEqual(step, projectiles.pos[i][0]);
+    }
+    projectiles.reapSpent();
     try std.testing.expectEqual(@as(usize, 0), projectiles.count);
 }
 

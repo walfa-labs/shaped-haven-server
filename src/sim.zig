@@ -1340,6 +1340,27 @@ test "the whole combat simulation is deterministic" {
     }
 }
 
+test "the stress load holds exactly the requested counts on the wire" {
+    // The phase-2 definition of done is observed through a client, so the counts
+    // a snapshot reports have to be the counts that were asked for — not merely
+    // close to them. The player is left armed: enemies die and are reaped every
+    // tick, and the load is still what the next snapshot advertises.
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    _ = p;
+    sim.stress = .{ .enemies = 1000, .projectiles = 500 };
+
+    var i: usize = 0;
+    while (i < 120) : (i += 1) {
+        sim.advance();
+        const view = sim.snapshotView();
+        try std.testing.expectEqual(@as(u16, 1000), view.counts[1]);
+        try std.testing.expectEqual(@as(u16, 500), view.counts[2]);
+        try std.testing.expectEqual(@as(usize, 1000), sim.enemies.count);
+        try std.testing.expectEqual(@as(usize, 500), sim.projectiles.count);
+    }
+}
+
 test "the stress load holds the world at a fixed size" {
     var sim = Simulation.init();
     const p = sim.spawnPlayer(0).?;
