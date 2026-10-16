@@ -26,7 +26,6 @@ const root = @import("root.zig");
 const sim = @import("sim.zig");
 const enemy = @import("enemy.zig");
 const weapon = @import("weapon.zig");
-const rng = @import("rng.zig");
 
 /// The load DESIGN.md §6 names.
 pub const default_enemies: usize = 1000;
@@ -41,8 +40,7 @@ pub const budget_ms: f64 = 4.0;
 /// targets and every broadphase query has a realistic number of candidates.
 /// Packing them close is the *worst* case for the combat pass, which is what
 /// the DoD is about.
-const enemy_disc_radius: f32 = 35.0;
-const projectile_disc_radius: f32 = 30.0;
+const load_radius: f32 = 35.0;
 
 /// Warm-up ticks, run before the measurement so page faults on the first touch
 /// of the pools and caches do not land inside it.
@@ -87,13 +85,12 @@ pub fn run(
     const player = s.spawnPlayer(0).?;
     player.pos = .{ 0.0, 0.0 };
 
-    var r = rng.Rng.init(0xbeef_1234);
-    topUp(s, want_enemies, want_projectiles, &r, player.pos);
+    topUp(s, want_enemies, want_projectiles);
 
     var i: usize = 0;
     while (i < warmup_ticks) : (i += 1) {
         s.advance();
-        topUp(s, want_enemies, want_projectiles, &r, player.pos);
+        topUp(s, want_enemies, want_projectiles);
     }
 
     var total_ns: i96 = 0;
@@ -112,7 +109,7 @@ pub fn run(
         const elapsed = before.durationTo(after).raw.nanoseconds;
         total_ns += elapsed;
         max_ns = @max(max_ns, elapsed);
-        topUp(s, want_enemies, want_projectiles, &r, player.pos);
+        topUp(s, want_enemies, want_projectiles);
     }
 
     const fticks: f64 = @floatFromInt(ticks);
@@ -131,33 +128,10 @@ pub fn run(
 }
 
 /// Refill the world to the target load, spawning near the player so the combat
-/// pass always has work to do.
-fn topUp(
-    s: *sim.Simulation,
-    want_enemies: usize,
-    want_projectiles: usize,
-    r: *rng.Rng,
-    around: [2]f32,
-) void {
-    const gun = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
-
-    while (s.projectiles.count < want_projectiles) {
-        const angle = r.range(0.0, 2.0 * std.math.pi);
-        const dist = r.range(2.0, projectile_disc_radius);
-        const dir = [2]f32{ @cos(angle), @sin(angle) };
-        const pos = [2]f32{ around[0] + dir[0] * dist, around[1] + dir[1] * dist };
-        if (s.projectiles.spawn(0, gun, pos, dir) == null) break;
-    }
-
-    while (s.enemies.count < want_enemies) {
-        const angle = r.range(0.0, 2.0 * std.math.pi);
-        const dist = r.range(1.0, enemy_disc_radius);
-        const pos = [2]f32{
-            around[0] + @cos(angle) * dist,
-            around[1] + @sin(angle) * dist,
-        };
-        if (s.enemies.spawn(.circle_t1, pos) == null) break;
-    }
+/// pass always has work to do. The simulation owns the placement, so the
+/// benchmark and the server's `--stress-enemies` mode build the same world.
+fn topUp(s: *sim.Simulation, want_enemies: usize, want_projectiles: usize) void {
+    s.topUpLoad(want_enemies, want_projectiles, load_radius);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,8 +185,7 @@ test "the load actually reaches the counts the report claims" {
     var s = sim.Simulation.init();
     const player = s.spawnPlayer(0).?;
     player.pos = .{ 0.0, 0.0 };
-    var r = rng.Rng.init(1);
-    topUp(&s, 1000, 500, &r, player.pos);
+    topUp(&s, 1000, 500);
 
     try std.testing.expectEqual(@as(usize, 1000), s.enemies.count);
     try std.testing.expectEqual(@as(usize, 500), s.projectiles.count);
@@ -223,7 +196,7 @@ test "the load actually reaches the counts the report claims" {
     try std.testing.expect(s.projectiles.count > 100);
 
     // The pool caps still hold under a deliberately oversized target.
-    topUp(&s, root.max_enemies + 1000, root.max_projectiles + 1000, &r, player.pos);
+    topUp(&s, root.max_enemies + 1000, root.max_projectiles + 1000);
     try std.testing.expectEqual(root.max_enemies, s.enemies.count);
     try std.testing.expectEqual(root.max_projectiles, s.projectiles.count);
 }

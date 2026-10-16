@@ -106,6 +106,20 @@ pub const player_hp_floor: f32 = 1.0;
 /// per-run variety changes this at `Simulation.init`, not here.
 pub const spawn_seed: u64 = 0x5eed5eed5eed5eed;
 
+/// A fixed load to hold for the whole run, instead of the natural spawn curve.
+///
+/// This exists so the phase-2 definition of done can be *observed* rather than
+/// waited for: the natural curve of DESIGN.md §4 does not reach 1,000 live
+/// enemies until roughly twelve minutes in, which is far too long to sit
+/// through while measuring a frame rate. It is a measurement tool, off in
+/// normal play, and the server only turns it on from `--stress-enemies`.
+pub const StressLoad = struct {
+    enemies: usize,
+    projectiles: usize,
+    /// Radius of the disc the load is placed in, around the players' centroid.
+    radius: f32 = 35.0,
+};
+
 /// One player in the simulation (DESIGN.md §2 field list, phase-1 subset).
 pub const PlayerState = struct {
     id: u8 = 0,
@@ -172,6 +186,9 @@ pub const Simulation = struct {
     /// Fractional spawns carried between spawn evaluations, so the rate curve
     /// is not rounded down once per second.
     spawn_accum: f32 = 0.0,
+    /// When set, the world is held at this load every tick instead of being
+    /// populated by the spawn curve. See `StressLoad`.
+    stress: ?StressLoad = null,
 
     /// Scratch space for the snapshot encoder; keeps encoding allocation-free.
     net_scratch: [root.max_players]wire.PlayerNet = root.filledWithDefault(wire.PlayerNet, root.max_players),
@@ -286,6 +303,45 @@ pub const Simulation = struct {
 
         self.tick += 1;
         if (self.tick % enemy.spawn_interval_ticks == 0) self.spawnWave();
+        if (self.stress) |load| self.topUpLoad(load.enemies, load.projectiles, load.radius);
+    }
+
+    /// Refill the world to a fixed load, spawning around the alive players'
+    /// centroid.
+    ///
+    /// Used by the stress load above and by the benchmark, so both measure and
+    /// serve exactly the same world. It draws from the simulation's own RNG, so
+    /// a stress run is reproducible too.
+    pub fn topUpLoad(
+        self: *Simulation,
+        want_enemies: usize,
+        want_projectiles: usize,
+        radius: f32,
+    ) void {
+        const around = self.playerCentroid() orelse return;
+        const limit = root.arena_half_size - enemy.max_radius;
+        const gun = weapon.spec(@intFromEnum(weapon.Id.gun)) orelse return;
+
+        while (self.projectiles.count < want_projectiles) {
+            const angle = self.rng.range(0.0, 2.0 * std.math.pi);
+            const dist = self.rng.range(2.0, radius);
+            const dir = [2]f32{ @cos(angle), @sin(angle) };
+            const pos = [2]f32{
+                std.math.clamp(around[0] + dir[0] * dist, -limit, limit),
+                std.math.clamp(around[1] + dir[1] * dist, -limit, limit),
+            };
+            if (self.projectiles.spawn(0, gun, pos, dir) == null) break;
+        }
+
+        while (self.enemies.count < want_enemies) {
+            const angle = self.rng.range(0.0, 2.0 * std.math.pi);
+            const dist = self.rng.range(1.0, radius);
+            const pos = [2]f32{
+                std.math.clamp(around[0] + @cos(angle) * dist, -limit, limit),
+                std.math.clamp(around[1] + @sin(angle) * dist, -limit, limit),
+            };
+            if (self.enemies.spawn(.circle_t1, pos) == null) break;
+        }
     }
 
     /// Centroid of the alive players, or `null` when nobody is connected.
@@ -1283,6 +1339,42 @@ test "the whole combat simulation is deterministic" {
         try std.testing.expectEqual(a.projectiles.id[k], b.projectiles.id[k]);
         try std.testing.expectEqual(a.projectiles.pos[k][0], b.projectiles.pos[k][0]);
     }
+}
+
+test "the stress load holds the world at a fixed size" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    sim.stress = .{ .enemies = 500, .projectiles = 200 };
+
+    // Nothing to hold before a player exists: the load is placed around them.
+    var empty = Simulation.init();
+    empty.stress = .{ .enemies = 10, .projectiles = 10 };
+    empty.advance();
+    try std.testing.expectEqual(@as(usize, 0), empty.enemies.count);
+
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        sim.advance();
+        try std.testing.expectEqual(@as(usize, 500), sim.enemies.count);
+        try std.testing.expectEqual(@as(usize, 200), sim.projectiles.count);
+    }
+
+    // Every stressed enemy is a swarmer inside the placement radius.
+    for (0..sim.enemies.count) |e| {
+        try std.testing.expectEqual(
+            @as(u8, @intFromEnum(enemy.Archetype.circle_t1)),
+            sim.enemies.archetype[e],
+        );
+        const d = std.math.hypot(sim.enemies.pos[e][0], sim.enemies.pos[e][1]);
+        try std.testing.expect(d <= 36.0);
+    }
+
+    // Turning it off lets the world drain again.
+    sim.stress = null;
+    i = 0;
+    while (i < 200) : (i += 1) sim.advance();
+    try std.testing.expect(sim.enemies.count < 500);
 }
 
 test "a paused simulation advances nothing" {
