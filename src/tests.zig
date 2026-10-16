@@ -30,7 +30,7 @@ test "all modules are reachable" {
     _ = net_opt.SetNoDelayError;
     _ = rng.Rng.init(0);
     try std.testing.expectEqual(spatial.cell_size, 4.0);
-    try std.testing.expect(enemy.implemented.len == 2);
+    try std.testing.expectEqual(@as(usize, 7), enemy.implemented.len);
     try std.testing.expect(weapon.specs.len == 4);
     try std.testing.expect(combat.max_hits_per_projectile >= 1);
     try std.testing.expect(bench.default_enemies == 1000);

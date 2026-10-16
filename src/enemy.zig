@@ -19,17 +19,22 @@ pub const Archetype = wire.EnemyArchetype;
 
 /// Largest radius among the implemented archetypes. Broadphase queries add it
 /// to a weapon's reach so an enemy whose *edge* overlaps is still a candidate.
-pub const max_radius: f32 = 0.5;
+/// The boss is the widest body in the game at 3.0 units.
+pub const max_radius: f32 = 3.0;
 
-/// Per-archetype stats (DESIGN.md §4, Tier 1 rows).
+/// Per-archetype stats (DESIGN.md §4).
 pub const Stats = struct {
     hp: f32,
     move_speed: f32,
     contact_dmg: f32,
     radius: f32,
     /// Simulation tick at which the archetype unlocks (DESIGN.md §4 "Tier &
-    /// unlock"). Circle T1 is available from the first tick.
+    /// unlock"). Circle T1 is available from the first tick; the boss is not
+    /// on the spawn curve at all and is placed by its own 180 s timer.
     unlock_tick: u32,
+    /// Fraction of a knockback impulse that survives (DESIGN.md §4: the Brute
+    /// resists 50%, the Goliath 85%, the boss and a charging Lancer 100%).
+    knockback_resist: f32 = 0.0,
 };
 
 /// Stats for an archetype, or `null` for one this phase does not implement.
@@ -52,12 +57,146 @@ pub fn stats(a: Archetype) ?Stats {
             .radius = 0.5,
             .unlock_tick = 90 * root.tick_hz, // 1:30
         },
-        else => null,
+        .circle_t2 => .{
+            .hp = 80.0,
+            .move_speed = 3.8,
+            .contact_dmg = 12.0,
+            .radius = 0.9,
+            .unlock_tick = 5 * 60 * root.tick_hz, // 5:00
+            .knockback_resist = 0.5,
+        },
+        .triangle_t2 => .{
+            .hp = 45.0,
+            .move_speed = 5.0,
+            .contact_dmg = 10.0,
+            .radius = 0.7,
+            .unlock_tick = 7 * 60 * root.tick_hz, // 7:00
+        },
+        .circle_t3 => .{
+            .hp = 320.0,
+            .move_speed = 3.2,
+            .contact_dmg = 22.0,
+            .radius = 1.4,
+            .unlock_tick = 12 * 60 * root.tick_hz, // 12:00
+            .knockback_resist = 0.85,
+        },
+        .triangle_t3 => .{
+            .hp = 180.0,
+            .move_speed = 8.5,
+            .contact_dmg = 28.0,
+            .radius = 1.0,
+            .unlock_tick = 14 * 60 * root.tick_hz, // 14:00
+        },
+        .boss => .{
+            .hp = 2500.0,
+            .move_speed = 5.5,
+            .contact_dmg = 35.0,
+            .radius = 3.0,
+            .unlock_tick = 0,
+            .knockback_resist = 1.0,
+        },
     };
 }
 
 /// Archetypes this phase can spawn.
-pub const implemented = [_]Archetype{ .circle_t1, .triangle_t1 };
+pub const implemented = [_]Archetype{
+    .circle_t1, .circle_t2, .circle_t3,
+    .triangle_t1, .triangle_t2, .triangle_t3,
+    .boss,
+};
+
+// ---------------------------------------------------------------------------
+// Difficulty curve (DESIGN.md §1)
+// ---------------------------------------------------------------------------
+
+/// `M_HP(t)`, the enemy health multiplier, as a function of elapsed minutes.
+///
+/// The four phases of DESIGN.md §1, stitched continuously: linear onboarding
+/// to 5:00, quadratic mid-game to 15:00, exponential climax to 20:00, and
+/// endless escalation past it. Applied to an enemy's health when it spawns.
+pub fn hpMultiplier(t_minutes: f32) f32 {
+    if (t_minutes <= 5.0) return 1.0 + 0.20 * t_minutes;
+    if (t_minutes <= 15.0) return 2.0 + 0.25 * (t_minutes - 5.0) * (t_minutes - 5.0);
+    if (t_minutes <= 20.0) return 27.0 * std.math.pow(f32, 1.22, t_minutes - 15.0);
+    return 73.0 * std.math.pow(f32, 1.35, t_minutes - 20.0);
+}
+
+/// Enemy move-speed multiplier: +4% per minute past 20:00 (DESIGN.md §1,
+/// Phase D). Below 20:00 the curve does not touch speed.
+pub fn speedMultiplier(t_minutes: f32) f32 {
+    if (t_minutes <= 20.0) return 1.0;
+    return 1.0 + 0.04 * (t_minutes - 20.0);
+}
+
+// ---------------------------------------------------------------------------
+// Elite modifiers (DESIGN.md §4)
+// ---------------------------------------------------------------------------
+
+/// `elite_mask` bit layout. An elite carries exactly one modifier; the field
+/// is a mask so the client reads each bit independently and a later phase can
+/// combine them.
+pub const elite = struct {
+    pub const vampiric: u8 = 1 << 0;
+    pub const splitter: u8 = 1 << 1;
+    pub const shielded: u8 = 1 << 2;
+    pub const haste_aura: u8 = 1 << 3;
+
+    /// Elites gain 3.0x HP and +25% radius, and drop 5x XP (DESIGN.md §4).
+    pub const hp_mult: f32 = 3.0;
+    pub const radius_mult: f32 = 1.25;
+
+    /// Vampiric: +20% move speed, and restores 15% max HP on damaging a player.
+    pub const vampiric_speed_mult: f32 = 1.20;
+    pub const vampiric_heal: f32 = 0.15;
+
+    /// Haste Aura: an 8.0 u aura granting +35% movement speed to nearby enemies.
+    pub const haste_radius: f32 = 8.0;
+    pub const haste_speed_mult: f32 = 1.35;
+
+    /// Shielded: a barrier of 50% max HP that regenerates after 3.0 s without
+    /// taking damage.
+    pub const shield_barrier: f32 = 0.5;
+    pub const shield_regen_ticks: u16 = 3 * root.tick_hz;
+
+    /// Splitter: on death, splits into 3 miniature copies with 30% HP, +30%
+    /// speed and 0.6x radius.
+    pub const splitter_copies: usize = 3;
+    pub const splitter_hp: f32 = 0.30;
+    pub const splitter_speed: f32 = 1.30;
+    pub const splitter_radius: f32 = 0.60;
+};
+
+/// Elite spawn chance `1% + 0.5% x t`, capped at 15% (DESIGN.md §4).
+pub fn eliteChance(t_minutes: f32) f32 {
+    return @min(0.01 + 0.005 * t_minutes, 0.15);
+}
+
+// ---------------------------------------------------------------------------
+// Boss (DESIGN.md §4)
+// ---------------------------------------------------------------------------
+
+pub const boss = struct {
+    /// One boss every 180 s (3:00, 6:00, 9:00, ...).
+    pub const interval_ticks: u32 = 180 * root.tick_hz;
+    /// `2500 x M_HP(t) x (1 + 0.75(P - 1))`; the party term is applied by the
+    /// spawner, which knows the player count.
+    pub const base_hp: f32 = 2500.0;
+    pub const party_hp_step: f32 = 0.75;
+
+    /// Attack cycle: a 6.0 s loop alternating a 12-projectile radial burst
+    /// with a telegraphed dash. Attacks land every 3.0 s, alternating.
+    pub const attack_interval_ticks: u32 = 3 * root.tick_hz;
+    pub const burst_count: usize = 12;
+    pub const burst_speed: f32 = 14.0;
+    pub const burst_damage: f32 = 18.0;
+    pub const burst_ttl_ticks: u16 = 2 * root.tick_hz;
+    /// The dash is telegraphed by a 1.0 s warning box, then runs for 1.0 s at
+    /// 22.0 u/s (22 units). DESIGN.md fixes the warning and the speed but not
+    /// the dash length; 1.0 s is the reading here.
+    pub const dash_speed: f32 = 22.0;
+    pub const telegraph_ticks: u32 = root.tick_hz;
+    pub const dash_ticks: u32 = root.tick_hz;
+};
 
 /// Darter behaviour constants (DESIGN.md §4, Triangle T1).
 pub const darter = struct {
@@ -73,11 +212,42 @@ pub const darter = struct {
     pub const lunge_ticks: u16 = 30;
 };
 
-/// Enemy AI states. Only the darter leaves `pursue`.
+/// Spitter behaviour constants (DESIGN.md §4, Triangle T2).
+pub const spitter = struct {
+    /// Range at which the spitter halts and starts firing.
+    pub const fire_range: f32 = 18.0;
+    /// Seconds between shots.
+    pub const fire_interval_ticks: u16 = 150; // 2.5 s
+    /// Projectile speed and damage.
+    pub const shot_speed: f32 = 9.0;
+    pub const shot_damage: f32 = 10.0;
+    pub const shot_ttl_ticks: u16 = 150; // 2.5 s of travel
+    /// How far outside `fire_range` the player must move before the spitter
+    /// resumes pursuit, so one sitting on the boundary does not oscillate.
+    pub const resume_band: f32 = 4.0;
+};
+
+/// Lancer behaviour constants (DESIGN.md §4, Triangle T3).
+pub const lancer = struct {
+    /// Seconds between charge-vector locks.
+    pub const lock_interval_ticks: u16 = 240; // 4.0 s
+    /// Charge speed and the distance it covers (24.0 u at 20.0 u/s = 1.2 s).
+    pub const charge_speed: f32 = 20.0;
+    pub const charge_distance: f32 = 24.0;
+    pub const charge_ticks: u16 = 72; // 1.2 s
+};
+
+/// Enemy AI states.
+///
+/// The darter leaves `pursue` for `windup`/`lunge`; the lancer for `charge`;
+/// the spitter for `halt`; the boss for `telegraph`/`lunge`.
 pub const AiState = enum(u8) {
     pursue = 0,
     windup = 1,
     lunge = 2,
+    halt = 3,
+    charge = 4,
+    telegraph = 5,
 };
 
 /// Ticks between contact hits from the same enemy.
@@ -130,12 +300,33 @@ pub fn surgeActive(tick: u32) bool {
 
 /// Pick an archetype for a spawn at `tick`.
 ///
-/// DESIGN.md §4 gives unlock times but no mix ratio, so once both Tier 1
-/// archetypes are unlocked the choice is an even 50/50.
+/// DESIGN.md §4 gives unlock times but no mix ratio, so every unlocked
+/// archetype is in play and the draw is weighted toward the higher tiers
+/// (Tier 1 = 1, Tier 2 = 2, Tier 3 = 3): the mix escalates as the run
+/// progresses, which is the curve the design is after. The boss is not on the
+/// curve — it is placed by its own 180 s timer.
 pub fn pickArchetype(r: *rng.Rng, tick: u32) Archetype {
-    const triangle = stats(.triangle_t1).?.unlock_tick;
-    if (tick < triangle) return .circle_t1;
-    return if (r.below(2) == 0) .circle_t1 else .triangle_t1;
+    const table = [_]struct { a: Archetype, weight: usize }{
+        .{ .a = .circle_t1, .weight = 1 },
+        .{ .a = .triangle_t1, .weight = 1 },
+        .{ .a = .circle_t2, .weight = 2 },
+        .{ .a = .triangle_t2, .weight = 2 },
+        .{ .a = .circle_t3, .weight = 3 },
+        .{ .a = .triangle_t3, .weight = 3 },
+    };
+
+    var total: usize = 0;
+    for (table) |entry| {
+        if (tick >= stats(entry.a).?.unlock_tick) total += entry.weight;
+    }
+    // Circle T1 is always unlocked, so the total is never zero.
+    var pick = r.below(total);
+    for (table) |entry| {
+        if (tick < stats(entry.a).?.unlock_tick) continue;
+        if (pick < entry.weight) return entry.a;
+        pick -= entry.weight;
+    }
+    return .circle_t1;
 }
 
 /// The pincer axis for one spawn event, or `null` when no surge is running.
@@ -199,6 +390,20 @@ pub const Pool = struct {
     freeze_ticks: [root.max_enemies]u16 = @splat(0),
     /// Target Painter: ticks of mark left by a Gun hit (DESIGN.md §3).
     marked_ticks: [root.max_enemies]u16 = @splat(0),
+    /// Fraction of a knockback impulse that survives (DESIGN.md §4).
+    kb_resist: [root.max_enemies]f32 = @splat(0.0),
+    /// Direction this enemy faces, which is what the wire's `vel_angle`
+    /// reports. Equal to the movement direction, except for a boss telegraphing
+    /// a dash: it stands still but faces the way it is about to go.
+    facing: [root.max_enemies][2]f32 = @splat(.{ 1.0, 0.0 }),
+    /// Boss only: immune to Cryo Flechette's freeze (DESIGN.md §4).
+    status_immune: [root.max_enemies]bool = @splat(false),
+    /// Shielded elite: a barrier absorbed ahead of HP (DESIGN.md §4).
+    barrier: [root.max_enemies]f32 = @splat(0.0),
+    /// Shielded elite: ticks of no damage left before the barrier regenerates.
+    shielded_regen: [root.max_enemies]u16 = @splat(0),
+    /// Boss: which attack comes next (0 = radial burst, 1 = telegraphed dash).
+    boss_parity: [root.max_enemies]u8 = @splat(0),
     /// Enemies that died while frozen, queued for Cryo Flechette's shatter
     /// (DESIGN.md §3). `sim.zig` drains this after `reapDead`.
     shatter_pos: [root.max_enemies][2]f32 = @splat(.{ 0.0, 0.0 }),
@@ -206,9 +411,32 @@ pub const Pool = struct {
     shatter_damage: [root.max_enemies]f32 = @splat(0.0),
     shatter_count: usize = 0,
 
-    /// Reserve a slot. Returns `null` when the pool is full or the archetype is
-    /// not implemented in this phase — a full pool must degrade, not crash.
-    pub fn spawn(self: *Pool, archetype: Archetype, pos: [2]f32) ?usize {
+    /// Spawn-time overrides. The difficulty curve, the elite modifiers and the
+    /// Splitter's minis all scale an archetype's base stats, and the boss's HP
+    /// formula replaces them outright, so a spawn is parameterised rather than
+    /// hardcoded to the archetype's row.
+    pub const SpawnOpts = struct {
+        /// Absolute HP; `null` takes the archetype's base, scaled by `hp_mult`.
+        hp: ?f32 = null,
+        hp_mult: f32 = 1.0,
+        /// Absolute radius / speed; `null` takes the archetype's base scaled by
+        /// the corresponding `_mult`.
+        radius: ?f32 = null,
+        radius_mult: f32 = 1.0,
+        speed: ?f32 = null,
+        speed_mult: f32 = 1.0,
+        elite_mask: u8 = 0,
+        knockback_resist: f32 = 0.0,
+        status_immune: bool = false,
+    };
+
+    /// Spawn with scaled stats. `null` is the archetype's own row.
+    pub fn spawnWith(
+        self: *Pool,
+        archetype: Archetype,
+        pos: [2]f32,
+        opts: SpawnOpts,
+    ) ?usize {
         if (self.count >= root.max_enemies) return null;
         const s = stats(archetype) orelse return null;
 
@@ -216,18 +444,24 @@ pub const Pool = struct {
         self.id[i] = self.next_id;
         self.next_id +%= 1;
         self.archetype[i] = @intFromEnum(archetype);
-        self.elite_mask[i] = 0;
+        self.elite_mask[i] = opts.elite_mask;
         self.ai_state[i] = @intFromEnum(AiState.pursue);
         self.ai_timer[i] = 0;
         self.contact_cd[i] = 0;
         self.pos[i] = pos;
         self.vel[i] = .{ 0.0, 0.0 };
         self.kb[i] = .{ 0.0, 0.0 };
-        self.hp[i] = s.hp;
-        self.max_hp[i] = s.hp;
-        self.radius[i] = s.radius;
+        self.hp[i] = (opts.hp orelse s.hp) * opts.hp_mult;
+        self.max_hp[i] = (opts.hp orelse s.hp) * opts.hp_mult;
+        self.radius[i] = (opts.radius orelse s.radius) * opts.radius_mult;
         self.contact_dmg[i] = s.contact_dmg;
-        self.move_speed[i] = s.move_speed;
+        self.move_speed[i] = (opts.speed orelse s.move_speed) * opts.speed_mult;
+        self.kb_resist[i] = opts.knockback_resist;
+        self.facing[i] = .{ 1.0, 0.0 };
+        self.status_immune[i] = opts.status_immune;
+        self.barrier[i] = 0.0;
+        self.shielded_regen[i] = 0;
+        self.boss_parity[i] = 0;
         self.debuff_mult[i] = 1.0;
         self.slow_ticks[i] = 0;
         self.slow_factor[i] = 1.0;
@@ -235,6 +469,27 @@ pub const Pool = struct {
         self.freeze_ticks[i] = 0;
         self.count += 1;
         return i;
+    }
+
+    /// Reserve a slot with the archetype's base stats. Returns `null` when the
+    /// pool is full or the archetype is not implemented — a full pool must
+    /// degrade, not crash.
+    pub fn spawn(self: *Pool, archetype: Archetype, pos: [2]f32) ?usize {
+        return self.spawnWith(archetype, pos, .{});
+    }
+
+    /// True when slot `i` holds the boss.
+    pub fn isBoss(self: *const Pool, i: usize) bool {
+        return self.archetype[i] == @intFromEnum(Archetype.boss);
+    }
+
+    /// How many bosses are live. The spawner places at most one at a time.
+    pub fn bossCount(self: *const Pool) usize {
+        var n: usize = 0;
+        for (0..self.count) |i| {
+            if (self.isBoss(i)) n += 1;
+        }
+        return n;
     }
 
     /// Remove slot `i` by moving the last live enemy into it.
@@ -265,7 +520,10 @@ pub const Pool = struct {
     /// Compact away every enemy at or below zero HP. Returns the kill count.
     ///
     /// An enemy that dies while frozen is queued for Cryo Flechette's shatter
-    /// (DESIGN.md §3); `sim.zig` drains `shatter_*` after this returns.
+    /// (DESIGN.md §3); `sim.zig` drains `shatter_*` after this returns. A
+    /// Splitter elite splits into its miniature copies on death (DESIGN.md §4):
+    /// the copies are appended to the pool, alive, so they are not reaped by
+    /// this same pass.
     pub fn reapDead(self: *Pool) usize {
         var killed: usize = 0;
         var i: usize = 0;
@@ -278,6 +536,9 @@ pub const Pool = struct {
                     self.shatter_damage[k] = 120.0;
                     self.shatter_count += 1;
                 }
+                if (self.elite_mask[i] & elite.splitter != 0) {
+                    self.splitIntoMinis(i);
+                }
                 self.swapRemove(i);
                 killed += 1;
             } else {
@@ -287,16 +548,62 @@ pub const Pool = struct {
         return killed;
     }
 
+    /// Spawn a Splitter's three miniature copies where it died (DESIGN.md §4):
+    /// 30% of the parent's max HP, +30% speed, 0.6x radius, no elite mask, so
+    /// the copies cannot split again.
+    fn splitIntoMinis(self: *Pool, i: usize) void {
+        const a: Archetype = @enumFromInt(self.archetype[i]);
+        var k: usize = 0;
+        while (k < elite.splitter_copies) : (k += 1) {
+            const angle = @as(f32, @floatFromInt(k)) * (2.0 * std.math.pi / @as(f32, @floatFromInt(elite.splitter_copies)));
+            const pos = .{
+                self.pos[i][0] + @cos(angle) * self.radius[i],
+                self.pos[i][1] + @sin(angle) * self.radius[i],
+            };
+            _ = self.spawnWith(a, pos, .{
+                .hp = elite.splitter_hp * self.max_hp[i],
+                .radius = elite.splitter_radius * self.radius[i],
+                .speed = elite.splitter_speed * self.move_speed[i],
+            });
+        }
+    }
+
     /// Apply `amount` damage and `impulse` knockback along `dir`. Returns true
     /// when this hit killed the enemy.
     ///
     /// The Vulcan Minigun's stacking debuff multiplies the damage taken, so a
-    /// debuffed enemy takes more than the raw amount.
+    /// debuffed enemy takes more than the raw amount. A Shielded elite's barrier
+    /// absorbs ahead of HP, and the archetype's knockback resistance scales the
+    /// impulse.
     pub fn applyHit(self: *Pool, i: usize, amount: f32, dir: [2]f32, impulse: f32) bool {
-        self.hp[i] -= amount * self.debuff_mult[i];
-        self.kb[i][0] += dir[0] * impulse;
-        self.kb[i][1] += dir[1] * impulse;
+        var damage = amount * self.debuff_mult[i];
+        if (self.barrier[i] > 0.0) {
+            const absorbed = @min(self.barrier[i], damage);
+            self.barrier[i] -= absorbed;
+            damage -= absorbed;
+            // Taking damage restarts the barrier's regeneration delay.
+            self.shielded_regen[i] = elite.shield_regen_ticks;
+        }
+        self.hp[i] -= damage;
+        const scale = 1.0 - self.kb_resist[i];
+        self.kb[i][0] += dir[0] * impulse * scale;
+        self.kb[i][1] += dir[1] * impulse * scale;
         return self.hp[i] <= 0.0;
+    }
+
+    /// Age every Shielded barrier's regeneration delay and restore the barrier
+    /// to its full 50% once the enemy has gone 3.0 s without taking damage.
+    pub fn tickShieldRegen(self: *Pool) void {
+        for (0..self.count) |i| {
+            if (self.elite_mask[i] & elite.shielded == 0) continue;
+            if (self.barrier[i] >= elite.shield_barrier * self.max_hp[i]) continue;
+            if (self.shielded_regen[i] > 0) {
+                self.shielded_regen[i] -= 1;
+                if (self.shielded_regen[i] == 0) {
+                    self.barrier[i] = elite.shield_barrier * self.max_hp[i];
+                }
+            }
+        }
     }
 };
 
@@ -304,7 +611,7 @@ pub const Pool = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "Tier 1 stats match DESIGN.md §4" {
+test "archetype stats match DESIGN.md §4" {
     const swarm = stats(.circle_t1).?;
     try std.testing.expectEqual(@as(f32, 15.0), swarm.hp);
     try std.testing.expectEqual(@as(f32, 4.5), swarm.move_speed);
@@ -319,10 +626,76 @@ test "Tier 1 stats match DESIGN.md §4" {
     try std.testing.expectEqual(@as(f32, 0.5), darter_stats.radius);
     try std.testing.expectEqual(@as(u32, 90 * 60), darter_stats.unlock_tick);
 
-    // Later tiers are not implemented in this phase.
-    try std.testing.expect(stats(.circle_t2) == null);
-    try std.testing.expect(stats(.boss) == null);
-    try std.testing.expectEqual(@as(f32, 0.5), max_radius);
+    const brute = stats(.circle_t2).?;
+    try std.testing.expectEqual(@as(f32, 80.0), brute.hp);
+    try std.testing.expectEqual(@as(f32, 3.8), brute.move_speed);
+    try std.testing.expectEqual(@as(f32, 12.0), brute.contact_dmg);
+    try std.testing.expectEqual(@as(f32, 0.9), brute.radius);
+    try std.testing.expectEqual(@as(u32, 5 * 60 * 60), brute.unlock_tick);
+    try std.testing.expectEqual(@as(f32, 0.5), brute.knockback_resist);
+
+    const spitter_stats = stats(.triangle_t2).?;
+    try std.testing.expectEqual(@as(f32, 45.0), spitter_stats.hp);
+    try std.testing.expectEqual(@as(f32, 5.0), spitter_stats.move_speed);
+    try std.testing.expectEqual(@as(f32, 10.0), spitter_stats.contact_dmg);
+    try std.testing.expectEqual(@as(f32, 0.7), spitter_stats.radius);
+    try std.testing.expectEqual(@as(u32, 7 * 60 * 60), spitter_stats.unlock_tick);
+
+    const goliath = stats(.circle_t3).?;
+    try std.testing.expectEqual(@as(f32, 320.0), goliath.hp);
+    try std.testing.expectEqual(@as(f32, 3.2), goliath.move_speed);
+    try std.testing.expectEqual(@as(f32, 22.0), goliath.contact_dmg);
+    try std.testing.expectEqual(@as(f32, 1.4), goliath.radius);
+    try std.testing.expectEqual(@as(u32, 12 * 60 * 60), goliath.unlock_tick);
+    try std.testing.expectEqual(@as(f32, 0.85), goliath.knockback_resist);
+
+    const lancer_stats = stats(.triangle_t3).?;
+    try std.testing.expectEqual(@as(f32, 180.0), lancer_stats.hp);
+    try std.testing.expectEqual(@as(f32, 8.5), lancer_stats.move_speed);
+    try std.testing.expectEqual(@as(f32, 28.0), lancer_stats.contact_dmg);
+    try std.testing.expectEqual(@as(f32, 1.0), lancer_stats.radius);
+    try std.testing.expectEqual(@as(u32, 14 * 60 * 60), lancer_stats.unlock_tick);
+
+    const boss_stats = stats(.boss).?;
+    try std.testing.expectEqual(@as(f32, 2500.0), boss_stats.hp);
+    try std.testing.expectEqual(@as(f32, 5.5), boss_stats.move_speed);
+    try std.testing.expectEqual(@as(f32, 35.0), boss_stats.contact_dmg);
+    try std.testing.expectEqual(@as(f32, 3.0), boss_stats.radius);
+    try std.testing.expectEqual(@as(f32, 1.0), boss_stats.knockback_resist);
+
+    // The boss is the widest body in the game.
+    try std.testing.expectEqual(@as(f32, 3.0), max_radius);
+}
+
+test "the difficulty curve follows DESIGN.md §1" {
+    // Phase A: 1.0 + 0.20t.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), hpMultiplier(0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), hpMultiplier(5.0), 1e-6);
+    // Phase B: 2.0 + 0.25(t-5)^2, continuous with A at 5:00.
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), hpMultiplier(5.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.25), hpMultiplier(8.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 27.0), hpMultiplier(15.0), 1e-6);
+    // Phase C: 27.0 x 1.22^(t-15), continuous with B at 15:00.
+    try std.testing.expectApproxEqAbs(@as(f32, 27.0), hpMultiplier(15.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 73.0), hpMultiplier(20.0), 0.05);
+    // Phase D: 73.0 x 1.35^(t-20), continuous with C at 20:00.
+    try std.testing.expectApproxEqAbs(@as(f32, 73.0), hpMultiplier(20.0), 0.05);
+    try std.testing.expect(hpMultiplier(25.0) > hpMultiplier(20.0));
+
+    // Speed: +4% per minute past 20:00, untouched below it.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), speedMultiplier(0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), speedMultiplier(20.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.04), speedMultiplier(21.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.20), speedMultiplier(25.0), 1e-6);
+}
+
+test "the elite spawn chance follows DESIGN.md §4" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), eliteChance(0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), eliteChance(8.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.11), eliteChance(20.0), 1e-6);
+    // Capped at 15%, which the raw formula reaches at 28:00.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.15), eliteChance(28.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.15), eliteChance(100.0), 1e-6);
 }
 
 test "the active cap follows DESIGN.md §4" {
@@ -428,10 +801,41 @@ test "spawn fills the pool and refuses to overrun it" {
     try std.testing.expect(pool.spawn(.circle_t1, .{ 0.0, 0.0 }) == null);
     try std.testing.expectEqual(root.max_enemies, pool.count);
 
-    // An archetype this phase does not implement is refused outright.
-    var small = Pool{};
-    try std.testing.expect(small.spawn(.circle_t2, .{ 0.0, 0.0 }) == null);
-    try std.testing.expectEqual(@as(usize, 0), small.count);
+    // A full pool refuses a boss too, rather than overrunning.
+    try std.testing.expect(pool.spawn(.boss, .{ 0.0, 0.0 }) == null);
+}
+
+test "spawnWith scales an archetype's stats and carries the elite mask" {
+    var pool = Pool{};
+    const base = pool.spawn(.circle_t1, .{ 1.0, 1.0 }).?;
+    try std.testing.expectEqual(@as(f32, 15.0), pool.hp[base]);
+    try std.testing.expectEqual(@as(f32, 0.5), pool.radius[base]);
+    try std.testing.expectEqual(@as(f32, 4.5), pool.move_speed[base]);
+    try std.testing.expectEqual(@as(u8, 0), pool.elite_mask[base]);
+
+    // An elite brute: 3.0x HP, +25% radius, Vampiric's +20% speed.
+    const elite_i = pool.spawnWith(.circle_t2, .{ 2.0, 2.0 }, .{
+        .hp_mult = 3.0,
+        .radius_mult = 1.25,
+        .speed_mult = 1.2,
+        .elite_mask = elite.vampiric,
+    }).?;
+    try std.testing.expectEqual(@as(f32, 80.0 * 3.0), pool.hp[elite_i]);
+    try std.testing.expectEqual(@as(f32, 0.9 * 1.25), pool.radius[elite_i]);
+    try std.testing.expectEqual(@as(f32, 3.8 * 1.2), pool.move_speed[elite_i]);
+    try std.testing.expectEqual(elite.vampiric, pool.elite_mask[elite_i]);
+
+    // The boss's HP formula replaces the base outright.
+    const boss_i = pool.spawnWith(.boss, .{ 3.0, 3.0 }, .{
+        .hp_mult = 73.0 * 1.75,
+        .knockback_resist = 1.0,
+        .status_immune = true,
+    }).?;
+    try std.testing.expectEqual(@as(f32, 2500.0 * 73.0 * 1.75), pool.hp[boss_i]);
+    try std.testing.expectEqual(@as(f32, 2500.0 * 73.0 * 1.75), pool.max_hp[boss_i]);
+    try std.testing.expectEqual(@as(f32, 3.0), pool.radius[boss_i]);
+    try std.testing.expectEqual(@as(f32, 1.0), pool.kb_resist[boss_i]);
+    try std.testing.expect(pool.status_immune[boss_i]);
 }
 
 test "spawn gives every enemy a distinct id and the archetype's stats" {

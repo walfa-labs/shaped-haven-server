@@ -40,6 +40,17 @@ pub const max_weapon_level: u8 = 8;
 /// Base XP gem pickup radius in world units (DESIGN.md §1).
 pub const xp_pickup_radius: f32 = 3.0;
 
+/// Interest-management radius in world units (PROTOCOL.md "Interest
+/// management"). A snapshot — full or delta — carries only entities within
+/// this distance of the receiving player. It is sent to the client in
+/// `S2C_WELCOME` as a `u16`.
+///
+/// The orthographic viewport covers 80 x 45 units (DESIGN.md §1), a
+/// half-diagonal of about 45.9 units, so 50 covers the whole screen with a
+/// small margin for the client's 100 ms interpolation delay and for enemies
+/// walking in from the spawn ring at 48–56 units.
+pub const interest_radius: f32 = 50.0;
+
 /// Number of simulation ticks between snapshots.
 pub const ticks_per_snapshot: u32 = tick_hz / snapshot_hz;
 
