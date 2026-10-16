@@ -132,13 +132,15 @@ build the server ships at. Both are quoted so the two are not confused:
 
 | Build | Command | Mean | Worst |
 | --- | --- | --- | --- |
-| ReleaseFast | `zig build test -Doptimize=ReleaseFast` | 0.034 ms/tick | 0.075 ms/tick |
-| Debug | `zig build test` | 0.308 ms/tick | 0.529 ms/tick |
+| ReleaseFast | `zig build test -Doptimize=ReleaseFast` | 0.033 ms/tick | 0.06 – 0.15 ms/tick |
+| Debug | `zig build test` | 0.33 ms/tick | 0.5 – 0.7 ms/tick |
 
 Both over 240 ticks with 1,000 enemies and 500 projectiles live, measured on
-this machine. The benchmark asserts that the load it measured *was* that load —
-the mean live counts over the run must equal the requested ones — so the number
-cannot come from a run that was quietly serving less than the DoD names.
+this machine. The mean is stable; the worst tick is a single sample and moves
+around between runs, so it is quoted as a range. The benchmark asserts that
+the load it measured *was* that load — the mean live counts over the run must
+equal the requested ones — so the number cannot come from a run that was
+quietly serving less than the DoD names.
 
 ### Against a real client
 
