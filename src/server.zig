@@ -42,6 +42,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const wire = @import("wire.zig");
 const sim = @import("sim.zig");
+const delta = @import("delta.zig");
 const net_opt = @import("net_opt.zig");
 
 const net = std.Io.net;
@@ -113,6 +114,15 @@ const Frame = struct {
     }
 };
 
+/// Wrap `bytes` in a frame, freeing them if the frame cannot be allocated so
+/// a failed encode never leaks its payload.
+fn frameOrFree(gpa: std.mem.Allocator, bytes: []u8) !*Frame {
+    return Frame.create(gpa, bytes) catch |e| {
+        gpa.free(bytes);
+        return e;
+    };
+}
+
 /// One accepted TCP connection and its parse/write state.
 ///
 /// Always heap allocated: the connection threads hold a raw pointer to it, and
@@ -175,6 +185,12 @@ pub const Server = struct {
     /// allocated with `gpa` so that they can be released individually.
     arena: *std.heap.ArenaAllocator,
     sim: sim.Simulation,
+    /// The 32-snapshot history ring a delta baseline is diffed against. Heap
+    /// allocated: at 32 full-world snapshots it is a few megabytes, far too
+    /// large to keep inline in a `Server` that tests put on the stack.
+    snapshots: *delta.SnapshotRing,
+    /// Reusable scratch for the per-client snapshot diff, also heap allocated.
+    diff_scratch: *delta.DiffScratch,
     mu: std.Io.Mutex = .init,
     /// Pointers, not values: a connection's address has to stay put for the
     /// whole life of its threads, so removing one can never move another.
@@ -188,11 +204,27 @@ pub const Server = struct {
         gpa: std.mem.Allocator,
         arena: *std.heap.ArenaAllocator,
     ) Server {
+        // The history ring and the diff scratch are allocated from the arena,
+        // which outlives the server and is deinited by the caller.
+        const snapshots = arena.allocator().create(delta.SnapshotRing) catch @panic("out of memory");
+        snapshots.* = .{};
+        // The ring starts empty: every slot tick 0, which is not a valid
+        // snapshot tick, so a baseline lookup finds nothing until a snapshot
+        // has actually been stored.
+        @memset(
+            @as([*]u8, @ptrCast(&snapshots.slots))[0..@sizeOf(@TypeOf(snapshots.slots))],
+            0,
+        );
+        const diff_scratch = arena.allocator().create(delta.DiffScratch) catch @panic("out of memory");
+        diff_scratch.* = .{};
+
         return .{
             .io = io,
             .gpa = gpa,
             .arena = arena,
             .sim = sim.Simulation.init(),
+            .snapshots = snapshots,
+            .diff_scratch = diff_scratch,
         };
     }
 
@@ -420,7 +452,11 @@ pub const Server = struct {
         }
     }
 
-    /// Encode one snapshot and queue it on every connection that wants it.
+    /// Encode one snapshot per connection that wants it and queue them.
+    ///
+    /// Each connection gets its own frame, because a delta is diffed against
+    /// that connection's acknowledged baseline and filtered to its own
+    /// neighbourhood — two clients rarely want the same bytes any more.
     fn broadcast(self: *Server) void {
         // Encoding for nobody is worth avoiding: a snapshot carrying a thousand
         // enemies is around 18 KB, and a client that has dropped mid-run would
@@ -436,29 +472,57 @@ pub const Server = struct {
         self.unlock();
         if (!wanted) return;
 
-        const bytes = wire.encodeSnapshotFull(self.gpa, self.sim.snapshotView()) catch |e| {
-            std.debug.print("[server] error: could not encode snapshot: {s}\n", .{@errorName(e)});
-            return;
-        };
-        const frame = Frame.create(self.gpa, bytes) catch |e| {
-            std.debug.print("[server] error: could not allocate a snapshot frame: {s}\n", .{@errorName(e)});
-            self.gpa.free(bytes);
-            return;
-        };
+        // Record the whole world at this tick in the history ring. The slot is
+        // a stable copy, so the per-client diffs below are not disturbed by the
+        // interest-filtered full snapshots, which reuse the sim's scratch.
+        const view = self.sim.snapshotView();
+        self.snapshots.store(view);
+        const current = &self.snapshots.slots[(view.server_tick / root.ticks_per_snapshot) % delta.ring_size];
+
+        var frames: [root.max_players]struct { conn: *ClientConn, frame: *Frame } = undefined;
+        var n_frames: usize = 0;
+        for (self.clients.items) |conn| {
+            if (!receivesSnapshots(conn)) continue;
+            if (self.snapshotFrame(conn, current)) |frame| {
+                frames[n_frames] = .{ .conn = conn, .frame = frame };
+                n_frames += 1;
+            } else |e| {
+                std.debug.print("[server] error: could not encode snapshot: {s}\n", .{@errorName(e)});
+            }
+        }
 
         self.lock();
         defer self.unlock();
+        for (frames[0..n_frames]) |f| {
+            self.enqueue(f.conn, f.frame);
+        }
+    }
 
-        for (self.clients.items) |conn| {
-            if (!receivesSnapshots(conn)) continue;
-            frame.retain();
-            self.enqueue(conn, frame);
+    /// Encode the one snapshot this connection wants: a delta against its
+    /// acknowledged baseline, or a full snapshot of its neighbourhood when it
+    /// has no baseline the ring still holds.
+    fn snapshotFrame(self: *Server, conn: *ClientConn, current: *const delta.RingSlot) !*Frame {
+        const centre = self.sim.players[conn.player_id].pos;
+        const baseline = self.snapshots.baseline(conn.last_recv_server_tick);
+
+        if (baseline) |base| {
+            const d = delta.computeDelta(current, base, centre, root.interest_radius, self.diff_scratch);
+            const bytes = wire.encodeSnapshotDelta(self.gpa, .{
+                .server_tick = self.sim.tick,
+                .baseline_tick = base.tick,
+                .run_time_ms = self.sim.runTimeMs(),
+                .acked_seq = self.sim.ackedSeq(),
+                .game_state = @intFromEnum(self.sim.state),
+                .spawned = d.spawned,
+                .updated = d.updated,
+                .destroyed = d.destroyed,
+            }) catch |e| return e;
+            return frameOrFree(self.gpa, bytes);
         }
 
-        // Drop this thread's own reference. When no connection was eligible the
-        // frame is freed right here, so an idle server does not leak a frame
-        // per snapshot.
-        frame.release(self.gpa);
+        const full = self.sim.snapshotViewFor(centre, root.interest_radius);
+        const bytes = wire.encodeSnapshotFull(self.gpa, full) catch |e| return e;
+        return frameOrFree(self.gpa, bytes);
     }
 
     /// Queue a frame on one connection, taking ownership of its reference.
@@ -667,7 +731,12 @@ fn handleHello(self: *Server, conn: *ClientConn, hello: wire.Hello) void {
         return;
     });
 
-    const snapshot = wire.encodeSnapshotFull(self.gpa, self.sim.snapshotView()) catch |e| {
+    // The client has no baseline yet, so this is a full snapshot of its
+    // neighbourhood (PROTOCOL.md: a baseline of 0 gets a full snapshot).
+    const snapshot = wire.encodeSnapshotFull(
+        self.gpa,
+        self.sim.snapshotViewFor(player.pos, root.interest_radius),
+    ) catch |e| {
         std.debug.print("[server] snapshot encode failed: {s}\n", .{@errorName(e)});
         markClosed(self, conn);
         return;
@@ -703,6 +772,8 @@ fn welcomeFrame(
     try payload.byte(gpa, root.tick_hz);
     try payload.byte(gpa, root.snapshot_hz);
     try payload.leU16(gpa, @as(u16, @intFromFloat(root.arena_half_size)));
+    try payload.leU16(gpa, @as(u16, @intFromFloat(root.interest_radius)));
+    try payload.leU16(gpa, 0); // reserved
     try payload.leU32(gpa, server_tick);
 
     return wire.encodeFrame(gpa, wire.msg.s2c_welcome, payload.bytes(), 0);
@@ -1334,13 +1405,14 @@ test "a HELLO with the wrong protocol version is refused" {
     try std.testing.expectEqual(@as(usize, 0), conn.outgoing.items.len);
 }
 
-test "a snapshot frame is shared safely and freed exactly once" {
+test "a broadcast gives each connection its own snapshot frame" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var server = Server.init(std.Io.failing, gpa, &arena);
 
-    // Two connections, both past the handshake, so both are eligible.
+    // Two connections, both past the handshake, so both are eligible. Neither
+    // has acknowledged a baseline, so both get a full snapshot.
     var conns: [2]*ClientConn = undefined;
     for (&conns) |*slot| {
         const conn = try gpa.create(ClientConn);
@@ -1357,25 +1429,23 @@ test "a snapshot frame is shared safely and freed exactly once" {
     _ = server.sim.spawnPlayer(0);
     server.broadcast();
 
-    // One frame, two references: each consumer owns the same bytes and the last
-    // release is the one that frees them. `std.testing.allocator` fails the
-    // test on a double free or a leak.
+    // Each connection gets its own frame now: a delta is diffed against that
+    // connection's baseline and filtered to its neighbourhood, so two clients
+    // rarely want the same bytes. Each frame has one reference, owned by its
+    // connection, and the release is the one that frees it.
+    // `std.testing.allocator` fails the test on a double free or a leak.
     try std.testing.expectEqual(@as(usize, 1), conns[0].outgoing.items.len);
     try std.testing.expectEqual(@as(usize, 1), conns[1].outgoing.items.len);
-    try std.testing.expect(conns[0].outgoing.items[0] == conns[1].outgoing.items[0]);
-    try std.testing.expectEqual(@as(u32, 2), conns[0].outgoing.items[0].refs.load(.acquire));
-    try std.testing.expectEqual(
-        conns[0].outgoing.items[0].bytes.len,
-        conns[0].queued_bytes,
-    );
-
-    conns[0].outgoing.items[0].release(gpa);
-    conns[0].outgoing.clearRetainingCapacity();
-    // Still readable by the other consumer after the first one is done.
-    const header = wire.decodeFrameHeader(conns[1].outgoing.items[0].bytes).?;
-    try std.testing.expectEqual(wire.msg.s2c_snapshot_full, header.msg_type);
-    conns[1].outgoing.items[0].release(gpa);
-    conns[1].outgoing.clearRetainingCapacity();
+    try std.testing.expect(conns[0].outgoing.items[0] != conns[1].outgoing.items[0]);
+    for (conns) |conn| {
+        const frame = conn.outgoing.items[0];
+        try std.testing.expectEqual(@as(u32, 1), frame.refs.load(.acquire));
+        const header = wire.decodeFrameHeader(frame.bytes).?;
+        try std.testing.expectEqual(wire.msg.s2c_snapshot_full, header.msg_type);
+        try std.testing.expectEqual(frame.bytes.len, conn.queued_bytes);
+        frame.release(gpa);
+        conn.outgoing.clearRetainingCapacity();
+    }
 }
 
 test "a broadcast with no eligible connection frees its frame" {
@@ -1526,6 +1596,17 @@ const TestClient = struct {
         try payload.leU16(self.gpa, event_id);
         try payload.byte(self.gpa, choice_idx);
         const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_levelup_choice, payload.bytes(), 0);
+        defer self.gpa.free(frame);
+        try self.writer.interface.writeAll(frame);
+        try std.Io.Writer.flush(&self.writer.interface);
+    }
+
+    /// Send a `C2S_ACK_SNAPSHOT` for `server_tick`.
+    fn ack(self: *TestClient, server_tick: u32) !void {
+        var payload = wire.Sink.init();
+        defer payload.deinit(self.gpa);
+        try payload.leU32(self.gpa, server_tick);
+        const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_ack_snapshot, payload.bytes(), 0);
         defer self.gpa.free(frame);
         try self.writer.interface.writeAll(frame);
         try std.Io.Writer.flush(&self.writer.interface);
@@ -1912,4 +1993,85 @@ test "game over goes out, and a restart returns to a running game" {
 
     const view = loop.server.sim.snapshotView();
     try std.testing.expectEqual(@as(u8, @intFromEnum(sim.GameState.running)), view.game_state);
+}
+
+test "a client that acknowledges a baseline gets a delta against it" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    const full = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    _ = try client.readFrame(&got); // loadout
+
+    // The handshake's immediate full snapshot is at tick 0, which is not a
+    // valid delta baseline. Acknowledging it gets a full snapshot back.
+    const full_payload = full[wire.header_size..];
+    const full_tick = wire.readLe(u32, full_payload, 0);
+    try client.ack(full_tick);
+    try waitForIncoming(&loop.server, 1);
+
+    // Step to the first broadcast tick (3): a full snapshot, because tick 0 is
+    // not a baseline the ring holds.
+    loop.server.step();
+    loop.server.step();
+    const full2 = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const full2_payload = full2[wire.header_size..];
+    const full2_tick = wire.readLe(u32, full2_payload, 0);
+    try std.testing.expect(full2_tick != 0);
+    try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, full2_payload, 4)); // baseline_tick = 0
+
+    // Acknowledge the tick-3 full snapshot. The next broadcast is a delta
+    // against it.
+    try client.ack(full2_tick);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    loop.server.step();
+    loop.server.step();
+
+    const d = try client.expectFrame(&got, wire.msg.s2c_snapshot_delta, 4);
+    const d_payload = d[wire.header_size..];
+    try std.testing.expectEqual(full2_tick, wire.readLe(u32, d_payload, 4)); // baseline_tick
+    try std.testing.expectEqual(wire.readLe(u32, d_payload, 0), full2_tick + root.ticks_per_snapshot);
+}
+
+test "a delta baseline the ring no longer holds falls back to a full snapshot" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got); // immediate full snapshot
+    _ = try client.readFrame(&got); // loadout
+
+    // Acknowledge a tick far outside the 32-snapshot window: the server must
+    // answer with a full snapshot, not a delta against a stale baseline.
+    try client.ack(30 * root.ticks_per_snapshot);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    loop.server.step();
+
+    const full = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const full_payload = full[wire.header_size..];
+    try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, full_payload, 4)); // baseline_tick = 0
 }

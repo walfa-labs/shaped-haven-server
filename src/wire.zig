@@ -142,13 +142,31 @@ pub const restart_wire_size = 0;
 // Server -> client payloads
 // ---------------------------------------------------------------------------
 
-/// `S2C_WELCOME` — 17 bytes (DESIGN.md §5).
+/// `S2C_WELCOME` — 21 bytes (PROTOCOL.md "S2C_WELCOME (0x81)").
+///
+/// Phase 4 grows this from 17 bytes to carry the interest radius: the client
+/// needs to know how far its neighbourhood extends. `server_tick` moves from
+/// offset 13 to 17, and a reserved u16 pads the layout to a 4-byte boundary.
+///
+/// ```text
+/// player_id:        u8    @ 0
+/// session_token:    u64   @ 1
+/// tick_hz:          u8    @ 9   (60)
+/// snap_hz:          u8    @ 10  (20)
+/// arena_half_size:  u16   @ 11  (1000)
+/// interest_radius:  u16   @ 13  (world units)
+/// reserved:         u16   @ 15  (0)
+/// server_tick:      u32   @ 17
+/// total:            21 bytes
+/// ```
 pub const Welcome = packed struct {
     player_id: u8,
     session_token: u64,
     tick_hz: u8,
     snap_hz: u8,
     arena_half_size: u16,
+    interest_radius: u16,
+    reserved: u16,
     server_tick: u32,
 };
 
@@ -494,6 +512,136 @@ pub fn encodeSnapshotFull(gpa: std.mem.Allocator, view: SnapshotView) ![]u8 {
     return encodeFrame(gpa, msg.s2c_snapshot_full, payload.bytes(), view.server_tick);
 }
 
+// ---------------------------------------------------------------------------
+// S2C_SNAPSHOT_DELTA (PROTOCOL.md "S2C_SNAPSHOT_DELTA (0x83)")
+// ---------------------------------------------------------------------------
+
+/// `kind` byte values naming the record type that follows in a delta array.
+pub const kind = struct {
+    pub const player: u8 = 0;
+    pub const enemy: u8 = 1;
+    pub const projectile: u8 = 2;
+    pub const gem: u8 = 3;
+};
+
+/// One entity in a delta array: a tagged union of the four net records. The
+/// entity id is the first field of every record, so `recordId` reads it back
+/// without a per-kind switch.
+pub const DeltaRecord = union(enum) {
+    player: PlayerNet,
+    enemy: EnemyNet,
+    projectile: ProjNet,
+    gem: GemNet,
+
+    pub fn kindByte(r: DeltaRecord) u8 {
+        return switch (r) {
+            .player => kind.player,
+            .enemy => kind.enemy,
+            .projectile => kind.projectile,
+            .gem => kind.gem,
+        };
+    }
+
+    /// Wire size of the record alone (no kind byte, no id prefix).
+    pub fn recordSize(r: DeltaRecord) usize {
+        return switch (r) {
+            .player => wireSize(PlayerNet),
+            .enemy => wireSize(EnemyNet),
+            .projectile => wireSize(ProjNet),
+            .gem => wireSize(GemNet),
+        };
+    }
+
+    /// The entity id: the first u32 of an enemy/projectile/gem record, or the
+    /// player id widened to u32 for a player.
+    pub fn recordId(r: DeltaRecord) u32 {
+        return switch (r) {
+            .player => r.player.player_id,
+            .enemy => r.enemy.id,
+            .projectile => r.projectile.id,
+            .gem => r.gem.id,
+        };
+    }
+};
+
+/// One destroyed entity: just its kind and id (PROTOCOL.md "Destroyed").
+pub const DestroyedRef = struct {
+    kind: u8,
+    id: u32,
+};
+
+/// Everything a `S2C_SNAPSHOT_DELTA` payload carries, ready to encode.
+///
+/// The three arrays hold `DeltaRecord` values; the encoder writes the kind
+/// byte and (for updated and destroyed) the id ahead of each record.
+pub const DeltaView = struct {
+    server_tick: u32,
+    baseline_tick: u32,
+    run_time_ms: u32,
+    acked_seq: [root.max_players]u32,
+    game_state: u8,
+    spawned: []const DeltaRecord,
+    updated: []const DeltaRecord,
+    destroyed: []const DestroyedRef,
+};
+
+/// Encode a delta snapshot (PROTOCOL.md "S2C_SNAPSHOT_DELTA (0x83)").
+///
+/// Same 37-byte header as a full snapshot, but the four counts mean spawned,
+/// updated, destroyed and reserved (0), and the payload is the three arrays in
+/// that order: spawned (kind + full record), updated (kind + id + full
+/// record), destroyed (kind + id).
+pub fn encodeSnapshotDelta(gpa: std.mem.Allocator, view: DeltaView) ![]u8 {
+    var payload = Sink.init();
+    defer payload.deinit(gpa);
+
+    try payload.leU32(gpa, view.server_tick);
+    try payload.leU32(gpa, view.baseline_tick);
+    try payload.leU32(gpa, view.run_time_ms);
+    try payload.records(gpa, u32, &view.acked_seq);
+    try payload.byte(gpa, view.game_state);
+    try payload.leU16(gpa, @as(u16, @intCast(view.spawned.len)));
+    try payload.leU16(gpa, @as(u16, @intCast(view.updated.len)));
+    try payload.leU16(gpa, @as(u16, @intCast(view.destroyed.len)));
+    try payload.leU16(gpa, 0); // reserved
+
+    for (view.spawned) |r| {
+        try payload.byte(gpa, r.kindByte());
+        try writeRecord(gpa, &payload, r);
+    }
+    for (view.updated) |r| {
+        try payload.byte(gpa, r.kindByte());
+        try payload.leU32(gpa, r.recordId());
+        try writeRecord(gpa, &payload, r);
+    }
+    for (view.destroyed) |r| {
+        try payload.byte(gpa, r.kind);
+        try payload.leU32(gpa, r.id);
+    }
+
+    // PROTOCOL.md: `seq` carries the server tick on S2C_SNAPSHOT_*.
+    return encodeFrame(gpa, msg.s2c_snapshot_delta, payload.bytes(), view.server_tick);
+}
+
+/// Append one net record's bytes to the payload, trimmed to its wire size.
+fn writeRecord(gpa: std.mem.Allocator, payload: *Sink, r: DeltaRecord) !void {
+    switch (r) {
+        .player => |v| try writeRaw(gpa, payload, v),
+        .enemy => |v| try writeRaw(gpa, payload, v),
+        .projectile => |v| try writeRaw(gpa, payload, v),
+        .gem => |v| try writeRaw(gpa, payload, v),
+    }
+}
+
+/// Append one packed net record's wire bytes. The record is taken by value and
+/// the bytes are copied out within this call, so the slice never outlives the
+/// copy it points into.
+fn writeRaw(gpa: std.mem.Allocator, payload: *Sink, v: anytype) !void {
+    const T = @TypeOf(v);
+    const raw: *const [@sizeOf(T)]u8 = @ptrCast(&v);
+    try payload.fixedBytes(gpa, raw[0..wireSize(T)]);
+}
+
 /// Encode `S2C_LEVELUP_OFFER` (0x84, PROTOCOL.md).
 pub fn encodeLevelupOffer(
     gpa: std.mem.Allocator,
@@ -726,8 +874,8 @@ test "input payload matches DESIGN.md field list" {
     try std.testing.expect(decodePayload(Input, payload.bytes()) != null);
 }
 
-test "welcome payload matches DESIGN.md field list" {
-    try std.testing.expectEqual(@as(usize, 17), wireSize(Welcome));
+test "welcome payload matches the PROTOCOL.md 21-byte layout" {
+    try std.testing.expectEqual(@as(usize, 21), wireSize(Welcome));
 
     var payload = Sink.init();
     defer payload.deinit(std.testing.allocator);
@@ -736,6 +884,8 @@ test "welcome payload matches DESIGN.md field list" {
     try payload.byte(std.testing.allocator, 60);
     try payload.byte(std.testing.allocator, 20);
     try payload.leU16(std.testing.allocator, 1000);
+    try payload.leU16(std.testing.allocator, 50);
+    try payload.leU16(std.testing.allocator, 0);
     try payload.leU32(std.testing.allocator, 42);
 
     const decoded = decodePayload(Welcome, payload.bytes()).?;
@@ -743,7 +893,91 @@ test "welcome payload matches DESIGN.md field list" {
     try std.testing.expectEqual(@as(u8, 60), decoded.tick_hz);
     try std.testing.expectEqual(@as(u8, 20), decoded.snap_hz);
     try std.testing.expectEqual(@as(u16, 1000), decoded.arena_half_size);
+    try std.testing.expectEqual(@as(u16, 50), decoded.interest_radius);
+    try std.testing.expectEqual(@as(u16, 0), decoded.reserved);
     try std.testing.expectEqual(@as(u32, 42), decoded.server_tick);
+}
+
+test "a delta frame matches the PROTOCOL.md layout" {
+    const gpa = std.testing.allocator;
+
+    const spawned = [_]DeltaRecord{
+        .{ .enemy = .{
+            .id = 7,
+            .archetype = 1,
+            .elite_mask = 0,
+            .pos_x = 100,
+            .pos_y = -200,
+            .vel_angle = 64,
+            .hp_pct = 80,
+        } },
+    };
+    const updated = [_]DeltaRecord{
+        .{ .player = .{
+            .player_id = 0,
+            .state_flags = 1,
+            .pos_x = 12,
+            .pos_y = 34,
+            .vel_angle = 0,
+            .hp_pct = 100,
+        } },
+    };
+    const destroyed = [_]DestroyedRef{
+        .{ .kind = 3, .id = 9 },
+    };
+
+    const view = DeltaView{
+        .server_tick = 30,
+        .baseline_tick = 27,
+        .run_time_ms = 500,
+        .acked_seq = [_]u32{ 3, 0, 0, 0 },
+        .game_state = 0,
+        .spawned = &spawned,
+        .updated = &updated,
+        .destroyed = &destroyed,
+    };
+    const frame = try encodeSnapshotDelta(gpa, view);
+    defer gpa.free(frame);
+
+    const header = decodeFrameHeader(frame).?;
+    try std.testing.expectEqual(msg.s2c_snapshot_delta, header.msg_type);
+    try std.testing.expectEqual(@as(u32, 30), header.seq);
+
+    // 37-byte header, then spawned (1 + 12), updated (1 + 4 + 8), destroyed (1 + 4).
+    try std.testing.expectEqual(
+        @as(usize, header_size + 37 + (1 + 12) + (1 + 4 + 8) + (1 + 4)),
+        frame.len,
+    );
+    const p = frame[header_size..];
+    // Header: server_tick, baseline_tick, run_time_ms, acked_seq, game_state,
+    // counts = spawned, updated, destroyed, reserved.
+    try std.testing.expectEqualSlices(u8, &.{
+        30, 0, 0, 0, // server_tick
+        27, 0, 0, 0, // baseline_tick
+        244, 1, 0, 0, // run_time_ms = 500
+        3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // acked_seq
+        0, // game_state
+        1, 0, 1, 0, 1, 0, 0, 0, // counts
+    }, p[0..37]);
+    // spawned[0]: kind + EnemyNet.
+    try std.testing.expectEqualSlices(u8, &.{
+        1, // kind = enemy
+        7, 0, 0, 0, // id
+        1, 0, // archetype, elite_mask
+        100, 0, 56, 255, // pos_x, pos_y = -200
+        64, 80, // vel_angle, hp_pct
+    }, p[37..37 + 1 + 12]);
+    // updated[0]: kind + id + PlayerNet.
+    try std.testing.expectEqualSlices(u8, &.{
+        0, // kind = player
+        0, 0, 0, 0, // id (player_id widened)
+        0, 1, 12, 0, 34, 0, 0, 100, // PlayerNet
+    }, p[37 + 13..37 + 13 + 1 + 4 + 8]);
+    // destroyed[0]: kind + id.
+    try std.testing.expectEqualSlices(u8, &.{
+        3, // kind = gem
+        9, 0, 0, 0, // id
+    }, p[37 + 13 + 13..]);
 }
 
 test "snapshot header is 37 bytes with no padding after game_state" {
