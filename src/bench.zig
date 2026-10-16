@@ -61,6 +61,11 @@ pub const Report = struct {
     mean_live_enemies: f64,
     mean_live_projectiles: f64,
     kills: u32,
+    /// The build mode the measurement was taken in. Debug keeps bounds checks
+    /// and panics on every array access, which is a different order of cost
+    /// from the release build the server ships at, so a timing means nothing
+    /// without this.
+    mode: []const u8,
 
     pub fn passes(self: Report) bool {
         return self.mean_ms < budget_ms;
@@ -124,6 +129,7 @@ pub fn run(
         .mean_live_enemies = @as(f64, @floatFromInt(sum_enemies)) / fticks,
         .mean_live_projectiles = @as(f64, @floatFromInt(sum_projs)) / fticks,
         .kills = s.kills,
+        .mode = @tagName(builtin.mode),
     };
 }
 
@@ -142,11 +148,12 @@ test "1,000 enemies and 500 projectiles stay inside the phase-2 tick budget" {
     const report = try run(std.testing.allocator, default_enemies, default_projectiles, default_ticks);
 
     std.debug.print(
-        "\n[bench] {d} ticks with {d} enemies and {d} projectiles: " ++
+        "\n[bench] {s} build, {d} ticks with {d} enemies and {d} projectiles: " ++
             "mean {d:.3} ms/tick, worst {d:.3} ms/tick (budget {d:.1} ms)\n" ++
             "[bench] live during the run: {d:.0} enemies, {d:.0} projectiles; " ++
             "{d} kills\n",
         .{
+            report.mode,
             report.ticks,
             report.enemies,
             report.projectiles,
@@ -159,10 +166,19 @@ test "1,000 enemies and 500 projectiles stay inside the phase-2 tick budget" {
         },
     );
 
-    // The measurement only means anything if the world was really loaded and
-    // the combat pass was really running.
-    try std.testing.expect(report.mean_live_enemies > 900.0);
-    try std.testing.expect(report.mean_live_projectiles > 400.0);
+    // The measurement only means anything if the world was really loaded, and
+    // "really loaded" means the counts the DoD names — not merely close to them.
+    // The counts are sampled before each tick, after the top-up that follows the
+    // previous one, so this is the load the world was actually holding.
+    try std.testing.expectEqual(
+        @as(f64, @floatFromInt(report.enemies)),
+        report.mean_live_enemies,
+    );
+    try std.testing.expectEqual(
+        @as(f64, @floatFromInt(report.projectiles)),
+        report.mean_live_projectiles,
+    );
+    // ... and the combat pass was doing work, not ticking over an idle world.
     try std.testing.expect(report.kills > 0);
 
     // The budget is only meaningful in a release build: Debug keeps bounds
@@ -190,10 +206,22 @@ test "the load actually reaches the counts the report claims" {
     try std.testing.expectEqual(@as(usize, 1000), s.enemies.count);
     try std.testing.expectEqual(@as(usize, 500), s.projectiles.count);
 
-    // A single tick must not silently drain the world.
+    // A tick on its own drains the world, which is what the top-up is for.
     s.advance();
-    try std.testing.expect(s.enemies.count > 500);
-    try std.testing.expect(s.projectiles.count > 100);
+    try std.testing.expect(s.enemies.count < 1000);
+    try std.testing.expect(s.projectiles.count < 500);
+
+    // The top-up puts it back exactly, every time, and never grows either pool
+    // past the load it is holding.
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        topUp(&s, 1000, 500);
+        try std.testing.expectEqual(@as(usize, 1000), s.enemies.count);
+        try std.testing.expectEqual(@as(usize, 500), s.projectiles.count);
+        s.advance();
+        try std.testing.expect(s.enemies.count <= 1000);
+        try std.testing.expect(s.projectiles.count <= 500);
+    }
 
     // The pool caps still hold under a deliberately oversized target.
     topUp(&s, root.max_enemies + 1000, root.max_projectiles + 1000);

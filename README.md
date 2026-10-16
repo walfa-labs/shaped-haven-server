@@ -107,7 +107,9 @@ twelve minutes into a run, which is far too long to sit through while measuring
 a frame rate; `--stress-enemies 1000 --stress-projectiles 500` puts the phase-2
 load on the wire immediately so the client's side of the definition of done can
 be measured against a real server. The load is placed around the players'
-centroid, so it only starts once somebody has joined.
+centroid, so it only starts once somebody has joined, and it is held at exactly
+the requested counts — the top-up runs every tick, and also when a player
+joins, so even the first snapshot a client receives carries the full load.
 
 ## Status
 
@@ -117,12 +119,44 @@ detection with pierce and knockback over a uniform spatial hash grid. The
 snapshot's existing enemy and projectile arrays are filled; the wire format
 itself is unchanged from phase 1.
 
-Verified: `zig build test` — 107 tests pass. `zig build test
--Doptimize=ReleaseFast` — 107 pass, and the phase-2 load measurement reports
-**0.031 ms/tick mean (0.44 ms worst) over 240 ticks with 1,000 enemies and 500
-projectiles live**, against the 4.0 ms budget DESIGN.md §6 sets. Against a real
-client over loopback the same load is served at a steady 20 snapshots/second
-with no drops.
+Verified: `zig build test` — 115 tests pass. `zig build test
+-Doptimize=ReleaseFast` — 115 pass.
+
+### The phase-2 load measurement
+
+DESIGN.md §6 sets the definition of done as *1,000 active enemies and 500
+projectiles under 4.0 ms/tick*. The measurement is the `bench` test, and the
+build mode is part of the result: a Debug build keeps bounds checks and panics
+on every array access, which is a different order of cost from the release
+build the server ships at. Both are quoted so the two are not confused:
+
+| Build | Command | Mean | Worst |
+| --- | --- | --- | --- |
+| ReleaseFast | `zig build test -Doptimize=ReleaseFast` | 0.034 ms/tick | 0.075 ms/tick |
+| Debug | `zig build test` | 0.308 ms/tick | 0.529 ms/tick |
+
+Both over 240 ticks with 1,000 enemies and 500 projectiles live, measured on
+this machine. The benchmark asserts that the load it measured *was* that load —
+the mean live counts over the run must equal the requested ones — so the number
+cannot come from a run that was quietly serving less than the DoD names.
+
+### Against a real client
+
+`zig build -Doptimize=ReleaseFast` then
+`shaped-haven-server --stress-enemies 1000 --stress-projectiles 500`, with the
+client's own `--frames 600 --verbose` run against it: a steady 136 fps, 20
+snapshots/second, no dropped or malformed frames, and every snapshot carrying
+exactly 1,000 enemies and 500 projectiles.
+
+The client *draws* somewhat fewer than that — 850–970 enemies and 340–460
+projectiles over the run. That is the client's interpolation, not the server's
+load: it only draws an entity once two consecutive snapshots bracketing its
+render time both carry it, so an entity younger than the 100 ms interpolation
+delay is not drawn yet. The load churns — the player's weapons kill enemies
+every tick and the top-up replaces them, and projectiles expire and are
+replaced — so there is always a fraction too young to draw. The counts the
+server puts on the wire are exact; the counts a client renders are a
+consequence of its own delay.
 
 Deliberately not in this phase (DESIGN.md §6 puts them later): XP gems and
 pickups, upgrades, level-ups, evolutions, boss and elite enemies, floating
