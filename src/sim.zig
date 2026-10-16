@@ -4,23 +4,27 @@
 //! advances it one fixed 60 Hz step at a time. Networking lives in `server.zig`,
 //! which feeds inputs in and reads snapshots out.
 //!
-//! Phase 2 implements DESIGN.md §6's combat core: the enemy pool and the Tier 1
-//! spawn curve (§4), the four weapons at their level 1 stats (§3), and arc /
-//! circle hit detection with knockback over a uniform spatial hash grid. XP
-//! gems, upgrades and player death are phase 3.
+//! Phase 3 adds the upgrade engine on top of the phase-2 combat core: XP gems
+//! and the magnet, the XP curve and the level-up pause, the ten passives, the
+//! eight-level weapon tables, the eight evolutions, the five synergies, the
+//! uncapped Overclock endgame, and player death.
 //!
 //! The order of systems inside a tick is fixed, because determinism depends on
 //! it:
 //!
-//! 1. players integrate their input;
-//! 2. enemies run their AI, integrate, and are clamped to the arena;
+//! 1. players integrate their input, and regen/timers tick;
+//! 2. enemies run their AI (slowed or frozen), integrate, and are clamped;
 //! 3. the broadphase grid is rebuilt from the enemies' new positions;
-//! 4. every ready weapon acquires the nearest enemy and fires — arcs damage
-//!    immediately, projectiles are spawned;
+//! 4. every ready weapon fires — resolved through the loadout, with the
+//!    evolution and synergy effects;
 //! 5. projectiles travel and resolve what they overlap;
-//! 6. enemies touching a player deal contact damage;
-//! 7. dead enemies and spent projectiles are compacted out of their pools;
-//! 8. once per second the spawn formula is evaluated.
+//! 6. enemies touching a player deal contact damage, reduced by armor and
+//!    absorbed by shield;
+//! 7. dead enemies drop a gem; dead enemies and spent projectiles are compacted;
+//! 8. gems magnetize, fly, and are collected, awarding XP;
+//! 9. ground rifts damage what stands in them and expire;
+//! 10. a filled XP bar pauses the run and offers three choices;
+//! 11. once per second the spawn formula is evaluated.
 //!
 //! Nothing moves between step 3 and step 7 except knockback *velocity*, which
 //! only changes where an enemy will be next tick — so every grid query in a
@@ -35,6 +39,9 @@ const weapon = @import("weapon.zig");
 const combat = @import("combat.zig");
 const spatial = @import("spatial.zig");
 const rng = @import("rng.zig");
+const upgrade = @import("upgrade.zig");
+const gem = @import("gem.zig");
+const evolve = @import("evolve.zig");
 
 /// Simulation state (DESIGN.md §5 game_state values).
 pub const GameState = enum(u8) {
@@ -72,20 +79,7 @@ pub const StateFlags = struct {
     }
 };
 
-/// One weapon a player carries (DESIGN.md §2 `WeaponSlot`).
-///
-/// Phase 2 gives every player all four weapons at level 1 from the first tick;
-/// the levels, cooldown modifiers and evolutions of DESIGN.md §3 are phase 3.
-pub const WeaponSlot = struct {
-    id: u8 = 0,
-    level: u8 = 1,
-    cooldown_ticks: u16 = 0,
-    evolved: bool = false,
-
-    pub fn spec(slot: WeaponSlot) ?weapon.Spec {
-        return weapon.spec(slot.id);
-    }
-};
+pub const WeaponSlot = upgrade.WeaponSlot;
 
 /// Range at which a weapon will acquire a target, in world units.
 ///
@@ -98,13 +92,23 @@ pub const WeaponSlot = struct {
 /// exactly as it would in the genre this game is modelled on.
 pub const acquire_range: f32 = 45.0;
 
-/// A player's HP never falls below this in phase 2: death and game over are
-/// phase 3, so a run cannot end yet and the HUD is allowed to sit at 1%.
-pub const player_hp_floor: f32 = 1.0;
+/// Ticks the level-up offer waits before auto-selecting option 0
+/// (DESIGN.md §5: a 15.0 s server timeout).
+pub const levelup_timeout_ticks: u32 = 15 * root.tick_hz;
+
+/// Speed a magnetized gem flies at, in units per second.
+pub const gem_magnet_speed: f32 = 18.0;
+
+/// Distance at which a magnetized gem is collected.
+pub const gem_collect_radius: f32 = 0.6;
 
 /// Fixed seed for the spawn RNG, so a run is reproducible. A phase that wants
 /// per-run variety changes this at `Simulation.init`, not here.
 pub const spawn_seed: u64 = 0x5eed5eed5eed5eed;
+
+/// Seed for the level-up choice generator. Separate from the spawn RNG so a
+/// draft never perturbs the spawn curve.
+pub const upgrade_seed: u64 = 0x0ddba110ddba1100;
 
 /// A fixed load to hold for the whole run, instead of the natural spawn curve.
 ///
@@ -120,7 +124,21 @@ pub const StressLoad = struct {
     radius: f32 = 35.0,
 };
 
-/// One player in the simulation (DESIGN.md §2 field list, phase-1 subset).
+/// One pending level-up offer, waiting for `C2S_LEVELUP_CHOICE`.
+///
+/// The simulation pauses while any of these is unresolved; the server drains
+/// the ones with `sent == false` and sends each an `S2C_LEVELUP_OFFER`.
+pub const LevelUp = struct {
+    event_id: u16,
+    player_id: u8,
+    new_level: u16,
+    options: [3]upgrade.UpgradeOption,
+    timeout_ticks: u32,
+    resolved: bool,
+    sent: bool,
+};
+
+/// One player in the simulation (DESIGN.md §2 field list).
 pub const PlayerState = struct {
     id: u8 = 0,
     active: bool = false,
@@ -130,16 +148,41 @@ pub const PlayerState = struct {
     aim_dir: [2]f32 = .{ 1.0, 0.0 },
     hp: f32 = root.player_max_hp,
     max_hp: f32 = root.player_max_hp,
+    /// Temporary shield, absorbed before HP (Juggernaut Halberd).
+    shield: f32 = 0.0,
     xp: u32 = 0,
+    /// XP needed to reach the next level (`upgrade.xpForLevel(level)`).
+    xp_next: u32 = upgrade.xpForLevel(1),
     level: u16 = 1,
     weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons),
+    /// Passive levels, indexed 0..9 in DESIGN.md §3 table order; 0 = unowned.
+    passives: [root.max_passives]u8 = @splat(0),
+    /// Overclock counts, indexed by `id - 48` (damage, attack speed, max HP).
+    ///
+    /// `u32`, not `u8`: the counts are uncapped by design (DESIGN.md §3
+    /// "Unlimited limit-break"), and a `u8` wrapped at 256 purchases, silently
+    /// dropping the player's bonus. A `u32` cannot wrap in any reachable run —
+    /// it would take more than four billion level-ups.
+    overclock: [3]u32 = [_]u32{ 0, 0, 0 },
+    /// Bit mask of the active synergies (DESIGN.md §3).
+    synergy_mask: u16 = 0,
     input: InputFrame = .{},
     /// Last `input_seq` the server has applied; reported back to the client as
     /// `acked_seq` so it can reconcile its prediction ring buffer.
     last_input_seq: u32 = 0,
+    /// Ticks of invulnerability left (Phase Katana's dash).
+    invuln_ticks: u16 = 0,
+    /// Kinetic Charge: charge accumulated by moving (DESIGN.md §3).
+    kinetic_charge: f32 = 0.0,
+    /// Cross-Slash Mastery: axe sweeps since the last reset.
+    axe_swings: u8 = 0,
+    /// Cross-Slash Mastery: reach bonus on the next sword attack.
+    sword_reach_bonus: f32 = 0.0,
+    /// Reactive Carapace: ticks until the shockwave can fire again.
+    carapace_cd: u16 = 0,
 
-    /// Integrate one fixed step. Pure function of `(input, dt)`.
-    pub fn integrate(p: *PlayerState, dt: f32) void {
+    /// Integrate one fixed step. Pure function of `(input, dt, move_speed_mult)`.
+    pub fn integrate(p: *PlayerState, dt: f32, move_speed_mult: f32) void {
         var mx: f32 = @as(f32, @floatFromInt(p.input.move_x)) / 100.0;
         var my: f32 = @as(f32, @floatFromInt(p.input.move_y)) / 100.0;
 
@@ -150,10 +193,13 @@ pub const PlayerState = struct {
             my /= mag;
         }
 
-        p.vel[0] = mx * root.move_speed;
-        p.vel[1] = my * root.move_speed;
-        p.pos[0] += p.vel[0] * dt;
-        p.pos[1] += p.vel[1] * dt;
+        const speed = root.move_speed * move_speed_mult;
+        p.vel[0] = mx * speed;
+        p.vel[1] = my * speed;
+        const dx = p.vel[0] * dt;
+        const dy = p.vel[1] * dt;
+        p.pos[0] += dx;
+        p.pos[1] += dy;
 
         // Hard arena walls (DESIGN.md §1). The collider is clamped so the whole
         // 1.0 x 1.0 square stays inside [-1000, 1000].
@@ -162,6 +208,11 @@ pub const PlayerState = struct {
         p.pos[1] = std.math.clamp(p.pos[1], -limit, limit);
 
         if (mag > 0.0001) p.aim_dir = .{ mx, my };
+
+        // Kinetic Charge: 10 charge per unit travelled (DESIGN.md §3).
+        if (p.synergy_mask & upgrade.synergy_kinetic_charge != 0) {
+            p.kinetic_charge += 10.0 * std.math.hypot(dx, dy);
+        }
     }
 };
 
@@ -169,20 +220,27 @@ pub const PlayerState = struct {
 pub const Simulation = struct {
     tick: u32 = 0,
     state: GameState = .running,
-    /// Enemies killed since the run started. Phase 2 only reports it; the score
-    /// that consumes it is phase 4.
+    /// Enemies killed since the run started.
     kills: u32 = 0,
+    /// Set when the run ends, for `S2C_GAME_OVER`. The server clears it once it
+    /// has sent the frame.
+    game_over_pending: bool = false,
+    final_tick: u32 = 0,
 
     players: [root.max_players]PlayerState = root.filledWithDefault(PlayerState, root.max_players),
 
     enemies: enemy.Pool = .{},
     projectiles: combat.ProjectilePool = .{},
+    gems: gem.Pool = .{},
+    rifts: evolve.RiftPool = .{},
     /// Broadphase over the enemy pool, rebuilt once per tick.
     grid: spatial.SpatialHash = .{},
 
     /// Spawn RNG. Seeded from a constant so a run is reproducible: the same
     /// seed and the same inputs produce the same enemies in the same places.
     rng: rng.Rng = rng.Rng.init(spawn_seed),
+    /// Level-up choice RNG, separate from the spawn RNG.
+    upgrade_rng: rng.Rng = rng.Rng.init(upgrade_seed),
     /// Fractional spawns carried between spawn evaluations, so the rate curve
     /// is not rounded down once per second.
     spawn_accum: f32 = 0.0,
@@ -195,19 +253,32 @@ pub const Simulation = struct {
     /// populated by the spawn curve. See `StressLoad`.
     stress: ?StressLoad = null,
 
+    /// Pending level-up offers, one per player whose XP bar filled.
+    pending_levelups: [root.max_players]LevelUp = root.filledWithDefault(LevelUp, root.max_players),
+    pending_count: usize = 0,
+    next_event_id: u16 = 1,
+    /// Set when a player's level, XP or item set changed, so the server knows
+    /// to send an `S2C_LOADOUT`.
+    loadout_dirty: [root.max_players]bool = @splat(false),
+
     /// Scratch space for the snapshot encoder; keeps encoding allocation-free.
     net_scratch: [root.max_players]wire.PlayerNet = root.filledWithDefault(wire.PlayerNet, root.max_players),
     net_enemies: [root.max_enemies]wire.EnemyNet = @splat(std.mem.zeroes(wire.EnemyNet)),
     net_projs: [root.max_projectiles]wire.ProjNet = @splat(std.mem.zeroes(wire.ProjNet)),
+    net_gems: [root.max_gems]wire.GemNet = @splat(std.mem.zeroes(wire.GemNet)),
     /// Scratch space for broadphase results, shared by every query in a tick.
     /// Sized for the whole enemy pool because one query can legitimately match
     /// every enemy in the world.
     query_scratch: [root.max_enemies]u32 = @splat(0),
+    /// Scratch space for the enemy indices a swing hit, so the evolution
+    /// effects (pull, shield) can walk them.
+    hit_scratch: [root.max_enemies]u32 = @splat(0),
 
     pub fn init() Simulation {
         var self = Simulation{};
         for (0..root.max_players, &self.players) |i, *p| {
             p.id = @intCast(i);
+            p.xp_next = upgrade.xpForLevel(1);
         }
         return self;
     }
@@ -227,29 +298,49 @@ pub const Simulation = struct {
             if (requested_slot >= root.max_players) return null;
             if (self.players[requested_slot].active) return null;
             self.players[requested_slot].active = true;
-            equipStarterWeapons(&self.players[requested_slot]);
+            resetPlayer(&self.players[requested_slot]);
             return &self.players[requested_slot];
         }
         for (&self.players) |*p| {
             if (!p.active) {
                 p.active = true;
-                equipStarterWeapons(p);
+                resetPlayer(p);
                 return p;
             }
         }
         return null;
     }
 
-    /// Give a joining player the four level 1 weapons of DESIGN.md §3.
-    ///
-    /// Cooldowns start at zero, so all four fire on the player's first tick.
-    fn equipStarterWeapons(p: *PlayerState) void {
+    /// Give a player a fresh run: the four level 1 weapons of DESIGN.md §3, no
+    /// passives, level 1, full HP.
+    fn resetPlayer(p: *PlayerState) void {
+        p.flags = .{ .alive = true };
+        p.hp = root.player_max_hp;
+        p.max_hp = root.player_max_hp;
+        p.shield = 0.0;
+        p.pos = .{ 0.0, 0.0 };
+        p.vel = .{ 0.0, 0.0 };
+        p.aim_dir = .{ 1.0, 0.0 };
+        p.xp = 0;
+        p.level = 1;
+        p.xp_next = upgrade.xpForLevel(1);
+        p.passives = @splat(0);
+        p.overclock = [_]u32{ 0, 0, 0 };
+        p.synergy_mask = 0;
+        p.invuln_ticks = 0;
+        p.kinetic_charge = 0.0;
+        p.axe_swings = 0;
+        p.sword_reach_bonus = 0.0;
+        p.carapace_cd = 0;
         p.weapons = root.filledWithDefault(WeaponSlot, root.max_weapons);
         for (&p.weapons, 0..) |*slot, i| {
             slot.id = @intCast(i);
             slot.level = 1;
             slot.cooldown_ticks = 0;
             slot.evolved = false;
+            slot.pending_slashes = 0;
+            slot.pending_timer = 0;
+            slot.shots_fired = 0;
         }
     }
 
@@ -283,11 +374,27 @@ pub const Simulation = struct {
     /// determinism contract: two runs given the same inputs must produce the
     /// same world, so the systems cannot be reordered.
     pub fn advance(self: *Simulation) void {
-        if (self.state != .running) return;
+        if (self.state == .game_over) return;
+        if (self.state == .level_up_pause) {
+            self.tickLevelUpPause();
+            return;
+        }
         const dt = tickDurationSeconds();
 
         for (&self.players) |*p| {
-            if (p.active) p.integrate(dt);
+            if (!p.active or !p.flags.alive) continue;
+            const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
+            p.integrate(dt, stats.move_speed_mult);
+
+            // Nano Repair (DESIGN.md §3): HP restored per second.
+            if (stats.regen_per_sec > 0.0 and p.hp < p.max_hp) {
+                p.hp = @min(p.hp + stats.regen_per_sec * dt, p.max_hp);
+            }
+            if (p.invuln_ticks > 0) p.invuln_ticks -= 1;
+            if (p.carapace_cd > 0) p.carapace_cd -= 1;
+            // Shield is temporary and decays back to nothing over a few
+            // seconds, so it cannot be banked indefinitely.
+            if (p.shield > 0.0) p.shield = @max(p.shield - 2.0 * dt, 0.0);
         }
 
         self.updateEnemies(dt);
@@ -299,11 +406,23 @@ pub const Simulation = struct {
             &self.grid,
             &self.query_scratch,
             dt,
+            self.synergyMask(),
         );
         self.updateContact();
+        self.dropGems();
 
         self.kills += @intCast(self.enemies.reapDead());
+        // `reapDead` compacts the pool, so the broadphase indices it left
+        // behind no longer match the slots; rebuild before the shatter query
+        // reads them.
+        self.rebuildGrid();
+        evolve.processShatter(&self.enemies, &self.grid, &self.query_scratch);
         self.projectiles.reapSpent();
+
+        self.updateGems(dt);
+        evolve.updateRifts(&self.rifts, &self.enemies, &self.grid, &self.query_scratch, dt);
+        self.rifts.reapExpired();
+        self.checkLevelUps();
 
         self.tick += 1;
         if (self.tick % enemy.spawn_interval_ticks == 0) self.spawnWave();
@@ -365,7 +484,7 @@ pub const Simulation = struct {
         var sum = [2]f32{ 0.0, 0.0 };
         var n: u32 = 0;
         for (&self.players) |p| {
-            if (!p.active) continue;
+            if (!p.active or !p.flags.alive) continue;
             sum[0] += p.pos[0];
             sum[1] += p.pos[1];
             n += 1;
@@ -379,7 +498,7 @@ pub const Simulation = struct {
         var best: ?usize = null;
         var best_d2 = std.math.inf(f32);
         for (&self.players, 0..) |p, i| {
-            if (!p.active) continue;
+            if (!p.active or !p.flags.alive) continue;
             const dx = p.pos[0] - from[0];
             const dy = p.pos[1] - from[1];
             const d2 = dx * dx + dy * dy;
@@ -401,6 +520,7 @@ pub const Simulation = struct {
         var i: usize = 0;
         while (i < self.enemies.count) : (i += 1) {
             if (self.enemies.contact_cd[i] > 0) self.enemies.contact_cd[i] -= 1;
+            if (self.enemies.marked_ticks[i] > 0) self.enemies.marked_ticks[i] -= 1;
 
             const archetype: enemy.Archetype = @enumFromInt(self.enemies.archetype[i]);
             const target = self.nearestPlayer(self.enemies.pos[i]);
@@ -423,6 +543,18 @@ pub const Simulation = struct {
                 self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
                 self.enemies.ai_timer[i] = 0;
             }
+
+            // Cryo Flechette: a frozen enemy does not move; a slowed one moves
+            // at the slowed factor (DESIGN.md §3).
+            if (self.enemies.freeze_ticks[i] > 0) {
+                self.enemies.freeze_ticks[i] -= 1;
+                vel = .{ 0.0, 0.0 };
+            } else if (self.enemies.slow_ticks[i] > 0) {
+                self.enemies.slow_ticks[i] -= 1;
+                vel[0] *= self.enemies.slow_factor[i];
+                vel[1] *= self.enemies.slow_factor[i];
+            }
+
             self.enemies.vel[i] = vel;
 
             // Knockback decays towards nothing and is added on top of whatever
@@ -511,14 +643,14 @@ pub const Simulation = struct {
     /// all four aim at the same target anyway.
     fn updateWeapons(self: *Simulation) void {
         for (&self.players) |*p| {
-            if (!p.active) continue;
+            if (!p.active or !p.flags.alive) continue;
+            const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
 
-            var any_ready = false;
+            // Cooldowns and the Sword L8 follow-up slashes tick first.
             for (&p.weapons) |*slot| {
                 if (slot.cooldown_ticks > 0) slot.cooldown_ticks -= 1;
-                if (slot.cooldown_ticks == 0 and slot.spec() != null) any_ready = true;
+                if (slot.pending_slashes > 0 and slot.pending_timer > 0) slot.pending_timer -= 1;
             }
-            if (!any_ready) continue;
 
             const target = combat.nearestEnemy(
                 &self.grid,
@@ -529,36 +661,151 @@ pub const Simulation = struct {
             ) orelse continue;
 
             const dir = combat.normalize(combat.sub(self.enemies.pos[target], p.pos));
+
             for (&p.weapons) |*slot| {
                 if (slot.cooldown_ticks > 0) continue;
-                const spec = slot.spec() orelse continue;
-                if (weapon.isArc(spec)) {
-                    _ = combat.fireArc(
-                        &self.enemies,
-                        &self.grid,
-                        &self.projectiles,
-                        p.id,
-                        spec,
-                        p.pos,
-                        dir,
-                        &self.query_scratch,
-                    );
-                } else {
-                    _ = self.projectiles.spawn(p.id, spec, p.pos, dir);
-                }
+                const base = weapon.specFor(slot.id, slot.level) orelse continue;
+                const spec = upgrade.resolveSpec(base, stats);
+                self.fireWeapon(p, slot, spec, dir);
                 slot.cooldown_ticks = spec.cooldown_ticks;
+                if (spec.slashes_per_cycle > 1) {
+                    slot.pending_slashes = spec.slashes_per_cycle - 1;
+                    slot.pending_timer = weapon.secondsToTicks(0.20);
+                }
+            }
+
+            for (&p.weapons) |*slot| {
+                if (slot.pending_slashes == 0 or slot.pending_timer > 0) continue;
+                const base = weapon.specFor(slot.id, slot.level) orelse continue;
+                const spec = upgrade.resolveSpec(base, stats);
+                self.fireWeapon(p, slot, spec, dir);
+                slot.pending_slashes -= 1;
+                slot.pending_timer = weapon.secondsToTicks(0.20);
+            }
+        }
+    }
+
+    /// Fire one weapon once with an already-resolved spec.
+    ///
+    /// `slot` is only touched for the Gun's per-slot shot counter, which is what
+    /// decides whether a round explodes; cooldowns are the caller's business.
+    fn fireWeapon(
+        self: *Simulation,
+        p: *PlayerState,
+        slot: *WeaponSlot,
+        spec: weapon.Spec,
+        dir: [2]f32,
+    ) void {
+        // Kinetic Charge: at 100 charge the activation gains +40% damage and
+        // +50% projectile speed (DESIGN.md §3).
+        var spec_mut = spec;
+        if (p.synergy_mask & upgrade.synergy_kinetic_charge != 0 and p.kinetic_charge >= 100.0) {
+            spec_mut.damage *= 1.4;
+            spec_mut.speed *= 1.5;
+            p.kinetic_charge = 0.0;
+        }
+
+        // Cross-Slash Mastery: every third axe sweep resets the sword's
+        // cooldown and grants +50% reach to its next attack.
+        // An evolved axe is still an axe, so the check is on the base weapon.
+        if (p.synergy_mask & upgrade.synergy_cross_slash != 0 and
+            upgrade.baseWeaponId(spec_mut.id) == upgrade.ids.axe)
+        {
+            p.axe_swings +%= 1;
+            if (p.axe_swings % 3 == 0) {
+                if (upgrade.weaponSlot(&p.weapons, upgrade.ids.sword)) |si| {
+                    p.weapons[si].cooldown_ticks = 0;
+                }
+                p.sword_reach_bonus = 0.5;
+            }
+        }
+        if (p.sword_reach_bonus > 0.0 and
+            upgrade.baseWeaponId(spec_mut.id) == upgrade.ids.sword)
+        {
+            spec_mut.reach *= 1.0 + p.sword_reach_bonus;
+            p.sword_reach_bonus = 0.0;
+        }
+
+        if (weapon.isArc(spec_mut)) {
+            const hits = combat.fireArc(
+                &self.enemies,
+                &self.grid,
+                &self.projectiles,
+                p.id,
+                spec_mut,
+                p.pos,
+                dir,
+                &self.query_scratch,
+                &self.hit_scratch,
+            );
+
+            if (spec_mut.dash_distance > 0.0) {
+                p.pos[0] += p.aim_dir[0] * spec_mut.dash_distance;
+                p.pos[1] += p.aim_dir[1] * spec_mut.dash_distance;
+                const limit = root.arena_half_size - root.player_half_extent;
+                p.pos[0] = std.math.clamp(p.pos[0], -limit, limit);
+                p.pos[1] = std.math.clamp(p.pos[1], -limit, limit);
+                p.flags.invulnerable = true;
+                p.invuln_ticks = spec_mut.dash_invuln_ticks;
+            }
+            if (spec_mut.pull_inward > 0.0) {
+                for (self.hit_scratch[0..hits]) |ei| {
+                    const e: usize = ei;
+                    const to = combat.sub(p.pos, self.enemies.pos[e]);
+                    const d = std.math.hypot(to[0], to[1]);
+                    if (d <= 1e-4) continue;
+                    const pull = @min(spec_mut.pull_inward, d);
+                    self.enemies.pos[e][0] += (to[0] / d) * pull;
+                    self.enemies.pos[e][1] += (to[1] / d) * pull;
+                }
+            }
+            if (spec_mut.rift_dps > 0.0) {
+                _ = self.rifts.spawn(p.pos, spec_mut.rift_radius, spec_mut.rift_dps, spec_mut.rift_ticks);
+            }
+            if (spec_mut.shield_per_hit > 0.0 and hits > 0) {
+                p.shield = @min(p.shield + spec_mut.shield_per_hit * @as(f32, @floatFromInt(hits)), spec_mut.shield_cap);
+            }
+            return;
+        }
+
+        if (spec_mut.shape == .ray and spec_mut.speed == 0.0) {
+            _ = combat.fireHitscan(
+                &self.enemies,
+                &self.grid,
+                &self.projectiles,
+                p.id,
+                spec_mut,
+                p.pos,
+                dir,
+                &self.query_scratch,
+            );
+            return;
+        }
+
+        const before = self.projectiles.count;
+        combat.spawnVolley(&self.projectiles, p.id, spec_mut, p.pos, dir);
+        if (spec_mut.explosive_every > 0) {
+            slot.shots_fired +%= 1;
+            if (slot.shots_fired % spec_mut.explosive_every == 0) {
+                for (before..self.projectiles.count) |k| self.projectiles.explosive[k] = true;
             }
         }
     }
 
     /// Contact damage: an enemy overlapping a player's 1.0 x 1.0 square hurts
     /// it, at most once per `enemy.contact_cooldown_ticks`.
+    ///
+    /// Titanium Plating reduces the damage taken, shield absorbs what is left,
+    /// and a player reaching 0 HP ends the run.
     fn updateContact(self: *Simulation) void {
         const half = root.player_half_extent;
         const reach = half * std.math.sqrt2 + enemy.max_radius;
 
         for (&self.players) |*p| {
-            if (!p.active or p.flags.invulnerable) continue;
+            if (!p.active or !p.flags.alive) continue;
+            const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
+            if (p.flags.invulnerable or p.invuln_ticks > 0) continue;
+
             const n = self.grid.queryCircle(p.pos, reach, &self.query_scratch);
             for (self.query_scratch[0..n]) |ei| {
                 const e: usize = ei;
@@ -567,11 +814,295 @@ pub const Simulation = struct {
                     continue;
                 }
                 self.enemies.contact_cd[e] = enemy.contact_cooldown_ticks;
-                // Floors at 1 HP: player death is phase 3, so a run cannot end
-                // yet and the client's HP bar is allowed to sit at 1%.
-                p.hp = @max(p.hp - self.enemies.contact_dmg[e], player_hp_floor);
+
+                const raw = self.enemies.contact_dmg[e];
+                // Titanium Plating: -3 flat damage taken, minimum 1.
+                var taken = @max(raw - stats.armor_flat, 1.0);
+                if (p.shield > 0.0) {
+                    const absorbed = @min(p.shield, taken);
+                    p.shield -= absorbed;
+                    taken -= absorbed;
+                }
+                p.hp -= taken;
+
+                // Reactive Carapace: taking contact damage emits a 4.0 u radial
+                // shockwave for 12 x Regen damage (DESIGN.md §3).
+                if (p.synergy_mask & upgrade.synergy_reactive_carapace != 0 and p.carapace_cd == 0) {
+                    const dmg = 12.0 * stats.regen_per_sec;
+                    const m = self.grid.queryCircle(p.pos, 4.0 + enemy.max_radius, &self.query_scratch);
+                    for (self.query_scratch[0..m]) |ej| {
+                        const other: usize = ej;
+                        if (!combat.circlesOverlap(p.pos, 4.0, self.enemies.pos[other], self.enemies.radius[other])) continue;
+                        _ = self.enemies.applyHit(other, dmg, combat.normalize(combat.sub(self.enemies.pos[other], p.pos)), 0.0);
+                    }
+                    p.carapace_cd = root.tick_hz;
+                }
+
+                if (p.hp <= 0.0) {
+                    p.hp = 0.0;
+                    p.flags.alive = false;
+                    self.killPlayer(p.id);
+                }
             }
         }
+    }
+
+    /// Spawn a gem at every enemy that died this tick (DESIGN.md §4).
+    fn dropGems(self: *Simulation) void {
+        for (0..self.enemies.count) |i| {
+            if (self.enemies.hp[i] > 0.0) continue;
+            _ = self.gems.spawn(
+                self.enemies.pos[i],
+                gem.gemValue(self.enemies.archetype[i], self.enemies.elite_mask[i]),
+            );
+        }
+    }
+
+    /// Magnetize, fly and collect gems, awarding XP.
+    fn updateGems(self: *Simulation, dt: f32) void {
+        var i: usize = 0;
+        while (i < self.gems.count) {
+            if (self.gems.magnet_target[i] == gem.no_magnet) {
+                for (&self.players) |*p| {
+                    if (!p.active or !p.flags.alive) continue;
+                    const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
+                    const d = combat.sub(p.pos, self.gems.pos[i]);
+                    if (d[0] * d[0] + d[1] * d[1] <= stats.pickup_radius * stats.pickup_radius) {
+                        self.gems.magnet_target[i] = p.id;
+                        break;
+                    }
+                }
+            }
+
+            const target = self.gems.magnet_target[i];
+            if (target == gem.no_magnet) {
+                i += 1;
+                continue;
+            }
+            const p = &self.players[target];
+            if (!p.active or !p.flags.alive) {
+                self.gems.magnet_target[i] = gem.no_magnet;
+                i += 1;
+                continue;
+            }
+
+            const to = combat.sub(p.pos, self.gems.pos[i]);
+            const dist = std.math.hypot(to[0], to[1]);
+            if (dist <= gem_collect_radius) {
+                self.gainXp(target, self.gems.xp_value[i]);
+                self.gems.swapRemove(i);
+                continue;
+            }
+
+            const dir = combat.normalize(to);
+            self.gems.pos[i][0] += dir[0] * gem_magnet_speed * dt;
+            self.gems.pos[i][1] += dir[1] * gem_magnet_speed * dt;
+
+            // Singularity Field: a magnetized gem deals 15 kinetic damage to
+            // enemies it passes through (DESIGN.md §3).
+            if (p.synergy_mask & upgrade.synergy_singularity_field != 0) {
+                const n = self.grid.queryCircle(self.gems.pos[i], 0.5 + enemy.max_radius, &self.query_scratch);
+                for (self.query_scratch[0..n]) |ei| {
+                    const e: usize = ei;
+                    if (!combat.circlesOverlap(self.gems.pos[i], 0.5, self.enemies.pos[e], self.enemies.radius[e])) continue;
+                    _ = self.enemies.applyHit(e, 15.0, combat.normalize(combat.sub(self.enemies.pos[e], self.gems.pos[i])), 0.0);
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Award XP to a player.
+    pub fn gainXp(self: *Simulation, player_id: u8, amount: u32) void {
+        if (player_id >= root.max_players) return;
+        const p = &self.players[player_id];
+        if (!p.active or !p.flags.alive) return;
+        p.xp += amount;
+        self.loadout_dirty[player_id] = true;
+    }
+
+    /// Offer a level-up to every player whose XP bar filled, and pause.
+    fn checkLevelUps(self: *Simulation) void {
+        for (&self.players) |*p| {
+            if (!p.active or !p.flags.alive) continue;
+            if (p.xp < p.xp_next) continue;
+
+            p.level += 1;
+            p.xp -= p.xp_next;
+            p.xp_next = upgrade.xpForLevel(p.level);
+            const options = upgrade.generateOptions(&p.weapons, &p.passives, &p.overclock, &self.upgrade_rng);
+            self.pending_levelups[self.pending_count] = .{
+                .event_id = self.next_event_id,
+                .player_id = p.id,
+                .new_level = p.level,
+                .options = options,
+                .timeout_ticks = levelup_timeout_ticks,
+                .resolved = false,
+                .sent = false,
+            };
+            self.next_event_id +%= 1;
+            self.pending_count += 1;
+            self.loadout_dirty[p.id] = true;
+        }
+        if (self.pending_count > 0) self.state = .level_up_pause;
+    }
+
+    /// Advance a paused run: count down the offer timeouts and auto-select
+    /// option 0 for any that expire.
+    fn tickLevelUpPause(self: *Simulation) void {
+        // A pause with nothing pending is a degenerate state a test can create
+        // by setting the state directly; it stays paused.
+        if (self.pending_count == 0) return;
+
+        var all_resolved = true;
+        for (self.pending_levelups[0..self.pending_count]) |*ev| {
+            if (ev.resolved) continue;
+            if (ev.timeout_ticks > 0) ev.timeout_ticks -= 1;
+            if (ev.timeout_ticks == 0) {
+                self.applyOption(ev.player_id, ev.options[0]);
+                ev.resolved = true;
+            }
+            if (!ev.resolved) all_resolved = false;
+        }
+        if (all_resolved) self.resumeFromPause();
+    }
+
+    /// Answer a pending level-up offer.
+    ///
+    /// Returns `false` when the event is unknown, already resolved, or the
+    /// choice index is out of range's slot.
+    pub fn submitChoice(self: *Simulation, player_id: u8, event_id: u16, choice_idx: u8) bool {
+        for (self.pending_levelups[0..self.pending_count]) |*ev| {
+            if (ev.player_id != player_id or ev.event_id != event_id) continue;
+            if (ev.resolved) return false;
+            const idx: usize = @min(choice_idx, 2);
+            self.applyOption(player_id, ev.options[idx]);
+            ev.resolved = true;
+            self.maybeResumeFromPause();
+            return true;
+        }
+        return false;
+    }
+
+    fn maybeResumeFromPause(self: *Simulation) void {
+        for (self.pending_levelups[0..self.pending_count]) |ev| {
+            if (!ev.resolved) return;
+        }
+        self.resumeFromPause();
+    }
+
+    fn resumeFromPause(self: *Simulation) void {
+        self.pending_count = 0;
+        self.state = .running;
+    }
+
+    /// Apply a chosen upgrade to a player's loadout.
+    fn applyOption(self: *Simulation, player_id: u8, opt: upgrade.UpgradeOption) void {
+        const p = &self.players[player_id];
+
+        if (opt.is_evo) {
+            if (upgrade.evolutionById(opt.item_id)) |evo| {
+                if (upgrade.weaponSlot(&p.weapons, evo.weapon_id)) |i| {
+                    p.weapons[i].id = evo.id;
+                    p.weapons[i].evolved = true;
+                    p.weapons[i].level = root.max_weapon_level;
+                    p.weapons[i].pending_slashes = 0;
+                    p.weapons[i].pending_timer = 0;
+                }
+            }
+        } else if (opt.item_id < root.max_weapons) {
+            if (upgrade.weaponSlot(&p.weapons, opt.item_id)) |i| {
+                p.weapons[i].level = @min(p.weapons[i].level + 1, root.max_weapon_level);
+            } else {
+                for (&p.weapons) |*slot| {
+                    if (!slot.isFree()) continue;
+                    slot.id = opt.item_id;
+                    slot.level = 1;
+                    slot.cooldown_ticks = 0;
+                    slot.evolved = false;
+                    slot.pending_slashes = 0;
+                    slot.pending_timer = 0;
+                    slot.shots_fired = 0;
+                    break;
+                }
+            }
+        } else if (upgrade.isOverclockId(opt.item_id)) {
+            const i: usize = opt.item_id - upgrade.ids.overclock_damage;
+            // Plain `+=` on the `u32` counter: no wrapping add, so the count
+            // cannot silently fall back to zero the way the old `+%=` on `u8`
+            // did at 256 purchases.
+            p.overclock[i] += 1;
+            if (i == 2) {
+                p.max_hp += 25.0;
+                p.hp += 25.0;
+            }
+        } else if (upgrade.passiveIndex(opt.item_id)) |i| {
+            const max = upgrade.passiveMaxLevelById(opt.item_id) orelse return;
+            p.passives[i] = @min(p.passives[i] + 1, max);
+        }
+
+        p.synergy_mask = upgrade.synergyMask(&p.weapons, &p.passives);
+        self.loadout_dirty[player_id] = true;
+    }
+
+    /// End the run for a player and, when nobody is left, report game over.
+    fn killPlayer(self: *Simulation, player_id: u8) void {
+        self.loadout_dirty[player_id] = true;
+        if (self.alivePlayerCount() > 0) return;
+        self.state = .game_over;
+        self.final_tick = self.tick;
+        self.game_over_pending = true;
+    }
+
+    /// Start a fresh run on a connection: reset the world and every connected
+    /// player.
+    ///
+    /// Phase 3 is a single-player phase, so a restart resets the whole run
+    /// rather than only the requesting player; party-level restart semantics
+    /// are phase 5.
+    pub fn restart(self: *Simulation, player_id: u8) void {
+        _ = player_id;
+        self.tick = 0;
+        self.kills = 0;
+        self.spawn_accum = 0.0;
+        self.spawn_debt = 0;
+        self.state = .running;
+        self.game_over_pending = false;
+        self.final_tick = 0;
+        self.pending_count = 0;
+        self.next_event_id = 1;
+
+        self.enemies.count = 0;
+        self.enemies.next_id = 1;
+        self.enemies.shatter_count = 0;
+        self.projectiles.count = 0;
+        self.projectiles.next_id = 1;
+        self.gems.count = 0;
+        self.gems.next_id = 1;
+        self.rifts.count = 0;
+
+        for (&self.players) |*p| {
+            if (!p.active) continue;
+            resetPlayer(p);
+            self.loadout_dirty[p.id] = true;
+        }
+    }
+
+    /// Score for a player (DESIGN.md §1):
+    /// `(seconds survived x 10) + (level x 250) + (kills x 2)`.
+    pub fn scoreFor(self: *const Simulation, player_id: u8) u32 {
+        const p = &self.players[player_id];
+        const seconds: u32 = @intCast(self.tick / root.tick_hz);
+        return seconds * 10 + @as(u32, p.level) * 250 + self.kills * 2;
+    }
+
+    /// Bit mask of the synergies the party has armed.
+    fn synergyMask(self: *const Simulation) u16 {
+        var mask: u16 = 0;
+        for (&self.players) |p| {
+            if (p.active and p.flags.alive) mask |= p.synergy_mask;
+        }
+        return mask;
     }
 
     /// Evaluate the spawn formula (DESIGN.md §4) and place the enemies it owes.
@@ -590,7 +1121,7 @@ pub const Simulation = struct {
 
         self.spawn_accum += rate;
         var owed: usize = @intFromFloat(@floor(self.spawn_accum));
-        self.spawn_accum -= @floatFromInt(owed);
+        self.spawn_accum -= @as(f32, @floatFromInt(owed));
         // Whatever the last wave could not place is still owed. Saturating
         // addition, not a clamp at the pool size: the debt is paid out over as
         // many waves as it takes, so clamping it to what a single wave could
@@ -643,6 +1174,15 @@ pub const Simulation = struct {
         return n;
     }
 
+    /// Players still alive, which is what ends a run.
+    pub fn alivePlayerCount(self: *const Simulation) u8 {
+        var n: u8 = 0;
+        for (&self.players) |p| {
+            if (p.active and p.flags.alive) n += 1;
+        }
+        return n;
+    }
+
     /// Quantized wire form of one player (PROTOCOL.md "PlayerNet", 8 bytes).
     pub fn playerNet(p: *const PlayerState) wire.PlayerNet {
         return .{
@@ -687,6 +1227,18 @@ pub const Simulation = struct {
         };
     }
 
+    /// Quantized wire form of one gem (PROTOCOL.md "GemNet", 12 bytes).
+    pub fn gemNet(pool: *const gem.Pool, i: usize) wire.GemNet {
+        return .{
+            .id = pool.id[i],
+            .pos_x = wire.quantize(pool.pos[i][0]),
+            .pos_y = wire.quantize(pool.pos[i][1]),
+            .xp_value = pool.xp_value[i],
+            .magnet_target_id = pool.magnet_target[i],
+            .reserved = 0,
+        };
+    }
+
     /// HP as a whole percentage, the form `hp_pct` carries on the wire.
     pub fn hpPercent(hp: f32, max_hp: f32) u8 {
         if (max_hp <= 0.0) return 0;
@@ -713,6 +1265,11 @@ pub const Simulation = struct {
             self.net_projs[nk] = projNet(&self.projectiles, nk);
         }
 
+        var ng: usize = 0;
+        while (ng < self.gems.count) : (ng += 1) {
+            self.net_gems[ng] = gemNet(&self.gems, ng);
+        }
+
         return .{
             .server_tick = self.tick,
             // Full snapshots carry no baseline; delta snapshots set this in
@@ -725,12 +1282,12 @@ pub const Simulation = struct {
                 @intCast(np),
                 @intCast(ne),
                 @intCast(nk),
-                0,
+                @intCast(ng),
             },
             .players = self.net_scratch[0..np],
             .enemies = self.net_enemies[0..ne],
             .projs = self.net_projs[0..nk],
-            .gems = &.{},
+            .gems = self.net_gems[0..ng],
         };
     }
 };
@@ -1007,7 +1564,7 @@ test "the darter pauses 0.4 s at 10 units and then lunges at 15 u/s" {
     );
 }
 
-test "contact damage hurts the player and floors at 1 HP" {
+test "contact damage hurts the player and can kill them" {
     var sim = Simulation.init();
     const p = sim.spawnPlayer(0).?;
     disarm(p);
@@ -1026,11 +1583,13 @@ test "contact damage hurts the player and floors at 1 HP" {
     sim.advance();
     try std.testing.expectApproxEqAbs(@as(f32, 90.0), p.hp, 1e-4);
 
-    // However long it stays, HP never reaches zero: death is phase 3.
+    // Unlike phase 2, HP now reaches zero and the run ends.
     i = 0;
     while (i < 3000) : (i += 1) sim.advance();
-    try std.testing.expectApproxEqAbs(player_hp_floor, p.hp, 1e-6);
-    try std.testing.expect(Simulation.hpPercent(p.hp, p.max_hp) == 1);
+    try std.testing.expect(p.hp <= 0.0);
+    try std.testing.expect(!p.flags.alive);
+    try std.testing.expectEqual(GameState.game_over, sim.state);
+    try std.testing.expect(sim.game_over_pending);
 }
 
 test "contact damage needs an actual overlap" {
@@ -1394,7 +1953,7 @@ test "knockback pushes an enemy away from the hit and decays" {
     try std.testing.expect(sim.enemies.hp[e] > 0.0);
 }
 
-test "the snapshot carries the enemy and projectile arrays" {
+test "the snapshot carries the enemy, projectile and gem arrays" {
     var sim = Simulation.init();
     const p = sim.spawnPlayer(0).?;
     _ = p;
@@ -1403,15 +1962,17 @@ test "the snapshot carries the enemy and projectile arrays" {
     const e1 = sim.enemies.spawn(.triangle_t1, .{ -7.0, 2.0 }).?;
     sim.enemies.hp[e1] = 5.0;
     const gun = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
-    _ = sim.projectiles.spawn(0, gun, .{ 1.0, 1.0 }, .{ 1.0, 0.0 }).?;
+    try std.testing.expect(sim.projectiles.spawn(0, gun, .{ 1.0, 1.0 }, .{1.0, 0.0}) != null);
+    _ = sim.gems.spawn(.{ 2.0, 2.0 }, gem.small_xp).?;
 
     const view = sim.snapshotView();
     try std.testing.expectEqual(@as(u16, 1), view.counts[0]);
     try std.testing.expectEqual(@as(u16, 2), view.counts[1]);
     try std.testing.expectEqual(@as(u16, 1), view.counts[2]);
-    try std.testing.expectEqual(@as(u16, 0), view.counts[3]);
+    try std.testing.expectEqual(@as(u16, 1), view.counts[3]);
     try std.testing.expectEqual(@as(usize, 2), view.enemies.len);
     try std.testing.expectEqual(@as(usize, 1), view.projs.len);
+    try std.testing.expectEqual(@as(usize, 1), view.gems.len);
 
     try std.testing.expectEqual(sim.enemies.id[e0], view.enemies[0].id);
     try std.testing.expectEqual(@intFromEnum(enemy.Archetype.circle_t1), view.enemies[0].archetype);
@@ -1428,12 +1989,17 @@ test "the snapshot carries the enemy and projectile arrays" {
     try std.testing.expectEqual(@intFromEnum(wire.ProjShape.circle), view.projs[0].shape);
     try std.testing.expectEqual(wire.quantize(1.0), view.projs[0].pos_x);
 
+    // The gem carries its value and its stationary magnet state.
+    try std.testing.expectEqual(@as(u16, gem.small_xp), view.gems[0].xp_value);
+    try std.testing.expectEqual(gem.no_magnet, view.gems[0].magnet_target_id);
+    try std.testing.expectEqual(wire.quantize(2.0), view.gems[0].pos_x);
+
     // The wire layout is header, then players, enemies, projectiles, gems.
     const frame = try wire.encodeSnapshotFull(std.testing.allocator, view);
     defer std.testing.allocator.free(frame);
     try std.testing.expectEqual(
         @as(usize, wire.header_size + wire.snapshot_header_wire_size +
-            8 * 1 + 12 * 2 + 12 * 1),
+            8 * 1 + 12 * 2 + 12 * 1 + 12 * 1),
         frame.len,
     );
 }
@@ -1501,6 +2067,12 @@ test "the stress load holds the world at a fixed size" {
     var sim = Simulation.init();
     const p = sim.spawnPlayer(0).?;
     disarm(p);
+    // The stressed projectiles kill enemies, so gems drop and the player would
+    // level up, and 500 enemies clustering on an unarmed player would kill it;
+    // this test is about the load, not the level curve or the death rule, so
+    // the bar is pinned out of reach and the player is invulnerable.
+    p.xp_next = std.math.maxInt(u32);
+    p.flags.invulnerable = true;
     sim.stress = .{ .enemies = 500, .projectiles = 200 };
 
     // Nothing to hold before a player exists: the load is placed around them.
@@ -1547,4 +2119,326 @@ test "a paused simulation advances nothing" {
     while (i < 60) : (i += 1) sim.advance();
     try std.testing.expectEqual(pos, sim.enemies.pos[0]);
     try std.testing.expectEqual(tick, sim.tick);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — the upgrade engine
+// ---------------------------------------------------------------------------
+
+test "a dead enemy drops a gem worth its archetype's XP" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    const e = sim.enemies.spawn(.circle_t1, .{ 5.0, 5.0 }).?;
+    sim.enemies.hp[e] = 0.0;
+
+    sim.advance();
+    try std.testing.expectEqual(@as(usize, 1), sim.gems.count);
+    try std.testing.expectEqual(@as(u16, gem.small_xp), sim.gems.xp_value[0]);
+    try std.testing.expectEqual(gem.no_magnet, sim.gems.magnet_target[0]);
+    // The corpse is compacted away.
+    try std.testing.expectEqual(@as(usize, 0), sim.enemies.count);
+    try std.testing.expectEqual(@as(u32, 1), sim.kills);
+}
+
+test "a gem is collected when the player walks onto it" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.pos = .{ 0.0, 0.0 };
+    _ = sim.gems.spawn(.{ 1.0, 0.0 }, gem.small_xp).?;
+    try std.testing.expectEqual(@as(u32, 0), p.xp);
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) sim.advance();
+    // The gem is inside the 3.0 unit pickup radius, so it magnetized and flew
+    // in, and the player collected it.
+    try std.testing.expectEqual(@as(usize, 0), sim.gems.count);
+    try std.testing.expect(p.xp >= gem.small_xp);
+}
+
+test "a gem outside the pickup radius stays put" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.pos = .{ 0.0, 0.0 };
+    _ = sim.gems.spawn(.{ 20.0, 0.0 }, gem.small_xp).?;
+
+    sim.advance();
+    try std.testing.expectEqual(@as(usize, 1), sim.gems.count);
+    try std.testing.expectEqual(gem.no_magnet, sim.gems.magnet_target[0]);
+    try std.testing.expectEqual(@as(u32, 0), p.xp);
+}
+
+test "Magnet Array scales the pickup radius" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.pos = .{ 0.0, 0.0 };
+    // Level 5 Magnet Array: 3.0 * 2.75 = 8.25 units.
+    p.passives[6] = 5;
+    _ = sim.gems.spawn(.{ 7.0, 0.0 }, gem.small_xp).?;
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) sim.advance();
+    try std.testing.expectEqual(@as(usize, 0), sim.gems.count);
+    try std.testing.expect(p.xp >= gem.small_xp);
+}
+
+test "a filled XP bar pauses the run and offers three choices" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.xp = p.xp_next;
+
+    sim.advance();
+    try std.testing.expectEqual(GameState.level_up_pause, sim.state);
+    try std.testing.expectEqual(@as(usize, 1), sim.pending_count);
+    try std.testing.expectEqual(@as(u16, 2), p.level);
+    try std.testing.expect(!sim.pending_levelups[0].resolved);
+    // The offer carries three distinct options.
+    const opts = sim.pending_levelups[0].options;
+    try std.testing.expect(opts[0].item_id != opts[1].item_id);
+    try std.testing.expect(opts[1].item_id != opts[2].item_id);
+    try std.testing.expect(opts[0].item_id != opts[2].item_id);
+    // The simulation is paused: the tick does not advance while it waits.
+    const tick = sim.tick;
+    sim.advance();
+    try std.testing.expectEqual(tick, sim.tick);
+}
+
+test "answering the offer applies the choice and resumes" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.xp = p.xp_next;
+    sim.advance();
+
+    const ev = sim.pending_levelups[0];
+    const chosen = ev.options[0];
+    try std.testing.expect(sim.submitChoice(0, ev.event_id, 0));
+
+    // A passive choice lands in the passive array at level 1.
+    if (chosen.item_id >= 16 and chosen.item_id < 26) {
+        try std.testing.expectEqual(@as(u8, 1), p.passives[chosen.item_id - 16]);
+    }
+    try std.testing.expect(sim.loadout_dirty[0]);
+    try std.testing.expectEqual(GameState.running, sim.state);
+    try std.testing.expectEqual(@as(usize, 0), sim.pending_count);
+}
+
+test "a stale or repeated choice is ignored" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.xp = p.xp_next;
+    sim.advance();
+    const ev = sim.pending_levelups[0];
+
+    try std.testing.expect(!sim.submitChoice(0, ev.event_id + 100, 0));
+    try std.testing.expect(sim.submitChoice(0, ev.event_id, 0));
+    // Already resolved.
+    try std.testing.expect(!sim.submitChoice(0, ev.event_id, 1));
+}
+
+test "the 15 second timeout auto-selects option 0" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.xp = p.xp_next;
+    sim.advance();
+    const ev = sim.pending_levelups[0];
+
+    var i: u32 = 0;
+    while (i < levelup_timeout_ticks) : (i += 1) {
+        sim.advance();
+        if (sim.state == .running) break;
+    }
+    try std.testing.expectEqual(GameState.running, sim.state);
+    // Option 0 was applied, and the offer was consumed.
+    try std.testing.expectEqual(@as(usize, 0), sim.pending_count);
+    _ = ev;
+}
+
+test "a level-8 weapon with its passive maxed evolves" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.weapons[0].id = upgrade.ids.sword;
+    p.weapons[0].level = 8;
+    p.passives[2] = 5; // Clockwork Gear
+
+    // Offer until Vorpal Blender appears, then take it.
+    var evolved = false;
+    var attempts: usize = 0;
+    while (attempts < 200 and !evolved) : (attempts += 1) {
+        p.xp = p.xp_next;
+        sim.advance();
+        const ev = sim.pending_levelups[0];
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            if (ev.options[i].item_id == upgrade.ids.vorpal_blender) {
+                try std.testing.expect(sim.submitChoice(0, ev.event_id, @intCast(i)));
+                evolved = true;
+                break;
+            }
+        }
+        if (!evolved) {
+            try std.testing.expect(sim.submitChoice(0, ev.event_id, 0));
+        }
+    }
+    try std.testing.expect(evolved);
+    try std.testing.expectEqual(upgrade.ids.vorpal_blender, p.weapons[0].id);
+    try std.testing.expect(p.weapons[0].evolved);
+    try std.testing.expectEqual(@as(u8, 8), p.weapons[0].level);
+}
+
+test "the weapon level table changes what a weapon does" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    // Sword only, level 1.
+    for (&p.weapons, 0..) |*slot, i| {
+        if (i != 0) slot.id = 0xff;
+    }
+    const front = sim.enemies.spawn(.circle_t1, .{ 1.5, 0.0 }).?;
+    sim.enemies.hp[front] = 1000.0;
+    sim.enemies.max_hp[front] = 1000.0;
+    sim.advance();
+    const after_l1 = sim.enemies.hp[front];
+
+    // Level 8: 90 damage, plus a rear slash.
+    p.weapons[0].level = 8;
+    p.weapons[0].cooldown_ticks = 0;
+    sim.enemies.hp[front] = 1000.0;
+    sim.advance();
+    const after_l8 = sim.enemies.hp[front];
+    try std.testing.expect(after_l8 < after_l1 - 60.0);
+}
+
+test "passives change the simulation" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    // Sword only.
+    for (&p.weapons, 0..) |*slot, i| {
+        if (i != 0) slot.id = 0xff;
+    }
+    const front = sim.enemies.spawn(.circle_t1, .{ 1.5, 0.0 }).?;
+    sim.enemies.hp[front] = 10000.0;
+    sim.enemies.max_hp[front] = 10000.0;
+    sim.advance();
+    const base = sim.enemies.hp[front];
+
+    // Spinach Core 5: +50% damage, so the same swing removes 30 instead of 20.
+    p.passives[0] = 5;
+    p.weapons[0].cooldown_ticks = 0;
+    sim.enemies.hp[front] = 10000.0;
+    sim.advance();
+    const buffed = sim.enemies.hp[front];
+    try std.testing.expectApproxEqAbs(base - 10.0, buffed, 1e-4);
+}
+
+test "Nano Repair restores HP over time" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.hp = 50.0;
+    p.passives[9] = 5; // +4.0 HP/s
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) sim.advance();
+    try std.testing.expectApproxEqAbs(@as(f32, 54.0), p.hp, 0.05);
+}
+
+test "Titanium Plating reduces contact damage" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.passives[8] = 5; // -15 flat, so 5 damage becomes the 1 minimum
+    _ = sim.enemies.spawn(.circle_t1, .{ 0.6, 0.0 }).?;
+
+    sim.advance();
+    try std.testing.expectApproxEqAbs(@as(f32, 99.0), p.hp, 1e-4);
+}
+
+test "Overclock raises max HP without a cap" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.overclock[2] = 4; // +100 max HP
+    p.max_hp += 100.0;
+    p.hp = p.max_hp;
+    try std.testing.expectEqual(@as(f32, 200.0), p.max_hp);
+    try std.testing.expectEqual(@as(u8, 100), Simulation.hpPercent(p.hp, p.max_hp));
+}
+
+test "Overclock purchases past 255 do not wrap" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+
+    // One purchase away from the old `u8` wrap on each counter.
+    p.overclock[0] = 255;
+    p.overclock[1] = 255;
+    p.overclock[2] = 255;
+    const hp_before = p.max_hp;
+
+    sim.applyOption(0, .{ .item_id = upgrade.ids.overclock_damage, .next_level = 1, .is_evo = false });
+    sim.applyOption(0, .{ .item_id = upgrade.ids.overclock_attack_speed, .next_level = 1, .is_evo = false });
+    sim.applyOption(0, .{ .item_id = upgrade.ids.overclock_max_hp, .next_level = 1, .is_evo = false });
+
+    // The counts land on 256, where the old `u8` + `+%=` wrapped to 0 and
+    // silently dropped every bonus the player had bought.
+    try std.testing.expectEqual(@as(u32, 256), p.overclock[0]);
+    try std.testing.expectEqual(@as(u32, 256), p.overclock[1]);
+    try std.testing.expectEqual(@as(u32, 256), p.overclock[2]);
+
+    // The bonuses keep scaling instead of collapsing: +512% damage, the
+    // clamped attack-speed floor, and another +25 max HP.
+    const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.12), stats.damage_mult, 1e-6);
+    try std.testing.expectApproxEqAbs(upgrade.overclock_cooldown_floor, stats.cooldown_mult, 1e-6);
+    try std.testing.expectEqual(@as(f32, hp_before + 25.0), p.max_hp);
+}
+
+test "a restart resets the run and revives the player" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    disarm(p);
+    p.level = 12;
+    p.xp = 999;
+    p.hp = 0.0;
+    p.flags.alive = false;
+    sim.state = .game_over;
+    sim.kills = 40;
+    _ = sim.enemies.spawn(.circle_t1, .{ 1.0, 1.0 }).?;
+
+    sim.restart(0);
+    try std.testing.expectEqual(GameState.running, sim.state);
+    try std.testing.expect(p.flags.alive);
+    try std.testing.expectEqual(@as(u16, 1), p.level);
+    try std.testing.expectEqual(@as(u32, 0), p.xp);
+    try std.testing.expectEqual(@as(f32, root.player_max_hp), p.hp);
+    try std.testing.expectEqual(@as(u32, 0), sim.kills);
+    try std.testing.expectEqual(@as(usize, 0), sim.enemies.count);
+    try std.testing.expectEqual(@as(usize, 0), sim.gems.count);
+}
+
+test "the score follows DESIGN.md §1" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    _ = p;
+    sim.tick = 60 * 30; // 30 seconds
+    sim.kills = 10;
+    sim.players[0].level = 5;
+    // 300 + 1250 + 20 = 1570
+    try std.testing.expectEqual(@as(u32, 1570), sim.scoreFor(0));
+}
+
+test "the smoke test's difficulty escalation is unbounded" {
+    // The spawn rate and active cap grow without a ceiling, which is what makes
+    // the run escalate without bound.
+    try std.testing.expect(enemy.spawnRate(10.0, 1) > enemy.spawnRate(1.0, 1));
+    try std.testing.expect(enemy.activeCap(20.0) > enemy.activeCap(5.0));
+    try std.testing.expectEqual(root.max_enemies, enemy.activeCap(1000.0));
+    try std.testing.expect(enemy.spawnRate(100.0, 1) > 1000.0);
 }

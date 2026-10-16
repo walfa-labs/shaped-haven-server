@@ -53,11 +53,13 @@ pub const msg = struct {
     pub const c2s_input: u8 = 0x02;
     pub const c2s_levelup_choice: u8 = 0x03;
     pub const c2s_ack_snapshot: u8 = 0x04;
+    pub const c2s_restart: u8 = 0x05;
     pub const s2c_welcome: u8 = 0x81;
     pub const s2c_snapshot_full: u8 = 0x82;
     pub const s2c_snapshot_delta: u8 = 0x83;
     pub const s2c_levelup_offer: u8 = 0x84;
     pub const s2c_game_over: u8 = 0x85;
+    pub const s2c_loadout: u8 = 0x86;
 };
 
 /// Fixed frame header (DESIGN.md §5).
@@ -121,7 +123,7 @@ pub const Input = packed struct {
     buttons: u8 = 0,
 };
 
-/// `C2S_LEVELUP_CHOICE` — 2 bytes (DESIGN.md §5).
+/// `C2S_LEVELUP_CHOICE` — 3 bytes (PROTOCOL.md).
 pub const LevelupChoice = packed struct {
     event_id: u16 = 0,
     choice_idx: u8 = 0,
@@ -131,6 +133,10 @@ pub const LevelupChoice = packed struct {
 pub const AckSnapshot = packed struct {
     last_recv_server_tick: u32 = 0,
 };
+
+/// `C2S_RESTART` — empty payload (PROTOCOL.md). Asks the server for a fresh run
+/// on this connection; only meaningful while `game_state` is game over.
+pub const restart_wire_size = 0;
 
 // ---------------------------------------------------------------------------
 // Server -> client payloads
@@ -214,6 +220,101 @@ pub const GemNet = packed struct {
     xp_value: u16,
     magnet_target_id: u8,
     reserved: u8,
+};
+
+/// One entry of `S2C_LEVELUP_OFFER` (PROTOCOL.md `UpgradeOptionNet`, 3 bytes).
+pub const UpgradeOptionNet = packed struct {
+    item_id: u8,
+    next_level: u8,
+    is_evo: u8,
+};
+
+/// `S2C_LEVELUP_OFFER` — 14 bytes (PROTOCOL.md).
+///
+/// The options array is carried as raw bytes because a packed struct cannot
+/// contain an array of packed structs in this toolchain; the encoder writes the
+/// nine option bytes field by field.
+pub const LevelupOffer = packed struct {
+    player_id: u8,
+    event_id: u16,
+    new_level: u16,
+    opt0_item_id: u8,
+    opt0_next_level: u8,
+    opt0_is_evo: u8,
+    opt1_item_id: u8,
+    opt1_next_level: u8,
+    opt1_is_evo: u8,
+    opt2_item_id: u8,
+    opt2_next_level: u8,
+    opt2_is_evo: u8,
+};
+
+/// `S2C_GAME_OVER` — 16 bytes (PROTOCOL.md).
+pub const GameOver = packed struct {
+    final_tick: u32,
+    seconds_survived: u32,
+    score: u32,
+    kills: u32,
+};
+
+/// One weapon in `S2C_LOADOUT` (PROTOCOL.md, 3 bytes).
+pub const WeaponNet = packed struct {
+    item_id: u8,
+    level: u8,
+    evolved: u8,
+};
+
+/// One passive in `S2C_LOADOUT` (PROTOCOL.md, 2 bytes).
+pub const PassiveNet = packed struct {
+    item_id: u8,
+    level: u8,
+};
+
+/// `S2C_LOADOUT` — 45 bytes (PROTOCOL.md).
+///
+/// Slots beyond `weapon_count` / `passive_count` are filled with `0xff` rather
+/// than omitted, so the payload is always exactly this size. The two item
+/// arrays are carried as raw bytes for the same packed-struct reason as
+/// `LevelupOffer.options`.
+pub const Loadout = packed struct {
+    player_id: u8,
+    level: u16,
+    xp: u32,
+    xp_next: u32,
+    weapon_count: u8,
+    w0_item_id: u8,
+    w0_level: u8,
+    w0_evolved: u8,
+    w1_item_id: u8,
+    w1_level: u8,
+    w1_evolved: u8,
+    w2_item_id: u8,
+    w2_level: u8,
+    w2_evolved: u8,
+    w3_item_id: u8,
+    w3_level: u8,
+    w3_evolved: u8,
+    passive_count: u8,
+    p0_item_id: u8,
+    p0_level: u8,
+    p1_item_id: u8,
+    p1_level: u8,
+    p2_item_id: u8,
+    p2_level: u8,
+    p3_item_id: u8,
+    p3_level: u8,
+    p4_item_id: u8,
+    p4_level: u8,
+    p5_item_id: u8,
+    p5_level: u8,
+    p6_item_id: u8,
+    p6_level: u8,
+    p7_item_id: u8,
+    p7_level: u8,
+    p8_item_id: u8,
+    p8_level: u8,
+    p9_item_id: u8,
+    p9_level: u8,
 };
 
 /// `EnemyNet.archetype` values.
@@ -391,6 +492,85 @@ pub fn encodeSnapshotFull(gpa: std.mem.Allocator, view: SnapshotView) ![]u8 {
 
     // PROTOCOL.md: `seq` carries the server tick on S2C_SNAPSHOT_*.
     return encodeFrame(gpa, msg.s2c_snapshot_full, payload.bytes(), view.server_tick);
+}
+
+/// Encode `S2C_LEVELUP_OFFER` (0x84, PROTOCOL.md).
+pub fn encodeLevelupOffer(
+    gpa: std.mem.Allocator,
+    player_id: u8,
+    event_id: u16,
+    new_level: u16,
+    options: []const UpgradeOptionNet,
+) ![]u8 {
+    var payload = Sink.init();
+    defer payload.deinit(gpa);
+
+    try payload.byte(gpa, player_id);
+    try payload.leU16(gpa, event_id);
+    try payload.leU16(gpa, new_level);
+    try payload.records(gpa, UpgradeOptionNet, options);
+
+    return encodeFrame(gpa, msg.s2c_levelup_offer, payload.bytes(), 0);
+}
+
+/// Encode `S2C_GAME_OVER` (0x85, PROTOCOL.md).
+pub fn encodeGameOver(gpa: std.mem.Allocator, go: GameOver) ![]u8 {
+    var payload = Sink.init();
+    defer payload.deinit(gpa);
+
+    try payload.leU32(gpa, go.final_tick);
+    try payload.leU32(gpa, go.seconds_survived);
+    try payload.leU32(gpa, go.score);
+    try payload.leU32(gpa, go.kills);
+
+    return encodeFrame(gpa, msg.s2c_game_over, payload.bytes(), 0);
+}
+
+/// Encode `S2C_LOADOUT` (0x86, PROTOCOL.md).
+pub fn encodeLoadout(gpa: std.mem.Allocator, l: Loadout) ![]u8 {
+    var payload = Sink.init();
+    defer payload.deinit(gpa);
+
+    try payload.byte(gpa, l.player_id);
+    try payload.leU16(gpa, l.level);
+    try payload.leU32(gpa, l.xp);
+    try payload.leU32(gpa, l.xp_next);
+    try payload.byte(gpa, l.weapon_count);
+    try payload.byte(gpa, l.w0_item_id);
+    try payload.byte(gpa, l.w0_level);
+    try payload.byte(gpa, l.w0_evolved);
+    try payload.byte(gpa, l.w1_item_id);
+    try payload.byte(gpa, l.w1_level);
+    try payload.byte(gpa, l.w1_evolved);
+    try payload.byte(gpa, l.w2_item_id);
+    try payload.byte(gpa, l.w2_level);
+    try payload.byte(gpa, l.w2_evolved);
+    try payload.byte(gpa, l.w3_item_id);
+    try payload.byte(gpa, l.w3_level);
+    try payload.byte(gpa, l.w3_evolved);
+    try payload.byte(gpa, l.passive_count);
+    try payload.byte(gpa, l.p0_item_id);
+    try payload.byte(gpa, l.p0_level);
+    try payload.byte(gpa, l.p1_item_id);
+    try payload.byte(gpa, l.p1_level);
+    try payload.byte(gpa, l.p2_item_id);
+    try payload.byte(gpa, l.p2_level);
+    try payload.byte(gpa, l.p3_item_id);
+    try payload.byte(gpa, l.p3_level);
+    try payload.byte(gpa, l.p4_item_id);
+    try payload.byte(gpa, l.p4_level);
+    try payload.byte(gpa, l.p5_item_id);
+    try payload.byte(gpa, l.p5_level);
+    try payload.byte(gpa, l.p6_item_id);
+    try payload.byte(gpa, l.p6_level);
+    try payload.byte(gpa, l.p7_item_id);
+    try payload.byte(gpa, l.p7_level);
+    try payload.byte(gpa, l.p8_item_id);
+    try payload.byte(gpa, l.p8_level);
+    try payload.byte(gpa, l.p9_item_id);
+    try payload.byte(gpa, l.p9_level);
+
+    return encodeFrame(gpa, msg.s2c_loadout, payload.bytes(), 0);
 }
 
 /// Append a `FrameHeader` + payload to `out`.
@@ -749,4 +929,103 @@ test "the enum byte values PROTOCOL.md leaves open are the documented ones" {
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(WeaponId.axe));
     try std.testing.expectEqual(@as(u8, 2), @intFromEnum(WeaponId.bow));
     try std.testing.expectEqual(@as(u8, 3), @intFromEnum(WeaponId.gun));
+}
+
+test "the phase-3 payload sizes match PROTOCOL.md" {
+    try std.testing.expectEqual(@as(usize, 3), wireSize(LevelupChoice));
+    try std.testing.expectEqual(@as(usize, 14), wireSize(LevelupOffer));
+    try std.testing.expectEqual(@as(usize, 16), wireSize(GameOver));
+    try std.testing.expectEqual(@as(usize, 45), wireSize(Loadout));
+    try std.testing.expectEqual(@as(usize, 3), wireSize(UpgradeOptionNet));
+    try std.testing.expectEqual(@as(usize, 3), wireSize(WeaponNet));
+    try std.testing.expectEqual(@as(usize, 2), wireSize(PassiveNet));
+}
+
+test "the level-up offer encodes in PROTOCOL.md order" {
+    const gpa = std.testing.allocator;
+    const options = [_]UpgradeOptionNet{
+        .{ .item_id = 0, .next_level = 2, .is_evo = 0 },
+        .{ .item_id = 16, .next_level = 1, .is_evo = 0 },
+        .{ .item_id = 32, .next_level = 8, .is_evo = 1 },
+    };
+    const frame = try encodeLevelupOffer(gpa, 1, 7, 3, &options);
+    defer gpa.free(frame);
+
+    const header = decodeFrameHeader(frame).?;
+    try std.testing.expectEqual(msg.s2c_levelup_offer, header.msg_type);
+    try std.testing.expectEqual(@as(u16, 14), header.payload_len);
+    try std.testing.expectEqualSlices(u8, &.{
+        1, // player_id
+        7, 0, // event_id
+        3, 0, // new_level
+        0, 2, 0, // option 0
+        16, 1, 0, // option 1
+        32, 8, 1, // option 2
+    }, frame[header_size..]);
+}
+
+test "the game-over frame encodes in PROTOCOL.md order" {
+    const gpa = std.testing.allocator;
+    const frame = try encodeGameOver(gpa, .{
+        .final_tick = 600,
+        .seconds_survived = 10,
+        .score = 1234,
+        .kills = 42,
+    });
+    defer gpa.free(frame);
+
+    const header = decodeFrameHeader(frame).?;
+    try std.testing.expectEqual(msg.s2c_game_over, header.msg_type);
+    try std.testing.expectEqual(@as(u16, 16), header.payload_len);
+    try std.testing.expectEqualSlices(u8, &.{
+        88, 2, 0, 0, // final_tick = 600
+        10, 0, 0, 0, // seconds_survived
+        210, 4, 0, 0, // score
+        42, 0, 0, 0, // kills
+    }, frame[header_size..]);
+}
+
+test "the loadout encodes in PROTOCOL.md order and pads its slots with 0xff" {
+    const gpa = std.testing.allocator;
+    const frame = try encodeLoadout(gpa, .{
+        .player_id = 0,
+        .level = 5,
+        .xp = 12,
+        .xp_next = 72,
+        .weapon_count = 2,
+        .w0_item_id = 0, .w0_level = 8, .w0_evolved = 1,
+        .w1_item_id = 3, .w1_level = 1, .w1_evolved = 0,
+        .w2_item_id = 0xff, .w2_level = 0, .w2_evolved = 0,
+        .w3_item_id = 0xff, .w3_level = 0, .w3_evolved = 0,
+        .passive_count = 1,
+        .p0_item_id = 16, .p0_level = 5,
+        .p1_item_id = 0xff, .p1_level = 0,
+        .p2_item_id = 0xff, .p2_level = 0,
+        .p3_item_id = 0xff, .p3_level = 0,
+        .p4_item_id = 0xff, .p4_level = 0,
+        .p5_item_id = 0xff, .p5_level = 0,
+        .p6_item_id = 0xff, .p6_level = 0,
+        .p7_item_id = 0xff, .p7_level = 0,
+        .p8_item_id = 0xff, .p8_level = 0,
+        .p9_item_id = 0xff, .p9_level = 0,
+    });
+    defer gpa.free(frame);
+
+    const header = decodeFrameHeader(frame).?;
+    try std.testing.expectEqual(msg.s2c_loadout, header.msg_type);
+    try std.testing.expectEqual(@as(u16, 45), header.payload_len);
+    try std.testing.expectEqualSlices(u8, &.{
+        0, // player_id
+        5, 0, // level
+        12, 0, 0, 0, // xp
+        72, 0, 0, 0, // xp_next
+        2, // weapon_count
+        0, 8, 1, // weapons[0]: evolved sword at 8
+        3, 1, 0, // weapons[1]
+        0xff, 0, 0, // weapons[2]: empty
+        0xff, 0, 0, // weapons[3]: empty
+        1, // passive_count
+        16, 5, // passives[0]
+        0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0,
+    }, frame[header_size..]);
 }

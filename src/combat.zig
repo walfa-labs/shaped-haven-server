@@ -5,6 +5,11 @@
 //! a hit applies, and the broadphase queries that decide which enemies a hit
 //! has to consider. `sim.zig` owns the tick order and calls into this.
 //!
+//! A projectile carries a copy of the resolved spec it was fired with, so the
+//! per-level and evolution behaviour fields (ricochet, split, debuff, slow,
+//! explosion) survive the trip from the weapon slot to the hit test without a
+//! second lookup.
+//!
 //! Geometry note. Travelling projectiles are tested as a circle against a
 //! circle at their new position, with no swept test between the old and the new
 //! position. At the speeds DESIGN.md §3 gives, that cannot tunnel: the fastest
@@ -18,11 +23,20 @@ const wire = @import("wire.zig");
 const weapon = @import("weapon.zig");
 const enemy = @import("enemy.zig");
 const spatial = @import("spatial.zig");
+const upgrade = @import("upgrade.zig");
 
 /// Distinct enemies one projectile can remember hitting. A projectile is spent
 /// the moment its pierce reaches zero, so it can never need more entries than
-/// the largest travelling weapon's pierce.
-pub const max_hits_per_projectile: usize = 2;
+/// the largest travelling weapon's pierce — the bow's level 8 row is 99.
+pub const max_hits_per_projectile: usize = 100;
+
+/// An empty hit list, for default-initializing a projectile's.
+const zero_hit_ids = root.repeated(u32, max_hits_per_projectile, 0);
+
+/// Ticks of Target Painter mark a Gun hit leaves (DESIGN.md §3: 3.0 s).
+fn markTicks() u16 {
+    return @intFromFloat(@round(3.0 * @as(f32, @floatFromInt(root.tick_hz))));
+}
 
 comptime {
     if (weapon.max_projectile_hits > max_hits_per_projectile) {
@@ -99,20 +113,30 @@ pub const ProjectilePool = struct {
 
     id: [root.max_projectiles]u32 = @splat(0),
     owner_id: [root.max_projectiles]u8 = @splat(0),
+    /// Base weapon id (0..3) for the wire; an evolution still reports the
+    /// weapon it grew from (PROTOCOL.md `ProjNet.weapon_id`).
     weapon_id: [root.max_projectiles]u8 = @splat(0),
     shape: [root.max_projectiles]u8 = @splat(0),
     pos: [root.max_projectiles][2]f32 = @splat(.{ 0.0, 0.0 }),
     /// Velocity in units per second for a travelling projectile. An `arc`
     /// record does not travel, so for those this holds the unit facing vector
     /// instead — which is what keeps the wire's `vel_angle` meaningful for a
-    /// swing.
+    /// swing. A hitscan `ray` record does not travel either.
     vel: [root.max_projectiles][2]f32 = @splat(.{ 0.0, 0.0 }),
+    /// The resolved spec this record was fired with.
+    spec: [root.max_projectiles]weapon.Spec = root.repeated(weapon.Spec, root.max_projectiles, weapon.zero_spec),
     damage: [root.max_projectiles]f32 = @splat(0.0),
     pierce_remaining: [root.max_projectiles]u8 = @splat(0),
     ttl_ticks: [root.max_projectiles]u16 = @splat(0),
+    ricochet_remaining: [root.max_projectiles]u8 = @splat(0),
+    /// Storm Volley: sub-arrows still to spawn on first impact.
+    split_count: [root.max_projectiles]u8 = @splat(0),
+    split_done: [root.max_projectiles]u8 = @splat(0),
+    /// Gun L4+: this round explodes on impact.
+    explosive: [root.max_projectiles]bool = @splat(false),
     /// Entity ids already hit, so a projectile cannot damage the same enemy
     /// twice while it is still overlapping it.
-    hit_ids: [root.max_projectiles][max_hits_per_projectile]u32 = @splat(.{ 0, 0 }),
+    hit_ids: [root.max_projectiles][max_hits_per_projectile]u32 = root.repeated([max_hits_per_projectile]u32, root.max_projectiles, zero_hit_ids),
     hit_count: [root.max_projectiles]u8 = @splat(0),
 
     pub fn shapeOf(self: *const ProjectilePool, i: usize) wire.ProjShape {
@@ -120,9 +144,12 @@ pub const ProjectilePool = struct {
     }
 
     /// True when this record takes part in collisions. An `arc` record is a
-    /// rendered swing whose damage was already applied by `fireArc`.
+    /// rendered swing whose damage was already applied by `fireArc`; a hitscan
+    /// `ray` record is a drawn beam whose damage was already applied by
+    /// `fireHitscan`.
     pub fn collides(self: *const ProjectilePool, i: usize) bool {
-        return self.shapeOf(i) != .arc;
+        if (self.shapeOf(i) == .arc) return false;
+        return self.spec[i].speed > 0.0;
     }
 
     /// Reserve a slot for `spec` fired from `pos` along the unit vector `dir`.
@@ -142,16 +169,23 @@ pub const ProjectilePool = struct {
         self.id[i] = self.next_id;
         self.next_id +%= 1;
         self.owner_id[i] = owner_id;
-        self.weapon_id[i] = @intFromEnum(spec.id);
+        // PROTOCOL.md keeps ProjNet.weapon_id at 0..3, so an evolution reports
+        // the base weapon it grew from.
+        self.weapon_id[i] = if (spec.id < root.max_weapons) spec.id else spec.id - 32;
         self.shape[i] = @intFromEnum(spec.shape);
         self.pos[i] = pos;
         self.vel[i] = if (arc) facing else .{ facing[0] * spec.speed, facing[1] * spec.speed };
         // An arc's damage is applied by the sector test at the moment it fires,
         // so its record carries none and never collides.
         self.damage[i] = if (arc) 0.0 else spec.damage;
+        self.spec[i] = spec;
         self.pierce_remaining[i] = spec.pierce;
         self.ttl_ticks[i] = spec.ttl_ticks;
-        self.hit_ids[i] = .{ 0, 0 };
+        self.ricochet_remaining[i] = spec.ricochet;
+        self.split_count[i] = spec.split_count;
+        self.split_done[i] = 0;
+        self.explosive[i] = false;
+        self.hit_ids[i] = @splat(0);
         self.hit_count[i] = 0;
         self.count += 1;
         return i;
@@ -289,7 +323,7 @@ pub fn nearestEnemy(
 }
 
 /// Apply an arc weapon's sector to every enemy inside it. Returns how many were
-/// hit.
+/// hit, and writes the hit enemy indices into `hits_out`.
 ///
 /// Instantaneous: the sweep damages the whole sector on the tick it fires, and
 /// the `arc` record spawned afterwards is a rendering-only echo of it.
@@ -302,6 +336,7 @@ pub fn fireArc(
     origin: [2]f32,
     dir: [2]f32,
     scratch: []u32,
+    hits_out: []u32,
 ) usize {
     const half_arc = spec.arc_rad * 0.5;
     const n = grid.queryCircle(origin, spec.reach + enemy.max_radius, scratch);
@@ -322,13 +357,77 @@ pub fn fireArc(
         if (!sectorContains(origin, dir, spec.reach, half_arc, enemies.pos[e], enemies.radius[e])) {
             continue;
         }
-        _ = enemies.applyHit(e, spec.damage, normalize(sub(enemies.pos[e], origin)), spec.knockback);
+        _ = enemies.applyHit(e, spec.damage, normalize(sub(enemies.pos[e], origin)), spec.knockback + spec.knockback_bonus);
+        if (hits < hits_out.len) hits_out[hits] = @intCast(e);
         pierce -= 1;
         hits += 1;
     }
 
     _ = projectiles.spawn(owner_id, spec, origin, dir);
     return hits;
+}
+
+/// Apply an instant hitscan beam to every enemy inside it (DESIGN.md §3
+/// Railgun Longbow). `reach` is the beam's length, `radius` its half-width.
+///
+/// The damage is applied here; the `ray` record spawned afterwards is a
+/// rendering-only echo of the beam.
+pub fn fireHitscan(
+    enemies: *enemy.Pool,
+    grid: *const spatial.SpatialHash,
+    projectiles: *ProjectilePool,
+    owner_id: u8,
+    spec: weapon.Spec,
+    origin: [2]f32,
+    dir: [2]f32,
+    scratch: []u32,
+) usize {
+    const n = grid.queryCircle(origin, spec.reach + enemy.max_radius, scratch);
+    var hits: usize = 0;
+    for (scratch[0..n]) |ei| {
+        const e: usize = ei;
+        const d = sub(enemies.pos[e], origin);
+        const along = d[0] * dir[0] + d[1] * dir[1];
+        if (along < 0.0 or along > spec.reach + enemies.radius[e]) continue;
+        const perp2 = @max(d[0] * d[0] + d[1] * d[1] - along * along, 0.0);
+        if (perp2 > (spec.radius + enemies.radius[e]) * (spec.radius + enemies.radius[e])) continue;
+        _ = enemies.applyHit(e, spec.damage, dir, spec.knockback);
+        hits += 1;
+    }
+
+    _ = projectiles.spawn(owner_id, spec, origin, dir);
+    return hits;
+}
+
+/// Fire a weapon's `count` projectiles, spread across `spread_rad` around
+/// `base_dir`. A 360 degree spread distributes them evenly around the circle.
+pub fn spawnVolley(
+    projectiles: *ProjectilePool,
+    owner_id: u8,
+    spec: weapon.Spec,
+    pos: [2]f32,
+    base_dir: [2]f32,
+) void {
+    const count = @max(spec.count, 1);
+    const base_angle = std.math.atan2(base_dir[1], base_dir[0]);
+    if (spec.spread_rad >= 2.0 * std.math.pi - 1e-3) {
+        // A full nova: evenly spaced around the circle.
+        for (0..count) |k| {
+            const a = base_angle + @as(f32, @floatFromInt(k)) *
+                (2.0 * std.math.pi / @as(f32, @floatFromInt(count)));
+            _ = projectiles.spawn(owner_id, spec, pos, .{ @cos(a), @sin(a) });
+        }
+        return;
+    }
+    if (count == 1) {
+        _ = projectiles.spawn(owner_id, spec, pos, base_dir);
+        return;
+    }
+    const step = spec.spread_rad / @as(f32, @floatFromInt(count - 1));
+    for (0..count) |k| {
+        const a = base_angle - spec.spread_rad * 0.5 + step * @as(f32, @floatFromInt(k));
+        _ = projectiles.spawn(owner_id, spec, pos, .{ @cos(a), @sin(a) });
+    }
 }
 
 /// Move every travelling projectile, resolve what it hits, and apply damage.
@@ -342,6 +441,7 @@ pub fn updateProjectiles(
     grid: *const spatial.SpatialHash,
     scratch: []u32,
     dt: f32,
+    synergy_mask: u16,
 ) void {
     const arena = root.arena_half_size;
 
@@ -354,24 +454,60 @@ pub fn updateProjectiles(
         if (projectiles.ttl_ticks[i] == 0) continue; // spent, reaped at the end of the tick
 
         if (!projectiles.collides(i)) {
-            projectiles.age(i); // an arc record does not travel; it only ages
+            projectiles.age(i); // an arc or hitscan record does not travel
             continue;
+        }
+
+        // Target Painter: a bow arrow curves toward a marked enemy within
+        // 6.0 units (DESIGN.md §3).
+        if ((synergy_mask & synergy_target_painter) != 0 and
+            projectiles.weapon_id[i] == 2)
+        {
+            const n = grid.queryCircle(projectiles.pos[i], 6.0 + enemy.max_radius, scratch);
+            var best: ?usize = null;
+            var best_d2 = std.math.inf(f32);
+            for (scratch[0..n]) |ei| {
+                const e: usize = ei;
+                if (enemies.marked_ticks[e] == 0) continue;
+                const d = sub(enemies.pos[e], projectiles.pos[i]);
+                const d2 = d[0] * d[0] + d[1] * d[1];
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best = e;
+                }
+            }
+            if (best) |e| {
+                const to = normalize(sub(enemies.pos[e], projectiles.pos[i]));
+                const speed = std.math.hypot(projectiles.vel[i][0], projectiles.vel[i][1]);
+                projectiles.vel[i][0] = to[0] * speed;
+                projectiles.vel[i][1] = to[1] * speed;
+            }
         }
 
         const from = projectiles.pos[i];
         projectiles.pos[i][0] += projectiles.vel[i][0] * dt;
         projectiles.pos[i][1] += projectiles.vel[i][1] * dt;
 
-        // Past the arena wall: nothing left to hit.
+        // Past the arena wall: a ricocheting projectile (Bow L4+) bounces back
+        // instead of being spent.
         if (@abs(projectiles.pos[i][0]) > arena or @abs(projectiles.pos[i][1]) > arena) {
-            projectiles.ttl_ticks[i] = 0;
-            continue;
+            if (projectiles.ricochet_remaining[i] > 0) {
+                projectiles.ricochet_remaining[i] -= 1;
+                if (@abs(projectiles.pos[i][0]) > arena) {
+                    projectiles.pos[i][0] = std.math.clamp(projectiles.pos[i][0], -arena, arena);
+                    projectiles.vel[i][0] = -projectiles.vel[i][0];
+                }
+                if (@abs(projectiles.pos[i][1]) > arena) {
+                    projectiles.pos[i][1] = std.math.clamp(projectiles.pos[i][1], -arena, arena);
+                    projectiles.vel[i][1] = -projectiles.vel[i][1];
+                }
+            } else {
+                projectiles.ttl_ticks[i] = 0;
+                continue;
+            }
         }
 
-        const spec = weapon.spec(projectiles.weapon_id[i]) orelse {
-            projectiles.ttl_ticks[i] = 0;
-            continue;
-        };
+        const spec = projectiles.spec[i];
         const dir = normalize(projectiles.vel[i]);
         const n = grid.queryCircle(
             projectiles.pos[i],
@@ -394,8 +530,42 @@ pub fn updateProjectiles(
                 continue;
             }
 
-            _ = enemies.applyHit(e, projectiles.damage[i], dir, spec.knockback);
+            // Target Painter: a bow arrow hitting a marked enemy deals +35%
+            // critical damage.
+            var damage = projectiles.damage[i];
+            if ((synergy_mask & synergy_target_painter) != 0 and
+                projectiles.weapon_id[i] == 2 and
+                enemies.marked_ticks[e] > 0)
+            {
+                damage *= 1.35;
+            }
+
+            _ = enemies.applyHit(e, damage, dir, spec.knockback);
             projectiles.recordHit(i, enemies.id[e]);
+            applyOnHit(enemies, e, spec, synergy_mask);
+
+            // Storm Volley: split into sub-arrows on the first enemy impact.
+            if (projectiles.split_count[i] > 0 and projectiles.split_done[i] == 0) {
+                projectiles.split_done[i] = 1;
+                const sub_spec = spec;
+                const sub_damage = spec.damage * spec.split_damage_mult;
+                var k: u8 = 0;
+                while (k < spec.split_count) : (k += 1) {
+                    const a = std.math.atan2(dir[1], dir[0]) +
+                        (@as(f32, @floatFromInt(k)) - @as(f32, @floatFromInt(spec.split_count - 1)) * 0.5) * 0.5;
+                    var s = sub_spec;
+                    s.damage = sub_damage;
+                    s.split_count = 0;
+                    s.ttl_ticks = @max(spec.ttl_ticks, 20);
+                    _ = projectiles.spawn(projectiles.owner_id[i], s, projectiles.pos[i], .{ @cos(a), @sin(a) });
+                }
+            }
+
+            // Gun L4+: an explosive round deals area damage on impact.
+            if (projectiles.explosive[i]) {
+                explode(enemies, grid, scratch, projectiles.pos[i], spec.explosive_radius, projectiles.damage[i] * spec.explosive_mult);
+            }
+
             if (projectiles.pierce_remaining[i] > 0) projectiles.pierce_remaining[i] -= 1;
             if (projectiles.pierce_remaining[i] == 0) {
                 projectiles.ttl_ticks[i] = 0;
@@ -404,6 +574,49 @@ pub fn updateProjectiles(
         }
 
         projectiles.age(i);
+    }
+}
+
+/// Target Painter's bit in `synergy_mask` (DESIGN.md §3, Bow + Gun).
+pub const synergy_target_painter = upgrade.synergy_target_painter;
+
+/// The per-hit effects a weapon carries: Target Painter's mark, Vulcan
+/// Minigun's stacking debuff and Cryo Flechette's slow and freeze stacks
+/// (DESIGN.md §3).
+fn applyOnHit(enemies: *enemy.Pool, e: usize, spec: weapon.Spec, synergy_mask: u16) void {
+    if ((synergy_mask & synergy_target_painter) != 0 and spec.id == 3) {
+        enemies.marked_ticks[e] = markTicks();
+    }
+    if (spec.debuff_per_stack > 0.0) {
+        enemies.debuff_mult[e] = @min(
+            enemies.debuff_mult[e] + spec.debuff_per_stack,
+            1.0 + spec.debuff_cap,
+        );
+    }
+    if (spec.slow_ticks > 0) {
+        enemies.slow_ticks[e] = spec.slow_ticks;
+        enemies.slow_factor[e] = 1.0 - spec.slow_mult;
+        enemies.cryo_stacks[e] +%= 1;
+        if (spec.freeze_stacks > 0 and enemies.cryo_stacks[e] >= spec.freeze_stacks) {
+            enemies.freeze_ticks[e] = spec.freeze_ticks;
+        }
+    }
+}
+
+/// Area damage around `origin`, used by the Gun's explosive rounds.
+fn explode(
+    enemies: *enemy.Pool,
+    grid: *const spatial.SpatialHash,
+    scratch: []u32,
+    origin: [2]f32,
+    radius: f32,
+    damage: f32,
+) void {
+    const n = grid.queryCircle(origin, radius + enemy.max_radius, scratch);
+    for (scratch[0..n]) |ei| {
+        const e: usize = ei;
+        if (!circlesOverlap(origin, radius, enemies.pos[e], enemies.radius[e])) continue;
+        _ = enemies.applyHit(e, damage, normalize(sub(enemies.pos[e], origin)), 0.0);
     }
 }
 
@@ -528,6 +741,7 @@ test "an arc fires once, damages the whole sector, and leaves a record behind" {
     var grid = emptyGrid();
     var projectiles = ProjectilePool{};
     var scratch: [64]u32 = undefined;
+    var hits: [64]u32 = undefined;
 
     // Three swarmers ahead within reach, one behind, one out of reach.
     const front_a = enemies.spawn(.circle_t1, .{ 1.0, 0.0 }).?;
@@ -537,9 +751,11 @@ test "an arc fires once, damages the whole sector, and leaves a record behind" {
     for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.sword)).?;
-    const hits = fireArc(&enemies, &grid, &projectiles, 0, spec, .{ 0, 0 }, .{ 1, 0 }, &scratch);
+    const n = fireArc(&enemies, &grid, &projectiles, 0, spec, .{ 0, 0 }, .{ 1, 0 }, &scratch, &hits);
 
-    try std.testing.expectEqual(@as(usize, 2), hits);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(front_a, hits[0]);
+    try std.testing.expectEqual(front_b, hits[1]);
     // 15 HP against a 20 damage sword leaves -5, which is the death marker the
     // pool reaps on.
     try std.testing.expectApproxEqAbs(@as(f32, -5.0), enemies.hp[front_a], 1e-6);
@@ -560,6 +776,7 @@ test "the axe reaches further and hits a wider sector than the sword" {
     var grid = emptyGrid();
     var projectiles = ProjectilePool{};
     var scratch: [64]u32 = undefined;
+    var hits: [64]u32 = undefined;
 
     // 4.5 units out and 60 degrees off axis: inside the axe, outside the sword.
     const a = @as(f32, 60.0) * std.math.pi / 180.0;
@@ -568,11 +785,11 @@ test "the axe reaches further and hits a wider sector than the sword" {
     for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const sword = weapon.spec(@intFromEnum(weapon.Id.sword)).?;
-    try std.testing.expectEqual(@as(usize, 0), fireArc(&enemies, &grid, &projectiles, 0, sword, .{ 0, 0 }, .{ 1, 0 }, &scratch));
+    try std.testing.expectEqual(@as(usize, 0), fireArc(&enemies, &grid, &projectiles, 0, sword, .{ 0, 0 }, .{ 1, 0 }, &scratch, &hits));
     try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[target], 1e-6);
 
     const axe = weapon.spec(@intFromEnum(weapon.Id.axe)).?;
-    try std.testing.expectEqual(@as(usize, 1), fireArc(&enemies, &grid, &projectiles, 0, axe, .{ 0, 0 }, .{ 1, 0 }, &scratch));
+    try std.testing.expectEqual(@as(usize, 1), fireArc(&enemies, &grid, &projectiles, 0, axe, .{ 0, 0 }, .{ 1, 0 }, &scratch, &hits));
     try std.testing.expectApproxEqAbs(@as(f32, -30.0), enemies.hp[target], 1e-6); // 15 - 45
 }
 
@@ -586,13 +803,13 @@ test "a gun bullet damages one enemy, is spent, and cannot hit it twice" {
     for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
-    _ = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
+    try std.testing.expect(projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{1.0, 0.0}) != null);
 
     // The bullet starts 1.0 units away and closes 0.47 units per tick.
     const dt = 1.0 / 60.0;
     var ticks: usize = 0;
     while (ticks < 10) : (ticks += 1) {
-        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt);
+        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt, 0);
         projectiles.reapSpent();
         if (enemies.hp[target] < 15.0) break;
     }
@@ -620,7 +837,7 @@ test "a bow arrow pierces two enemies and then stops" {
     const dt = 1.0 / 60.0;
     var ticks: usize = 0;
     while (ticks < 60) : (ticks += 1) {
-        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt);
+        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt, 0);
         projectiles.reapSpent();
     }
 
@@ -637,6 +854,7 @@ test "a limited-pierce arc spends its pierce on the nearest enemy in the sector"
     var grid = emptyGrid();
     var projectiles = ProjectilePool{};
     var scratch: [64]u32 = undefined;
+    var hits: [64]u32 = undefined;
 
     // All three in cell (0, 0) — 1.0, 2.0 and 3.0 are all under the 4.0 cell
     // edge — inserted near to far, so the broadphase hands them back farthest
@@ -649,9 +867,9 @@ test "a limited-pierce arc spends its pierce on the nearest enemy in the sector"
 
     var spec = weapon.spec(@intFromEnum(weapon.Id.sword)).?;
     spec.pierce = 1;
-    const hits = fireArc(&enemies, &grid, &projectiles, 0, spec, .{ 0, 0 }, .{ 1, 0 }, &scratch);
+    const n = fireArc(&enemies, &grid, &projectiles, 0, spec, .{ 0, 0 }, .{ 1, 0 }, &scratch, &hits);
 
-    try std.testing.expectEqual(@as(usize, 1), hits);
+    try std.testing.expectEqual(@as(usize, 1), n);
     // 15 HP against a 20 damage sword leaves -5, which is the death marker.
     try std.testing.expectApproxEqAbs(@as(f32, -5.0), enemies.hp[near], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[mid], 1e-6);
@@ -675,12 +893,12 @@ test "a limited-pierce projectile spends its pierce on the enemies it reaches fi
     for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.bow)).?;
-    _ = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
+    try std.testing.expect(projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{1.0, 0.0}) != null);
 
     const dt = 1.0 / 60.0;
     var ticks: usize = 0;
     while (ticks < 60) : (ticks += 1) {
-        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt);
+        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt, 0);
         projectiles.reapSpent();
         if (projectiles.count == 0) break;
     }
@@ -704,7 +922,7 @@ test "a projectile travels once per tick of lifetime and never after it" {
     const i = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
     try std.testing.expectEqual(@as(u16, 1), projectiles.ttl_ticks[i]);
 
-    updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0);
+    updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0, 0);
     try std.testing.expectEqual(@as(usize, 1), projectiles.count); // reaped separately
     const step = projectiles.pos[i][0];
     // It travelled on the one tick of lifetime it had, and is now spent.
@@ -714,7 +932,7 @@ test "a projectile travels once per tick of lifetime and never after it" {
     // However long it sits there, an expired record never moves again.
     var k: usize = 0;
     while (k < 10) : (k += 1) {
-        updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0);
+        updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0, 0);
         try std.testing.expectEqual(step, projectiles.pos[i][0]);
     }
     projectiles.reapSpent();
@@ -728,12 +946,12 @@ test "a projectile that never hits expires on its lifetime" {
     var scratch: [64]u32 = undefined;
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
-    _ = projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{ 1.0, 0.0 }).?;
+    try std.testing.expect(projectiles.spawn(0, spec, .{ 0.0, 0.0 }, .{1.0, 0.0}) != null);
 
     const dt = 1.0 / 60.0;
     var ticks: usize = 0;
     while (ticks < 72) : (ticks += 1) {
-        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt);
+        updateProjectiles(&projectiles, &enemies, &grid, &scratch, dt, 0);
         projectiles.reapSpent();
     }
     try std.testing.expectEqual(@as(usize, 0), projectiles.count);
@@ -746,12 +964,29 @@ test "a projectile leaving the arena is spent" {
     var scratch: [64]u32 = undefined;
 
     const spec = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
-    _ = projectiles.spawn(0, spec, .{ root.arena_half_size - 0.1, 0.0 }, .{ 1.0, 0.0 }).?;
+    try std.testing.expect(projectiles.spawn(0, spec, .{ root.arena_half_size - 0.1, 0.0 }, .{1.0, 0.0}) != null);
 
-    updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0);
+    updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0, 0);
     try std.testing.expectEqual(@as(u16, 0), projectiles.ttl_ticks[0]);
     projectiles.reapSpent();
     try std.testing.expectEqual(@as(usize, 0), projectiles.count);
+}
+
+test "a ricocheting arrow bounces off the arena wall instead of being spent" {
+    var enemies = enemy.Pool{};
+    var grid = emptyGrid();
+    var projectiles = ProjectilePool{};
+    var scratch: [64]u32 = undefined;
+
+    const spec = weapon.specFor(2, 4).?; // Bow L4: 1 ricochet
+    try std.testing.expectEqual(@as(u8, 1), spec.ricochet);
+    try std.testing.expect(projectiles.spawn(0, spec, .{ root.arena_half_size - 0.1, 0.0 }, .{1.0, 0.0}) != null);
+
+    updateProjectiles(&projectiles, &enemies, &grid, &scratch, 1.0 / 60.0, 0);
+    // Still alive, moving back into the arena.
+    try std.testing.expectEqual(@as(u8, 0), projectiles.ricochet_remaining[0]);
+    try std.testing.expect(projectiles.vel[0][0] < 0.0);
+    try std.testing.expect(projectiles.ttl_ticks[0] > 0);
 }
 
 test "nearestEnemy picks the closest candidate inside the range" {
@@ -783,4 +1018,94 @@ test "swapRemove keeps the projectile pool dense" {
     try std.testing.expectEqual([2]f32{ 3.0, 3.0 }, pool.pos[0]);
     try std.testing.expectEqual(@as(u8, 2), pool.owner_id[0]);
     try std.testing.expectEqual(@as(u8, 1), pool.pierce_remaining[0]);
+}
+
+test "a hitscan beam damages every enemy along its path" {
+    var enemies = enemy.Pool{};
+    var grid = emptyGrid();
+    var projectiles = ProjectilePool{};
+    var scratch: [64]u32 = undefined;
+
+    const near = enemies.spawn(.circle_t1, .{ 5.0, 0.0 }).?;
+    const far = enemies.spawn(.circle_t1, .{ 20.0, 0.0 }).?;
+    const off = enemies.spawn(.circle_t1, .{ 10.0, 5.0 }).?;
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
+
+    const spec = weapon.specFor(36, 8).?; // Railgun Longbow
+    try std.testing.expectEqual(@as(f32, 45.0), spec.reach);
+    const hits = fireHitscan(&enemies, &grid, &projectiles, 0, spec, .{ 0, 0 }, .{ 1, 0 }, &scratch);
+
+    try std.testing.expectEqual(@as(usize, 2), hits);
+    try std.testing.expectApproxEqAbs(@as(f32, -205.0), enemies.hp[near], 1e-4); // 15 - 220
+    try std.testing.expectApproxEqAbs(@as(f32, -205.0), enemies.hp[far], 1e-4);
+    // 5 units off the beam's axis, outside the 0.6 half-width.
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), enemies.hp[off], 1e-4);
+    // A drawn beam record for the client.
+    try std.testing.expectEqual(@as(usize, 1), projectiles.count);
+    try std.testing.expect(!projectiles.collides(0));
+}
+
+test "a volley spreads its projectiles across the requested arc" {
+    var pool = ProjectilePool{};
+    const spec = weapon.specFor(2, 2).?; // Bow L2: 2 arrows, 15 degrees
+    spawnVolley(&pool, 0, spec, .{ 0, 0 }, .{ 1, 0 });
+    try std.testing.expectEqual(@as(usize, 2), pool.count);
+    // Symmetric about +x: +/- 7.5 degrees.
+    const a0 = std.math.atan2(pool.vel[0][1], pool.vel[0][0]);
+    const a1 = std.math.atan2(pool.vel[1][1], pool.vel[1][0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.5) * std.math.pi / 180.0, @abs(a0 - a1) * 0.5 * 2.0 * 0.5, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), (a0 + a1) * 0.5, 1e-3);
+
+    // A 360 degree nova is evenly spaced.
+    var nova = ProjectilePool{};
+    const volley = weapon.specFor(37, 8).?;
+    spawnVolley(&nova, 0, volley, .{ 0, 0 }, .{ 1, 0 });
+    try std.testing.expectEqual(@as(usize, 12), nova.count);
+}
+
+test "the Vulcan Minigun's debuff stacks on the enemy" {
+    var enemies = enemy.Pool{};
+    var grid = emptyGrid();
+
+    const target = enemies.spawn(.circle_t1, .{ 1.0, 0.0 }).?;
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
+
+    const spec = weapon.specFor(38, 8).?;
+    try std.testing.expectEqual(@as(f32, 0.05), spec.debuff_per_stack);
+    try std.testing.expectEqual(@as(f32, 0.50), spec.debuff_cap);
+    try std.testing.expectEqual(@as(f32, 1.0), enemies.debuff_mult[target]);
+
+    // Ten hits stack the debuff to its +50% cap.
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        applyOnHit(&enemies, target, spec, 0);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), enemies.debuff_mult[target], 1e-6);
+
+    // The debuff multiplies the damage a later hit applies.
+    const before = enemies.hp[target];
+    _ = enemies.applyHit(target, 10.0, .{ 1.0, 0.0 }, 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), before - enemies.hp[target], 1e-5);
+}
+
+test "Cryo Flechette slows, stacks and freezes" {
+    var enemies = enemy.Pool{};
+    var grid = emptyGrid();
+
+    const target = enemies.spawn(.circle_t1, .{ 1.0, 0.0 }).?;
+    for (0..enemies.count) |k| _ = grid.insert(@intCast(k), enemies.pos[k]);
+
+    const spec = weapon.specFor(39, 8).?;
+    try std.testing.expectEqual(@as(f32, 0.40), spec.slow_mult);
+    try std.testing.expectEqual(@as(u8, 5), spec.freeze_stacks);
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) applyOnHit(&enemies, target, spec, 0);
+    try std.testing.expectEqual(@as(u16, 0), enemies.freeze_ticks[target]);
+    try std.testing.expectEqual(@as(u16, spec.slow_ticks), enemies.slow_ticks[target]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), enemies.slow_factor[target], 1e-6);
+
+    // The fifth stack freezes the target.
+    applyOnHit(&enemies, target, spec, 0);
+    try std.testing.expectEqual(spec.freeze_ticks, enemies.freeze_ticks[target]);
 }

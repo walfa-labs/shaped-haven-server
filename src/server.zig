@@ -81,6 +81,7 @@ pub const Incoming = union(enum) {
     input: wire.Input,
     levelup_choice: wire.LevelupChoice,
     ack_snapshot: u32,
+    restart: void,
 };
 
 /// One encoded frame waiting to go out, reference counted.
@@ -337,13 +338,86 @@ pub const Server = struct {
         // 2. Integrate.
         self.sim.advance();
 
-        // 3. Broadcast a full snapshot at 20 Hz.
+        // 3. Drain the progression events the step produced: level-up offers,
+        //    loadout changes and game over. All under the lock, because the
+        //    outgoing queues are guarded by it.
+        self.sendProgressionEvents();
+
+        // 4. Broadcast a full snapshot at 20 Hz.
         if (self.sim.tick % root.ticks_per_snapshot == 0) {
             self.broadcast();
         }
 
-        // 4. Retire connections whose threads have finished.
+        // 5. Retire connections whose threads have finished.
         self.reap();
+    }
+
+    /// Send the level-up offers, loadout updates and the game-over frame the
+    /// simulation produced since the last step.
+    ///
+    /// The caller must not hold the lock; this takes it.
+    fn sendProgressionEvents(self: *Server) void {
+        self.lock();
+        defer self.unlock();
+
+        for (self.sim.pending_levelups[0..self.sim.pending_count]) |*ev| {
+            if (ev.sent) continue;
+            const conn = self.connForPlayer(ev.player_id) orelse continue;
+            if (levelupOfferFrame(self.gpa, ev)) |frame| {
+                self.enqueueBytes(conn, frame);
+                ev.sent = true;
+            } else |e| {
+                std.debug.print("[server] level-up offer encode failed: {s}\n", .{@errorName(e)});
+            }
+        }
+
+        for (self.sim.players, 0..) |p, i| {
+            if (!self.sim.loadout_dirty[i]) continue;
+            const conn = self.connForPlayer(p.id) orelse continue;
+            if (loadoutFrame(self.gpa, &self.sim, p.id)) |frame| {
+                self.enqueueBytes(conn, frame);
+                self.sim.loadout_dirty[i] = false;
+            } else |e| {
+                std.debug.print("[server] loadout encode failed: {s}\n", .{@errorName(e)});
+            }
+        }
+
+        if (self.sim.game_over_pending) {
+            if (gameOverFrame(self.gpa, &self.sim)) |frame| {
+                if (Frame.create(self.gpa, frame)) |shared| {
+                    for (self.clients.items) |conn| {
+                        if (conn.player_id == unassigned_player) continue;
+                        shared.retain();
+                        self.enqueue(conn, shared);
+                    }
+                    shared.release(self.gpa);
+                } else |e| {
+                    self.gpa.free(frame);
+                    std.debug.print("[server] game over frame alloc failed: {s}\n", .{@errorName(e)});
+                }
+            } else |e| {
+                std.debug.print("[server] game over encode failed: {s}\n", .{@errorName(e)});
+            }
+            self.sim.game_over_pending = false;
+        }
+    }
+
+    /// The connection serving `player_id`, or `null`. Caller holds the lock.
+    fn connForPlayer(self: *Server, player_id: u8) ?*ClientConn {
+        for (self.clients.items) |conn| {
+            if (conn.player_id == player_id) return conn;
+        }
+        return null;
+    }
+
+    /// Wrap `bytes` in a frame and queue it. Caller holds the lock.
+    fn enqueueBytes(self: *Server, conn: *ClientConn, bytes: []u8) void {
+        if (Frame.create(self.gpa, bytes)) |frame| {
+            self.enqueue(conn, frame);
+        } else |_| {
+            self.gpa.free(bytes);
+            markClosed(self, conn);
+        }
     }
 
     /// Encode one snapshot and queue it on every connection that wants it.
@@ -531,11 +605,12 @@ fn dispatch(self: *Server, conn: *ClientConn, message: Incoming) void {
             if (conn.player_id != unassigned_player) self.sim.applyInput(conn.player_id, input);
         },
         .levelup_choice => |choice| {
-            // Consumed by the level-up engine in phase 3.
-            std.debug.print(
-                "[server] note: LEVELUP_CHOICE(event {d}, option {d}) is unused in phase 1\n",
-                .{ choice.event_id, choice.choice_idx },
-            );
+            if (conn.player_id == unassigned_player) return;
+            _ = self.sim.submitChoice(conn.player_id, choice.event_id, choice.choice_idx);
+        },
+        .restart => {
+            if (conn.player_id == unassigned_player) return;
+            self.sim.restart(conn.player_id);
         },
         .ack_snapshot => |server_tick| {
             conn.last_recv_server_tick = server_tick;
@@ -603,6 +678,15 @@ fn handleHello(self: *Server, conn: *ClientConn, hello: wire.Hello) void {
         markClosed(self, conn);
         return;
     });
+
+    // The loadout so the client's HUD is populated from the first frame.
+    if (loadoutFrame(self.gpa, &self.sim, player.id)) |frame| {
+        self.enqueueBytes(conn, frame);
+    } else |e| {
+        std.debug.print("[server] loadout encode failed: {s}\n", .{@errorName(e)});
+        markClosed(self, conn);
+        return;
+    }
 }
 
 fn welcomeFrame(
@@ -622,6 +706,140 @@ fn welcomeFrame(
     try payload.leU32(gpa, server_tick);
 
     return wire.encodeFrame(gpa, wire.msg.s2c_welcome, payload.bytes(), 0);
+}
+
+/// `S2C_LEVELUP_OFFER` for one pending level-up.
+fn levelupOfferFrame(gpa: std.mem.Allocator, ev: *sim.LevelUp) ![]u8 {
+    var options: [3]wire.UpgradeOptionNet = undefined;
+    for (ev.options, 0..) |opt, i| {
+        options[i] = .{
+            .item_id = opt.item_id,
+            .next_level = opt.next_level,
+            .is_evo = @intFromBool(opt.is_evo),
+        };
+    }
+    return wire.encodeLevelupOffer(gpa, ev.player_id, ev.event_id, ev.new_level, &options);
+}
+
+/// `S2C_LOADOUT` for one player. Empty slots are padded with `0xff`.
+fn loadoutFrame(gpa: std.mem.Allocator, s: *sim.Simulation, player_id: u8) ![]u8 {
+    const p = &s.players[player_id];
+
+    var l: wire.Loadout = .{
+        .player_id = p.id,
+        .level = p.level,
+        .xp = p.xp,
+        .xp_next = p.xp_next,
+        .weapon_count = 0,
+        .w0_item_id = 0xff, .w0_level = 0, .w0_evolved = 0,
+        .w1_item_id = 0xff, .w1_level = 0, .w1_evolved = 0,
+        .w2_item_id = 0xff, .w2_level = 0, .w2_evolved = 0,
+        .w3_item_id = 0xff, .w3_level = 0, .w3_evolved = 0,
+        .passive_count = 0,
+        .p0_item_id = 0xff, .p0_level = 0,
+        .p1_item_id = 0xff, .p1_level = 0,
+        .p2_item_id = 0xff, .p2_level = 0,
+        .p3_item_id = 0xff, .p3_level = 0,
+        .p4_item_id = 0xff, .p4_level = 0,
+        .p5_item_id = 0xff, .p5_level = 0,
+        .p6_item_id = 0xff, .p6_level = 0,
+        .p7_item_id = 0xff, .p7_level = 0,
+        .p8_item_id = 0xff, .p8_level = 0,
+        .p9_item_id = 0xff, .p9_level = 0,
+    };
+
+    for (p.weapons, 0..) |slot, i| {
+        if (slot.isFree()) continue;
+        switch (i) {
+            0 => {
+                l.w0_item_id = slot.id;
+                l.w0_level = slot.level;
+                l.w0_evolved = @intFromBool(slot.evolved);
+            },
+            1 => {
+                l.w1_item_id = slot.id;
+                l.w1_level = slot.level;
+                l.w1_evolved = @intFromBool(slot.evolved);
+            },
+            2 => {
+                l.w2_item_id = slot.id;
+                l.w2_level = slot.level;
+                l.w2_evolved = @intFromBool(slot.evolved);
+            },
+            3 => {
+                l.w3_item_id = slot.id;
+                l.w3_level = slot.level;
+                l.w3_evolved = @intFromBool(slot.evolved);
+            },
+            else => {},
+        }
+        l.weapon_count += 1;
+    }
+    for (p.passives, 0..) |lvl, i| {
+        if (lvl == 0) continue;
+        switch (i) {
+            0 => {
+                l.p0_item_id = 16 + @as(u8, @intCast(i));
+                l.p0_level = lvl;
+            },
+            1 => {
+                l.p1_item_id = 16 + @as(u8, @intCast(i));
+                l.p1_level = lvl;
+            },
+            2 => {
+                l.p2_item_id = 16 + @as(u8, @intCast(i));
+                l.p2_level = lvl;
+            },
+            3 => {
+                l.p3_item_id = 16 + @as(u8, @intCast(i));
+                l.p3_level = lvl;
+            },
+            4 => {
+                l.p4_item_id = 16 + @as(u8, @intCast(i));
+                l.p4_level = lvl;
+            },
+            5 => {
+                l.p5_item_id = 16 + @as(u8, @intCast(i));
+                l.p5_level = lvl;
+            },
+            6 => {
+                l.p6_item_id = 16 + @as(u8, @intCast(i));
+                l.p6_level = lvl;
+            },
+            7 => {
+                l.p7_item_id = 16 + @as(u8, @intCast(i));
+                l.p7_level = lvl;
+            },
+            8 => {
+                l.p8_item_id = 16 + @as(u8, @intCast(i));
+                l.p8_level = lvl;
+            },
+            9 => {
+                l.p9_item_id = 16 + @as(u8, @intCast(i));
+                l.p9_level = lvl;
+            },
+            else => {},
+        }
+        l.passive_count += 1;
+    }
+
+    return wire.encodeLoadout(gpa, l);
+}
+
+/// `S2C_GAME_OVER`. The score is the best connected player's, and the kill
+/// count is the run's.
+fn gameOverFrame(gpa: std.mem.Allocator, s: *sim.Simulation) ![]u8 {
+    var best: u32 = 0;
+    for (s.players) |p| {
+        if (!p.active) continue;
+        best = @max(best, s.scoreFor(p.id));
+    }
+    return wire.encodeGameOver(gpa, .{
+        .final_tick = s.final_tick,
+        .seconds_survived = s.final_tick / root.tick_hz,
+        .score = best,
+        .kills = s.kills,
+    });
 }
 
 /// NUL-padded `[16]u8` client name for a `C2S_HELLO`.
@@ -834,6 +1052,7 @@ fn routeClient(self: *Server, conn: *ClientConn, msg_type: u8, payload: []const 
             .ack_snapshot = (wire.decodePayload(wire.AckSnapshot, payload) orelse return)
                 .last_recv_server_tick,
         },
+        wire.msg.c2s_restart => .{ .restart = {} },
         else => {
             std.debug.print(
                 "[server] note: ignoring unknown message type 0x{x}\n",
@@ -1076,12 +1295,15 @@ test "a handshake queues a welcome and an immediate full snapshot" {
 
     try std.testing.expectEqual(@as(u8, 0), conn.player_id);
     try std.testing.expectEqual(@as(u64, 0xdeadbeef), conn.session_token);
-    try std.testing.expectEqual(@as(usize, 2), conn.outgoing.items.len);
+    // Welcome, the immediate full snapshot, and the loadout the HUD needs.
+    try std.testing.expectEqual(@as(usize, 3), conn.outgoing.items.len);
 
     const welcome = wire.decodeFrameHeader(conn.outgoing.items[0].bytes).?;
     try std.testing.expectEqual(wire.msg.s2c_welcome, welcome.msg_type);
     const snapshot = wire.decodeFrameHeader(conn.outgoing.items[1].bytes).?;
     try std.testing.expectEqual(wire.msg.s2c_snapshot_full, snapshot.msg_type);
+    const loadout = wire.decodeFrameHeader(conn.outgoing.items[2].bytes).?;
+    try std.testing.expectEqual(wire.msg.s2c_loadout, loadout.msg_type);
 
     for (conn.outgoing.items) |frame| frame.release(gpa);
 }
@@ -1297,6 +1519,26 @@ const TestClient = struct {
         try std.Io.Writer.flush(&self.writer.interface);
     }
 
+    /// Send a `C2S_LEVELUP_CHOICE` for `event_id`.
+    fn levelupChoice(self: *TestClient, event_id: u16, choice_idx: u8) !void {
+        var payload = wire.Sink.init();
+        defer payload.deinit(self.gpa);
+        try payload.leU16(self.gpa, event_id);
+        try payload.byte(self.gpa, choice_idx);
+        const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_levelup_choice, payload.bytes(), 0);
+        defer self.gpa.free(frame);
+        try self.writer.interface.writeAll(frame);
+        try std.Io.Writer.flush(&self.writer.interface);
+    }
+
+    /// Send a `C2S_RESTART`.
+    fn restart(self: *TestClient) !void {
+        const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_restart, &.{}, 0);
+        defer self.gpa.free(frame);
+        try self.writer.interface.writeAll(frame);
+        try std.Io.Writer.flush(&self.writer.interface);
+    }
+
     /// Read one complete frame. Bounded to the bytes still needed: `readVec`
     /// will happily return more than asked for, and a read that runs past the
     /// frame boundary would consume the next frame's bytes and lose them.
@@ -1381,7 +1623,7 @@ fn readNewFrames(
     tick: u32,
     last_pos_x: *i16,
 ) !void {
-    const want = 2 + tick / root.ticks_per_snapshot;
+    const want = 3 + tick / root.ticks_per_snapshot;
     while (sent.* < want) : (sent.* += 1) {
         const frame = try client.readFrame(buf);
         const header = wire.decodeFrameHeader(frame).?;
@@ -1432,8 +1674,10 @@ test "a loopback connection completes HELLO, INPUT and SNAPSHOT_FULL" {
 
     // The writer thread sends what the steps queued; the snapshot taken after
     // the input carries the moved position.
+    // The handshake queued a welcome, an immediate full snapshot and a
+    // loadout; the tick-3 snapshot is the one that carries the movement.
     var seen_movement = false;
-    for (0..2) |_| {
+    for (0..3) |_| {
         const frame = try client.readFrame(&got);
         if (snapshotShowsMovement(frame)) seen_movement = true;
     }
@@ -1469,13 +1713,16 @@ test "two clients each receive the snapshots, and one leaving does not disturb t
     const second_id = second_welcome[wire.header_size];
     try std.testing.expect(first_id != second_id);
 
-    // Each handshake also queued an immediate full snapshot, which has to come
-    // off the socket for the frame accounting below to stay in step.
+    // Each handshake also queued an immediate full snapshot and a loadout, both
+    // of which have to come off the socket for the frame accounting below to
+    // stay in step.
+    _ = try first.readFrame(&got_a);
     _ = try first.readFrame(&got_a);
     _ = try second.readFrame(&got_b);
+    _ = try second.readFrame(&got_b);
 
-    var sent_a: usize = 2;
-    var sent_b: usize = 2;
+    var sent_a: usize = 3;
+    var sent_b: usize = 3;
     var pos_x_a: i16 = 0;
     var pos_x_b: i16 = 0;
 
@@ -1573,4 +1820,96 @@ test "a client that stops reading cannot stall the tick" {
     // every third tick. Two seconds is a generous ceiling that a blocked socket
     // write would blow straight through.
     try std.testing.expect(elapsed_ms < 2000);
+}
+
+test "a level-up offer goes out, the choice is applied, and the loadout follows" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [2048]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    // The handshake also queued an immediate full snapshot and a loadout.
+    _ = try client.readFrame(&got);
+    _ = try client.readFrame(&got);
+
+    // Fill the XP bar; the next step offers the level-up and pauses.
+    loop.server.sim.players[0].xp = loop.server.sim.players[0].xp_next;
+    loop.server.step();
+    try std.testing.expectEqual(sim.GameState.level_up_pause, loop.server.sim.state);
+
+    const offer = try client.expectFrame(&got, wire.msg.s2c_levelup_offer, 8);
+    const ev = wire.decodePayload(wire.LevelupOffer, offer[wire.header_size..]).?;
+    try std.testing.expectEqual(@as(u16, 2), ev.new_level);
+    // Three distinct options.
+    try std.testing.expect(ev.opt0_item_id != ev.opt1_item_id);
+    try std.testing.expect(ev.opt1_item_id != ev.opt2_item_id);
+    try std.testing.expect(ev.opt0_item_id != ev.opt2_item_id);
+
+    // Answer it, and the run resumes with the loadout the HUD needs.
+    try client.levelupChoice(ev.event_id, 0);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    try std.testing.expectEqual(sim.GameState.running, loop.server.sim.state);
+
+    const loadout = try client.expectFrame(&got, wire.msg.s2c_loadout, 8);
+    const l = wire.decodePayload(wire.Loadout, loadout[wire.header_size..]).?;
+    try std.testing.expectEqual(@as(u16, 2), l.level);
+    try std.testing.expect(l.weapon_count > 0);
+}
+
+test "game over goes out, and a restart returns to a running game" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x5678);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [2048]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got);
+    _ = try client.readFrame(&got);
+
+    // One swarmer on top of a 1 HP player ends the run.
+    loop.server.sim.players[0].hp = 1.0;
+    _ = loop.server.sim.enemies.spawn(.circle_t1, .{ 0.6, 0.0 }).?;
+    var ticks: usize = 0;
+    while (loop.server.sim.state != .game_over and ticks < 600) : (ticks += 1) {
+        loop.server.step();
+    }
+    try std.testing.expectEqual(sim.GameState.game_over, loop.server.sim.state);
+    try std.testing.expect(!loop.server.sim.players[0].flags.alive);
+
+    const over = try client.expectFrame(&got, wire.msg.s2c_game_over, 8);
+    const go = wire.decodePayload(wire.GameOver, over[wire.header_size..]).?;
+    try std.testing.expect(go.final_tick > 0);
+    try std.testing.expect(go.score > 0);
+
+    // Restart: the run is fresh and the snapshot says so.
+    try client.restart();
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    try std.testing.expectEqual(sim.GameState.running, loop.server.sim.state);
+    try std.testing.expect(loop.server.sim.players[0].flags.alive);
+    try std.testing.expectEqual(@as(u16, 1), loop.server.sim.players[0].level);
+    try std.testing.expectEqual(@as(usize, 0), loop.server.sim.enemies.count);
+
+    const view = loop.server.sim.snapshotView();
+    try std.testing.expectEqual(@as(u8, @intFromEnum(sim.GameState.running)), view.game_state);
 }
