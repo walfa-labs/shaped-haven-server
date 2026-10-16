@@ -627,15 +627,22 @@ fn acceptThread(self: *Server) void {
             return;
         }
 
+        // `registerClient` owns the socket from its first line and closes it on
+        // every failure path, so closing it here as well would close the same
+        // handle twice — and on Windows a handle can be reused in between.
         registerClient(self, stream) catch |err| {
             std.debug.print("[server] dropping connection: {s}\n", .{@errorName(err)});
-            net.Stream.close(&stream, self.io);
         };
     }
 }
 
 fn registerClient(self: *Server, stream: net.Stream) !void {
-    const conn = try self.gpa.create(ClientConn);
+    // The socket belongs to this function from its first line, and is closed on
+    // every failure path exactly once.
+    const conn = self.gpa.create(ClientConn) catch |err| {
+        net.Stream.close(&stream, self.io);
+        return err;
+    };
     conn.* = .{ .stream = stream };
 
     // From here on every failure has to unwind through this: the connection
