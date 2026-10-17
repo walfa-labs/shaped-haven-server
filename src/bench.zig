@@ -87,7 +87,7 @@ pub fn run(
     defer gpa.destroy(s);
     s.* = sim.Simulation.init();
 
-    const player = s.spawnPlayer(0).?;
+    const player = s.spawnPlayer(0, 0, 0).?;
     player.pos = .{ 0.0, 0.0 };
     // The load is what is being measured, not the level curve or the death
     // rule: the player's weapons kill stressed enemies, so gems drop and the
@@ -206,7 +206,7 @@ test "the load actually reaches the counts the report claims" {
     defer threaded.deinit();
 
     var s = sim.Simulation.init();
-    const player = s.spawnPlayer(0).?;
+    const player = s.spawnPlayer(0, 0, 0).?;
     player.pos = .{ 0.0, 0.0 };
     topUp(&s, 1000, 500);
 

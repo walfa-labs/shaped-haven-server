@@ -44,6 +44,7 @@ const wire = @import("wire.zig");
 const sim = @import("sim.zig");
 const delta = @import("delta.zig");
 const net_opt = @import("net_opt.zig");
+const races = @import("races.zig");
 
 const net = std.Io.net;
 
@@ -55,7 +56,7 @@ const read_chunk_size: usize = 4096;
 const conn_read_size: usize = 16 * 1024;
 const conn_write_size: usize = 64 * 1024;
 
-/// Largest payload accepted from a client. Every protocol v1 client message is
+/// Largest payload accepted from a client. Every protocol v2 client message is
 /// far below this; the cap exists so a hostile peer cannot grow the parse
 /// buffer without bound.
 const max_frame_size: usize = 1024;
@@ -147,6 +148,9 @@ pub const ClientConn = struct {
     /// Offset of the first unparsed byte inside `read_accum`.
     accum_offset: usize = 0,
     name: [16]u8 = std.mem.zeroes([16]u8),
+    /// Protocol v2's HELLO carries no session token, so this stays zero for the
+    /// life of the connection; it is still written into `S2C_WELCOME`, whose
+    /// layout is unchanged from v1.
     session_token: u64 = 0,
     /// Newest `server_tick` this client has acknowledged, and the tick it is
     /// expected to hold a complete state for.
@@ -889,14 +893,35 @@ fn handleHello(self: *Server, conn: *ClientConn, hello: wire.Hello) void {
         markClosed(self, conn);
         return;
     }
+    if (races.spec(hello.race_id) == null) {
+        std.debug.print(
+            "[server] disconnect: unknown race_id {d}\n",
+            .{hello.race_id},
+        );
+        markClosed(self, conn);
+        return;
+    }
+    if (hello.starting_weapon_id >= root.max_weapons) {
+        std.debug.print(
+            "[server] disconnect: unknown starting_weapon_id {d}\n",
+            .{hello.starting_weapon_id},
+        );
+        markClosed(self, conn);
+        return;
+    }
 
-    const player = self.sim.spawnPlayer(hello.requested_slot) orelse {
+    const player = self.sim.spawnPlayer(
+        0, // v2 HELLO carries no slot request: the first free slot is taken
+        hello.race_id,
+        hello.starting_weapon_id,
+    ) orelse {
         std.debug.print("[server] disconnect: no free player slot\n", .{});
         markClosed(self, conn);
         return;
     };
 
-    conn.session_token = hello.session_token;
+    // protocol v2's HELLO carries no session token: the connection itself is
+    // the credential, so the server's per-connection token stays zero.
     conn.player_id = player.id;
     @memcpy(&conn.name, &hello.name);
     std.debug.print("[server] player {d} joined as '{s}'\n", .{ player.id, conn.name });
@@ -987,6 +1012,9 @@ fn levelupOfferFrame(gpa: std.mem.Allocator, ev: *sim.LevelUp) ![]u8 {
             .item_id = opt.item_id,
             .next_level = opt.next_level,
             .is_evo = @intFromBool(opt.is_evo),
+            .stat_type = opt.stat_type,
+            .current_stat_fp = opt.current_stat_fp,
+            .upgraded_stat_fp = opt.upgraded_stat_fp,
         };
     }
     return wire.encodeLevelupOffer(gpa, ev.player_id, ev.event_id, ev.new_level, &options);
@@ -1401,10 +1429,9 @@ test "frame parser splits concatenated client messages" {
     defer payload.deinit(gpa);
     try payload.leU32(gpa, 1); // input_seq
     try payload.leU32(gpa, 2); // client_tick
-    try payload.byte(gpa, @as(u8, @bitCast(@as(i8, 100)))); // move_x
-    try payload.byte(gpa, 0); // move_y
-    try payload.leU16(gpa, 0); // aim_angle
-    try payload.byte(gpa, 0); // buttons
+    try payload.byte(gpa, 0x10); // buttons: dash
+    try payload.byte(gpa, @as(u8, @bitCast(@as(i8, 100)))); // axis_x
+    try payload.byte(gpa, 0); // axis_y
 
     var wire_bytes = std.ArrayList(u8).empty;
     defer wire_bytes.deinit(gpa);
@@ -1420,10 +1447,9 @@ test "frame parser splits concatenated client messages" {
     const first = conn.incoming.items[0].input;
     try std.testing.expectEqual(@as(u32, 1), first.input_seq);
     try std.testing.expectEqual(@as(u32, 2), first.client_tick);
-    try std.testing.expectEqual(@as(i8, 100), first.move_x);
-    try std.testing.expectEqual(@as(i8, 0), first.move_y);
-    try std.testing.expectEqual(@as(u16, 0), first.aim_angle);
-    try std.testing.expectEqual(@as(u8, 0), first.buttons);
+    try std.testing.expectEqual(@as(u8, 0x10), first.buttons);
+    try std.testing.expectEqual(@as(i8, 100), first.axis_x);
+    try std.testing.expectEqual(@as(i8, 0), first.axis_y);
 }
 
 test "frame parser waits for a partial frame" {
@@ -1436,10 +1462,9 @@ test "frame parser waits for a partial frame" {
     defer payload.deinit(gpa);
     try payload.leU32(gpa, 7); // input_seq
     try payload.leU32(gpa, 0); // client_tick
-    try payload.byte(gpa, @as(u8, @bitCast(@as(i8, 100)))); // move_x
-    try payload.byte(gpa, 0); // move_y
-    try payload.leU16(gpa, 0); // aim_angle
     try payload.byte(gpa, 0); // buttons
+    try payload.byte(gpa, @as(u8, @bitCast(@as(i8, 100)))); // axis_x
+    try payload.byte(gpa, 0); // axis_y
 
     var wire_bytes = std.ArrayList(u8).empty;
     defer wire_bytes.deinit(gpa);
@@ -1483,12 +1508,11 @@ test "a frame whose payload is not exactly the message size is rejected" {
 
     var payload = wire.Sink.init();
     defer payload.deinit(gpa);
-    try payload.leU32(gpa, 1);
-    try payload.leU32(gpa, 1);
-    try payload.byte(gpa, 100);
-    try payload.byte(gpa, 0);
-    try payload.leU16(gpa, 0);
-    try payload.byte(gpa, 0);
+    try payload.leU32(gpa, 1); // input_seq
+    try payload.leU32(gpa, 1); // client_tick
+    try payload.byte(gpa, 0); // buttons
+    try payload.byte(gpa, 100); // axis_x
+    try payload.byte(gpa, 0); // axis_y
     try payload.byte(gpa, 0); // one byte too many for C2S_INPUT
 
     var wire_bytes = std.ArrayList(u8).empty;
@@ -1517,15 +1541,17 @@ test "the input drain applies every queued message in order" {
     const name = nameField("tester");
     try conn.incoming.append(gpa, .{ .hello = .{
         .proto_ver = root.protocol_version,
-        .requested_slot = 0,
-        .session_token = 0x1234,
+        .race_id = 0,
+        .starting_weapon_id = 0,
+        .reserved = 0,
         .name = name,
     } });
     for ([_]u32{ 1, 2, 3 }) |seq| {
         try conn.incoming.append(gpa, .{ .input = .{
             .input_seq = seq,
             .client_tick = seq,
-            .move_x = 100,
+            .buttons = 0,
+            .axis_x = 100,
         } });
     }
 
@@ -1561,9 +1587,10 @@ test "a handshake queues a welcome and an immediate full snapshot" {
 
     var payload = wire.Sink.init();
     defer payload.deinit(gpa);
-    try payload.byte(gpa, 1); // proto_ver
-    try payload.byte(gpa, 0); // requested_slot
-    try payload.leU64(gpa, 0xdeadbeef); // session_token
+    try payload.byte(gpa, 2); // proto_ver
+    try payload.byte(gpa, 0); // race_id
+    try payload.byte(gpa, 0); // starting_weapon_id
+    try payload.byte(gpa, 0); // reserved
     try payload.fixedBytes(gpa, &nameField("tester"));
 
     routeClient(&server, conn, wire.msg.c2s_hello, payload.bytes());
@@ -1575,7 +1602,7 @@ test "a handshake queues a welcome and an immediate full snapshot" {
     dispatch(&server, conn, conn.incoming.orderedRemove(0));
 
     try std.testing.expectEqual(@as(u8, 0), conn.player_id);
-    try std.testing.expectEqual(@as(u64, 0xdeadbeef), conn.session_token);
+    try std.testing.expectEqual(@as(u64, 0), conn.session_token);
     // Welcome, the immediate full snapshot, and the loadout the HUD needs.
     try std.testing.expectEqual(@as(usize, 3), conn.outgoing.items.len);
 
@@ -1603,9 +1630,10 @@ test "a HELLO with the wrong protocol version is refused" {
 
     var payload = wire.Sink.init();
     defer payload.deinit(gpa);
-    try payload.byte(gpa, 2);
-    try payload.byte(gpa, 0);
-    try payload.leU64(gpa, 1);
+    try payload.byte(gpa, 1); // proto_ver 1, refused: the server speaks v2
+    try payload.byte(gpa, 0); // race_id
+    try payload.byte(gpa, 0); // starting_weapon_id
+    try payload.byte(gpa, 0); // reserved
     try payload.fixedBytes(gpa, &nameField(""));
 
     routeClient(&server, conn, wire.msg.c2s_hello, payload.bytes());
@@ -1613,6 +1641,54 @@ test "a HELLO with the wrong protocol version is refused" {
 
     try std.testing.expect(conn.closed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), conn.outgoing.items.len);
+}
+
+test "a HELLO with an unknown race or starting weapon is refused" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var server = Server.init(std.Io.failing, gpa, &arena);
+
+    // race_id 10 does not name a race.
+    const race_conn = try gpa.create(ClientConn);
+    race_conn.* = .{};
+    defer gpa.destroy(race_conn);
+    defer race_conn.outgoing.deinit(gpa);
+    defer race_conn.incoming.deinit(gpa);
+
+    var payload = wire.Sink.init();
+    defer payload.deinit(gpa);
+    try payload.byte(gpa, root.protocol_version);
+    try payload.byte(gpa, 10); // race_id
+    try payload.byte(gpa, 0); // starting_weapon_id
+    try payload.byte(gpa, 0);
+    try payload.fixedBytes(gpa, &nameField(""));
+
+    routeClient(&server, race_conn, wire.msg.c2s_hello, payload.bytes());
+    dispatch(&server, race_conn, race_conn.incoming.orderedRemove(0));
+    try std.testing.expect(race_conn.closed.load(.acquire));
+
+    // starting_weapon_id 4 does not name a weapon.
+    const weapon_conn = try gpa.create(ClientConn);
+    weapon_conn.* = .{};
+    defer gpa.destroy(weapon_conn);
+    defer weapon_conn.outgoing.deinit(gpa);
+    defer weapon_conn.incoming.deinit(gpa);
+
+    var payload2 = wire.Sink.init();
+    defer payload2.deinit(gpa);
+    try payload2.byte(gpa, root.protocol_version);
+    try payload2.byte(gpa, 0); // race_id
+    try payload2.byte(gpa, 4); // starting_weapon_id
+    try payload2.byte(gpa, 0);
+    try payload2.fixedBytes(gpa, &nameField(""));
+
+    routeClient(&server, weapon_conn, wire.msg.c2s_hello, payload2.bytes());
+    dispatch(&server, weapon_conn, weapon_conn.incoming.orderedRemove(0));
+    try std.testing.expect(weapon_conn.closed.load(.acquire));
+
+    // Nobody joined.
+    try std.testing.expectEqual(@as(u8, 0), server.sim.activePlayerCount());
 }
 
 test "a broadcast gives each connection its own snapshot frame" {
@@ -1636,7 +1712,7 @@ test "a broadcast gives each connection its own snapshot frame" {
     try server.clients.append(arena.allocator(), conns[0]);
     try server.clients.append(arena.allocator(), conns[1]);
 
-    _ = server.sim.spawnPlayer(0);
+    _ = server.sim.spawnPlayer(0, 0, 0);
     server.broadcast();
 
     // Each connection gets its own frame now: a delta is diffed against that
@@ -1688,7 +1764,7 @@ test "an outgoing queue that overflows drops the connection instead of growing" 
     defer gpa.destroy(conn);
     defer conn.deinit(gpa);
     try server.clients.append(arena.allocator(), conn);
-    _ = server.sim.spawnPlayer(0);
+    _ = server.sim.spawnPlayer(0, 0, 0);
 
     server.broadcast();
     // Each broadcast adds one frame; the bound is what stops a peer that never
@@ -1770,12 +1846,15 @@ const TestClient = struct {
     }
 
     /// Send a `C2S_HELLO` for `name`.
-    fn hello(self: *TestClient, name: []const u8, token: u64) !void {
+    /// Send a protocol v2 `C2S_HELLO` for `name` (race 0, sword).
+    fn hello(self: *TestClient, name: []const u8) !void {
         var payload = wire.Sink.init();
         defer payload.deinit(self.gpa);
+        // protocol v2: proto_ver, race_id, starting_weapon_id, reserved, name.
         try payload.byte(self.gpa, root.protocol_version);
-        try payload.byte(self.gpa, 0);
-        try payload.leU64(self.gpa, token);
+        try payload.byte(self.gpa, 0); // race_id
+        try payload.byte(self.gpa, 0); // starting_weapon_id
+        try payload.byte(self.gpa, 0); // reserved
         try payload.fixedBytes(self.gpa, &nameField(name));
         const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_hello, payload.bytes(), 0);
         defer self.gpa.free(frame);
@@ -1787,12 +1866,12 @@ const TestClient = struct {
     fn input(self: *TestClient, seq: u32, move_x: i8) !void {
         var payload = wire.Sink.init();
         defer payload.deinit(self.gpa);
+        // protocol v2: input_seq, client_tick, buttons, axis_x, axis_y.
         try payload.leU32(self.gpa, seq);
         try payload.leU32(self.gpa, seq);
+        try payload.byte(self.gpa, 0); // buttons
         try payload.byte(self.gpa, @as(u8, @bitCast(move_x)));
-        try payload.byte(self.gpa, 0);
-        try payload.leU16(self.gpa, 0);
-        try payload.byte(self.gpa, 0);
+        try payload.byte(self.gpa, 0); // axis_y
         const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_input, payload.bytes(), seq);
         defer self.gpa.free(frame);
         try self.writer.interface.writeAll(frame);
@@ -1920,7 +1999,8 @@ fn snapshotShowsMovement(frame: []const u8) bool {
     const payload = frame[wire.header_size..];
     if (payload.len < wire.snapshot_header_wire_size + wire.wireSize(wire.PlayerNet)) return false;
     const record = payload[wire.snapshot_header_wire_size..];
-    return std.mem.bytesToValue(i16, record[2..4]) > 0;
+    // PlayerNet.pos_x sits at record offset 3 in protocol v2.
+    return std.mem.bytesToValue(i16, record[3..5]) > 0;
 }
 
 /// Read every frame the server has queued for `client` but that the test has
@@ -1945,7 +2025,8 @@ fn readNewFrames(
         const payload = frame[wire.header_size..];
         if (payload.len < wire.snapshot_header_wire_size + wire.wireSize(wire.PlayerNet)) continue;
         const record = payload[wire.snapshot_header_wire_size..];
-        last_pos_x.* = std.mem.bytesToValue(i16, record[2..4]);
+        // PlayerNet.pos_x sits at record offset 3 in protocol v2.
+        last_pos_x.* = std.mem.bytesToValue(i16, record[3..5]);
     }
 }
 
@@ -1958,7 +2039,7 @@ test "a loopback connection completes HELLO, INPUT and SNAPSHOT_FULL" {
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x1234);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
 
@@ -1979,7 +2060,7 @@ test "a loopback connection completes HELLO, INPUT and SNAPSHOT_FULL" {
     try std.testing.expectEqual(@as(u8, 0), loop.server.sim.players[0].id);
     try std.testing.expectEqual(@as(u32, 1), loop.server.sim.players[0].last_input_seq);
     try std.testing.expectEqual(
-        @as(u8, @bitCast(loop.server.sim.players[0].input.move_x)),
+        @as(u8, @bitCast(loop.server.sim.players[0].input.axis_x)),
         100,
     );
     try std.testing.expect(loop.server.sim.players[0].pos[0] > 0);
@@ -2010,8 +2091,8 @@ test "two clients each receive the snapshots, and one leaving does not disturb t
     try second.init(loop, gpa);
     defer second.close();
 
-    try first.hello("first", 0xaaaa);
-    try second.hello("second", 0xbbbb);
+    try first.hello("first");
+    try second.hello("second");
     try waitForClients(&loop.server, 2);
     try waitForIncoming(&loop.server, 2);
     loop.server.step();
@@ -2093,7 +2174,7 @@ test "a client that stops reading cannot stall the tick" {
     // reader thread's `recv` return and lets shutdown join it.
     defer client.close();
 
-    try client.hello("silent", 0xcccc);
+    try client.hello("silent");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();
@@ -2145,7 +2226,7 @@ test "a level-up offer goes out, the choice is applied, and the loadout follows"
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x1234);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();
@@ -2190,7 +2271,7 @@ test "game over goes out, and a restart returns to a running game" {
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x5678);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();
@@ -2237,7 +2318,7 @@ test "a client that acknowledges a baseline gets a delta against it" {
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x1234);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();
@@ -2287,7 +2368,7 @@ test "a delta baseline the ring no longer holds falls back to a full snapshot" {
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x1234);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();
@@ -2374,7 +2455,7 @@ test "a corrected model rebuilds the held state from the ring" {
     var server = Server.init(std.Io.failing, gpa, &arena);
 
     // A player with a neighbourhood: one enemy in interest, one far outside it.
-    const p = server.sim.spawnPlayer(0).?;
+    const p = server.sim.spawnPlayer(0, 0, 0).?;
     p.pos = .{ 0.0, 0.0 };
     _ = server.sim.enemies.spawn(.circle_t1, .{ 5.0, 0.0 }).?;
     _ = server.sim.enemies.spawn(.circle_t1, .{ 500.0, 0.0 }).?;
@@ -2413,7 +2494,7 @@ test "a delta is diffed against the held state, not the last acknowledgement" {
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x1234);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();
@@ -2461,7 +2542,7 @@ test "the first corrective acknowledgement pulls the model back" {
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x1234);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();
@@ -2535,7 +2616,7 @@ test "a corrective acknowledgement the ring has lost still recovers" {
     defer arena.deinit();
     var server = Server.init(std.Io.failing, gpa, &arena);
 
-    const p = server.sim.spawnPlayer(0).?;
+    const p = server.sim.spawnPlayer(0, 0, 0).?;
     p.pos = .{ 0.0, 0.0 };
     _ = server.sim.enemies.spawn(.circle_t1, .{ 5.0, 0.0 }).?;
 
@@ -2611,7 +2692,7 @@ test "a restart takes the held state back to nothing" {
     try client.init(loop, gpa);
     defer client.close();
 
-    try client.hello("tester", 0x1234);
+    try client.hello("tester");
     try waitForClients(&loop.server, 1);
     try waitForIncoming(&loop.server, 1);
     loop.server.step();

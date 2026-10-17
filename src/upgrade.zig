@@ -392,12 +392,75 @@ fn scaleTicks(ticks: u16, mult: f32) u16 {
 // Level-up choices
 // ---------------------------------------------------------------------------
 
-/// One entry of a level-up offer (PROTOCOL.md `UpgradeOptionNet`).
+/// One entry of a level-up offer (protocol v2 `UpgradeOptionNet`).
+///
+/// The three identity fields name the item; the stat fields say what the
+/// purchase changes, as fixed-point values scaled by 100 so `500` reads as
+/// `5.0`. A `null` stat (zeros) means the option's effect is one the wire's
+/// `stat_type` list has no slot for — see `passiveStatType`.
 pub const UpgradeOption = struct {
     item_id: u8,
     next_level: u8,
     is_evo: bool,
+    stat_type: u8 = 0,
+    current_stat_fp: i16 = 0,
+    upgraded_stat_fp: i16 = 0,
 };
+
+/// The `UpgradeOptionNet.stat_type` a passive's primary effect maps to, or
+/// `null` when the effect is one the wire's stat list has no slot for
+/// (projectile speed, duration, pickup radius, regen).
+pub fn passiveStatType(index: usize) ?u8 {
+    return switch (index) {
+        0 => wire.StatType.damage, // Spinach Core
+        1 => wire.StatType.area, // Amplifier Lens
+        2 => wire.StatType.cooldown, // Clockwork Gear
+        5 => wire.StatType.projectiles, // Prism Splitter
+        7 => wire.StatType.move_speed, // Thruster Boots
+        8 => wire.StatType.armor, // Titanium Plating
+        else => null,
+    };
+}
+
+/// The passive's effect at `level` levels, in the wire's fixed-point ×100, or
+/// `null` for a passive with no mapped stat. A cooldown reduction is negative.
+fn passiveStatFp(index: usize, level: i32) ?i16 {
+    return switch (index) {
+        0 => @intCast(10 * level), // +10% damage per level
+        1 => @intCast(12 * level), // +12% area
+        2 => @intCast(-8 * level), // -8% cooldown
+        5 => @intCast(100 * level), // +1 projectile per level
+        7 => @intCast(8 * level), // +8% move speed
+        8 => @intCast(300 * level), // 3 flat armor per level
+        else => null,
+    };
+}
+
+/// Fixed-point ×100 of `value`, clamped to the i16 the wire carries.
+fn statFp(value: f32) i16 {
+    return @intFromFloat(std.math.clamp(value * 100.0, -32768.0, 32767.0));
+}
+
+/// The stat delta a weapon level carries: the wire's `stat_type` plus the
+/// level table's damage at the level the player holds now versus the level the
+/// option buys.
+const WeaponStatDelta = struct {
+    stat_type: u8,
+    current_stat_fp: i16,
+    upgraded_stat_fp: i16,
+};
+
+fn weaponStatDelta(item_id: u8, from_level: u8, to_level: u8) WeaponStatDelta {
+    const current = weapon.specFor(item_id, from_level) orelse
+        return .{ .stat_type = wire.StatType.damage, .current_stat_fp = 0, .upgraded_stat_fp = 0 };
+    const upgraded = weapon.specFor(item_id, to_level) orelse
+        return .{ .stat_type = wire.StatType.damage, .current_stat_fp = 0, .upgraded_stat_fp = 0 };
+    return .{
+        .stat_type = wire.StatType.damage,
+        .current_stat_fp = statFp(current.damage),
+        .upgraded_stat_fp = statFp(upgraded.damage),
+    };
+}
 
 /// A candidate and its weight in the draw.
 const Candidate = struct {
@@ -441,21 +504,22 @@ pub fn allMaxed(weapons: []const WeaponSlot, passives: []const u8) bool {
 /// which is what makes progression unlimited; if a loadout somehow offers
 /// fewer than three candidates the remainder is padded with Overclock so the
 /// offer is always a full three options.
+///
+/// Every candidate carries the stat delta the wire reports (`UpgradeOptionNet`'s
+/// fixed-point pair), computed from the loadout the option would leave behind.
 pub fn generateOptions(
     weapons: []const WeaponSlot,
     passives: []const u8,
     overclock: []const u32,
     r: *rng.Rng,
 ) [3]UpgradeOption {
-    _ = overclock;
     var cands: [max_candidates]Candidate = undefined;
     var n: usize = 0;
 
     if (allMaxed(weapons, passives)) {
         for (0..3) |i| {
-            const id: u8 = ids.overclock_damage + @as(u8, @intCast(i));
             cands[n] = .{
-                .option = .{ .item_id = id, .next_level = 1, .is_evo = false },
+                .option = overclockOption(ids.overclock_damage + @as(u8, @intCast(i)), overclock),
                 .weight = weight_overclock,
             };
             n += 1;
@@ -468,14 +532,23 @@ pub fn generateOptions(
     for (weapons) |slot| {
         if (slot.isFree() or isEvolutionId(slot.id)) continue;
         if (slot.level >= root.max_weapon_level) continue;
+        const d = weaponStatDelta(slot.id, slot.level, slot.level + 1);
         cands[n] = .{
-            .option = .{ .item_id = slot.id, .next_level = slot.level + 1, .is_evo = false },
+            .option = .{
+                .item_id = slot.id,
+                .next_level = slot.level + 1,
+                .is_evo = false,
+                .stat_type = d.stat_type,
+                .current_stat_fp = d.current_stat_fp,
+                .upgraded_stat_fp = d.upgraded_stat_fp,
+            },
             .weight = weight_level,
         };
         n += 1;
     }
 
-    // A new weapon into a free slot.
+    // A new weapon into a free slot. The player does not hold it, so the
+    // current value is zero and the delta is the level-1 spec outright.
     var free_slots: usize = 0;
     for (weapons) |slot| {
         if (slot.isFree()) free_slots += 1;
@@ -484,8 +557,16 @@ pub fn generateOptions(
         for (0..root.max_weapons) |w| {
             const id: u8 = @intCast(w);
             if (holdsWeapon(weapons, id)) continue;
+            const upgraded = weapon.specFor(id, 1) orelse continue;
             cands[n] = .{
-                .option = .{ .item_id = id, .next_level = 1, .is_evo = false },
+                .option = .{
+                    .item_id = id,
+                    .next_level = 1,
+                    .is_evo = false,
+                    .stat_type = wire.StatType.damage,
+                    .current_stat_fp = 0,
+                    .upgraded_stat_fp = statFp(upgraded.damage),
+                },
                 .weight = weight_new,
             };
             n += 1;
@@ -496,31 +577,43 @@ pub fn generateOptions(
     for (passives, 0..) |lvl, i| {
         if (lvl == 0) continue;
         if (lvl >= passiveMaxLevel(@intCast(i))) continue;
+        const id = passivesId(@intCast(i));
         cands[n] = .{
-            .option = .{ .item_id = passivesId(@intCast(i)), .next_level = lvl + 1, .is_evo = false },
+            .option = passiveOption(id, lvl + 1, lvl, lvl + 1),
             .weight = weight_level,
         };
         n += 1;
     }
 
-    // A new passive.
+    // A new passive: from zero to its first level.
     for (passives, 0..) |lvl, i| {
         if (lvl != 0) continue;
+        const id = passivesId(@intCast(i));
         cands[n] = .{
-            .option = .{ .item_id = passivesId(@intCast(i)), .next_level = 1, .is_evo = false },
+            .option = passiveOption(id, 1, 0, 1),
             .weight = weight_new,
         };
         n += 1;
     }
 
-    // Evolutions: weapon at level 8 and its named passive at max.
+    // Evolutions: weapon at level 8 and its named passive at max. The delta is
+    // the held weapon's damage against the fused spec's.
     for (evolutions) |evo| {
         if (!holdsWeaponAtLevel(weapons, evo.weapon_id, root.max_weapon_level)) continue;
         const max = passiveMaxLevelById(evo.passive_id) orelse continue;
         if (!holdsPassiveAtLevel(passives, evo.passive_id, max)) continue;
         if (holdsEvolution(weapons, evo.id)) continue;
+        const current = weapon.specFor(evo.weapon_id, root.max_weapon_level) orelse continue;
+        const upgraded = weapon.specFor(evo.id, root.max_weapon_level) orelse continue;
         cands[n] = .{
-            .option = .{ .item_id = evo.id, .next_level = root.max_weapon_level, .is_evo = true },
+            .option = .{
+                .item_id = evo.id,
+                .next_level = root.max_weapon_level,
+                .is_evo = true,
+                .stat_type = wire.StatType.damage,
+                .current_stat_fp = statFp(current.damage),
+                .upgraded_stat_fp = statFp(upgraded.damage),
+            },
             .weight = weight_evolution,
         };
         n += 1;
@@ -530,7 +623,7 @@ pub fn generateOptions(
     while (n < 3) {
         const id: u8 = ids.overclock_damage + @as(u8, @intCast(n % 3));
         cands[n] = .{
-            .option = .{ .item_id = id, .next_level = 1, .is_evo = false },
+            .option = overclockOption(id, overclock),
             .weight = weight_overclock,
         };
         n += 1;
@@ -541,6 +634,72 @@ pub fn generateOptions(
 
 fn passivesId(index: usize) u8 {
     return passive_table[index].id;
+}
+
+/// A passive's option: the stat fields come from the passive's own mapping, or
+/// zeros when the passive's effect has no wire stat slot.
+fn passiveOption(id: u8, next_level: u8, from_level: i32, to_level: i32) UpgradeOption {
+    const index = passiveIndex(id) orelse return .{
+        .item_id = id,
+        .next_level = next_level,
+        .is_evo = false,
+    };
+    const stat_type = passiveStatType(index) orelse return .{
+        .item_id = id,
+        .next_level = next_level,
+        .is_evo = false,
+    };
+    const current = passiveStatFp(index, from_level) orelse 0;
+    const upgraded = passiveStatFp(index, to_level) orelse 0;
+    return .{
+        .item_id = id,
+        .next_level = next_level,
+        .is_evo = false,
+        .stat_type = stat_type,
+        .current_stat_fp = current,
+        .upgraded_stat_fp = upgraded,
+    };
+}
+
+/// One Overclock option. The three counters are the loadout's own, so the
+/// delta is this purchase's marginal effect; the attack-speed counter reports
+/// the cooldown multiplier, which floors and so eventually stops moving.
+fn overclockOption(id: u8, overclock: []const u32) UpgradeOption {
+    const i: usize = id - ids.overclock_damage;
+    const count: u32 = if (i < overclock.len) overclock[i] else 0;
+    return switch (i) {
+        0 => .{
+            .item_id = id,
+            .next_level = 1,
+            .is_evo = false,
+            .stat_type = wire.StatType.damage,
+            .current_stat_fp = statFp(1.0 + 0.02 * @as(f32, @floatFromInt(count))),
+            .upgraded_stat_fp = statFp(1.0 + 0.02 * @as(f32, @floatFromInt(count + 1))),
+        },
+        1 => .{
+            .item_id = id,
+            .next_level = 1,
+            .is_evo = false,
+            .stat_type = wire.StatType.cooldown,
+            .current_stat_fp = statFp(cooldownMultAfter(count)),
+            .upgraded_stat_fp = statFp(cooldownMultAfter(count + 1)),
+        },
+        else => .{
+            .item_id = id,
+            .next_level = 1,
+            .is_evo = false,
+            .stat_type = wire.StatType.max_hp,
+            .current_stat_fp = statFp(25.0 * @as(f32, @floatFromInt(count))),
+            .upgraded_stat_fp = statFp(25.0 * @as(f32, @floatFromInt(count + 1))),
+        },
+    };
+}
+
+/// The attack-speed counter's cooldown multiplier after `count` purchases,
+/// floored exactly as `resolveStats` floors it.
+fn cooldownMultAfter(count: u32) f32 {
+    const factor = 1.0 - 0.015 * @as(f32, @floatFromInt(count));
+    return @max(factor, overclock_cooldown_floor);
 }
 
 /// Draw three distinct candidates, weighted, without replacement.
@@ -911,4 +1070,63 @@ test "the weighted draw never repeats an option" {
         try std.testing.expect(opts[0].item_id != opts[2].item_id);
         try std.testing.expect(opts[1].item_id != opts[2].item_id);
     }
+}
+
+test "every offer option carries the stat delta of what it buys" {
+    var r = rng.Rng.init(4242);
+    var weapons: [root.max_weapons]WeaponSlot = root.filledWithDefault(WeaponSlot, root.max_weapons);
+    var passives: [root.max_passives]u8 = @splat(0);
+    var overclock = [_]u32{ 0, 0, 0 };
+
+    // A fresh player: sword at level 1, no passives, no Overclock.
+    for (&weapons, 0..) |*slot, i| slot.id = @intCast(i);
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        const opts = generateOptions(&weapons, &passives, &overclock, &r);
+        for (opts) |o| {
+            // Every option's delta must be computable: a held weapon's damage
+            // goes up, a new item's current value is zero, and an evolution's
+            // delta is the fused spec against the maxed base weapon.
+            if (o.is_evo) {
+                try std.testing.expect(o.item_id >= 32 and o.item_id < 40);
+                const evo = evolutionById(o.item_id).?;
+                const current = weapon.specFor(evo.weapon_id, root.max_weapon_level).?;
+                const upgraded = weapon.specFor(o.item_id, root.max_weapon_level).?;
+                try std.testing.expectEqual(wire.StatType.damage, o.stat_type);
+                try std.testing.expectEqual(statFp(current.damage), o.current_stat_fp);
+                try std.testing.expectEqual(statFp(upgraded.damage), o.upgraded_stat_fp);
+            } else if (o.item_id < root.max_weapons) {
+                const spec = weapon.specFor(o.item_id, 1).?;
+                const first = statFp(spec.damage);
+                // Levelling a held weapon raises its damage; a new one starts
+                // from zero and buys the level-1 row.
+                const upgraded_fp = if (o.next_level == 1) first else o.upgraded_stat_fp;
+                try std.testing.expect(upgraded_fp >= o.current_stat_fp);
+            }
+        }
+    }
+
+    // A passive option reports its own mapped stat, and Clockwork Gear's
+    // cooldown reduction is negative.
+    const gear = passiveOption(ids.clockwork_gear, 3, 2, 3);
+    try std.testing.expectEqual(wire.StatType.cooldown, gear.stat_type);
+    try std.testing.expect(gear.current_stat_fp == -16);
+    try std.testing.expect(gear.upgraded_stat_fp == -24);
+
+    // An unmapped passive reports no stat at all.
+    const coil = passiveOption(ids.accelerator_coil, 1, 0, 1);
+    try std.testing.expectEqual(@as(u8, 0), coil.stat_type);
+    try std.testing.expectEqual(@as(i16, 0), coil.current_stat_fp);
+    try std.testing.expectEqual(@as(i16, 0), coil.upgraded_stat_fp);
+
+    // Overclock deltas are marginal: +2% damage, a floored cooldown, +25 HP.
+    const dmg = overclockOption(ids.overclock_damage, &[_]u32{ 10, 0, 0 });
+    try std.testing.expectEqual(wire.StatType.damage, dmg.stat_type);
+    try std.testing.expectEqual(@as(i16, 120), dmg.current_stat_fp);
+    try std.testing.expectEqual(@as(i16, 122), dmg.upgraded_stat_fp);
+
+    const hp = overclockOption(ids.overclock_max_hp, &[_]u32{ 0, 0, 4 });
+    try std.testing.expectEqual(wire.StatType.max_hp, hp.stat_type);
+    try std.testing.expectEqual(@as(i16, 10000), hp.current_stat_fp);
+    try std.testing.expectEqual(@as(i16, 12500), hp.upgraded_stat_fp);
 }

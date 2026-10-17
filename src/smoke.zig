@@ -119,7 +119,16 @@ fn forceEvolution(s: *Simulation, player_id: u8, evo_id: u8) !void {
 
 test "phase 3 smoke: a full run from gems to game over" {
     var s = Simulation.init();
-    const p = s.spawnPlayer(0).?;
+    const p = s.spawnPlayer(0, 0, 0).?;
+    // This test is about the run end to end — gems, level-ups, evolutions,
+    // synergies, death — not about survival balance, and v2 starts a run with
+    // one weapon. The other three are armed at level 1, as the old default
+    // loadout was, so the player survives the opening as this test expects.
+    for (p.weapons[1..], 1..) |*slot, i| {
+        slot.id = @intCast(i);
+        slot.level = 1;
+        slot.cooldown_ticks = 0;
+    }
 
     // --- 1. Enemies spawn and die -----------------------------------------
     // The natural spawn curve places the first wave at 1:00, and the player's
@@ -215,7 +224,7 @@ test "phase 3 smoke: a full run from gems to game over" {
     p.synergy_mask = upgrade.synergyMask(&p.weapons, &p.passives);
     try std.testing.expect(p.synergy_mask & upgrade.synergy_kinetic_charge != 0);
     disarm(p);
-    s.applyInput(0, .{ .input_seq = 1, .move_x = 100, .move_y = 0 });
+    s.applyInput(0, .{ .input_seq = 1, .buttons = 0, .axis_x = 100, .axis_y = 0 });
     var moved: usize = 0;
     while (moved < 20) : (moved += 1) try tick(&s, 0);
     try std.testing.expect(p.kinetic_charge > 0.0);
@@ -231,7 +240,7 @@ test "phase 3 smoke: a full run from gems to game over" {
 
     // --- 6. The difficulty escalates without bound -------------------------
     var late = Simulation.init();
-    const lp = late.spawnPlayer(0).?;
+    const lp = late.spawnPlayer(0, 0, 0).?;
     disarm(lp);
     late.tick = 3600 * 60 * 40; // 40 minutes
     var k: usize = 0;
@@ -243,7 +252,7 @@ test "phase 3 smoke: a full run from gems to game over" {
 
     // --- 7. Game over at 0 HP, and a restart -------------------------------
     var dead = Simulation.init();
-    const dp = dead.spawnPlayer(0).?;
+    const dp = dead.spawnPlayer(0, 0, 0).?;
     disarm(dp);
     dp.hp = 1.0;
     _ = dead.enemies.spawn(.circle_t1, .{ 0.6, 0.0 }).?;
@@ -260,7 +269,8 @@ test "phase 3 smoke: a full run from gems to game over" {
     try std.testing.expect(dp.flags.alive);
     try std.testing.expectEqual(@as(u16, 1), dp.level);
     try std.testing.expectEqual(@as(u32, 0), dp.xp);
-    try std.testing.expectEqual(@as(f32, root.player_max_hp), dp.hp);
+    // The race's own max HP, not the phase-1 default.
+    try std.testing.expectEqual(@as(f32, 110.0), dp.hp);
     try std.testing.expectEqual(@as(usize, 0), dead.enemies.count);
 }
 
@@ -270,7 +280,7 @@ test "phase 3 smoke: a full run from gems to game over" {
 
 test "Reactive Carapace's shockwave damages the enemies around the player" {
     var s = Simulation.init();
-    const p = s.spawnPlayer(0).?;
+    const p = s.spawnPlayer(0, 0, 0).?;
     disarm(p);
     armItem(p, upgrade.ids.titanium_plating, 3);
     armItem(p, upgrade.ids.nano_repair, 3);
@@ -298,7 +308,7 @@ test "Reactive Carapace's shockwave damages the enemies around the player" {
 
 test "Singularity Field damages enemies a magnetized gem passes through" {
     var s = Simulation.init();
-    const p = s.spawnPlayer(0).?;
+    const p = s.spawnPlayer(0, 0, 0).?;
     disarm(p);
     armItem(p, upgrade.ids.magnet_array, 3);
     armItem(p, upgrade.ids.amplifier_lens, 3);

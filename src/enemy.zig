@@ -412,6 +412,16 @@ pub const Pool = struct {
     shielded_regen: [root.max_enemies]u16 = @splat(0),
     /// Boss: which attack comes next (0 = radial burst, 1 = telegraphed dash).
     boss_parity: [root.max_enemies]u8 = @splat(0),
+    /// Telegraph (protocol v2 `EnemyNet`): what the client draws as the windup
+    /// warning before the enemy commits. `sim.updateEnemies` rewrites these
+    /// every tick — zero when the enemy is not winding up — so a stale record
+    /// can never describe an attack that is not coming.
+    telegraph_progress: [root.max_enemies]u8 = @splat(0),
+    telegraph_shape: [root.max_enemies]u8 = @splat(0),
+    /// Facing angle in milliradians, -3142..3142; negative is a left turn.
+    telegraph_angle: [root.max_enemies]i16 = @splat(0),
+    /// Radius for a circle/cone, length for a line charge, in world units.
+    telegraph_radius: [root.max_enemies]u16 = @splat(0),
     /// Enemies that died while frozen, queued for Cryo Flechette's shatter
     /// (DESIGN.md §3). `sim.zig` drains this after `reapDead`.
     shatter_pos: [root.max_enemies][2]f32 = @splat(.{ 0.0, 0.0 }),
@@ -470,6 +480,10 @@ pub const Pool = struct {
         self.barrier[i] = 0.0;
         self.shielded_regen[i] = 0;
         self.boss_parity[i] = 0;
+        self.telegraph_progress[i] = 0;
+        self.telegraph_shape[i] = 0;
+        self.telegraph_angle[i] = 0;
+        self.telegraph_radius[i] = 0;
         self.debuff_mult[i] = 1.0;
         self.slow_ticks[i] = 0;
         self.slow_factor[i] = 1.0;
@@ -884,6 +898,10 @@ test "swapRemove keeps the pool dense and carries every field across" {
     pool.kb[b] = .{ 9.0, 8.0 };
     pool.ai_state[b] = @intFromEnum(AiState.lunge);
     pool.ai_timer[b] = 17;
+    pool.telegraph_progress[b] = 200;
+    pool.telegraph_shape[b] = @intFromEnum(wire.TelegraphShape.line_charge);
+    pool.telegraph_angle[b] = -1500;
+    pool.telegraph_radius[b] = 22;
     const moved_id = pool.id[c];
     const moved_pos = pool.pos[c];
 
@@ -899,6 +917,13 @@ test "swapRemove keeps the pool dense and carries every field across" {
     try std.testing.expectEqual([2]f32{ 9.0, 8.0 }, pool.kb[b]);
     try std.testing.expectEqual(@as(u16, 17), pool.ai_timer[b]);
     try std.testing.expectEqual(@as(u8, @intFromEnum(AiState.lunge)), pool.ai_state[b]);
+    try std.testing.expectEqual(@as(u8, 200), pool.telegraph_progress[b]);
+    try std.testing.expectEqual(
+        @as(u8, @intFromEnum(wire.TelegraphShape.line_charge)),
+        pool.telegraph_shape[b],
+    );
+    try std.testing.expectEqual(@as(i16, -1500), pool.telegraph_angle[b]);
+    try std.testing.expectEqual(@as(u16, 22), pool.telegraph_radius[b]);
 
     // Removing the tail slot needs no move.
     pool.swapRemove(pool.count - 1);
