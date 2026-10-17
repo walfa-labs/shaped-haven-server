@@ -15,6 +15,7 @@ const enemy = @import("enemy.zig");
 const weapon = @import("weapon.zig");
 const combat = @import("combat.zig");
 const upgrade = @import("upgrade.zig");
+const loadout = @import("loadout.zig");
 const gem = @import("gem.zig");
 const evolve = @import("evolve.zig");
 const bench = @import("bench.zig");
@@ -45,5 +46,9 @@ test "all modules are reachable" {
     try std.testing.expectEqual(@as(usize, 64), root.max_rifts);
     try std.testing.expect(@sizeOf(evolve.RiftPool) > 0);
     try std.testing.expectEqual(sim.levelup_timeout_ticks, 15 * 60);
+    const empty_loadout = loadout.Loadout{};
+    try std.testing.expectEqual(@as(usize, 4), empty_loadout.weapons.len);
+    try std.testing.expectEqual(@as(usize, 10), empty_loadout.passives.len);
+    try std.testing.expect(empty_loadout.isEmpty());
     _ = smoke;
 }

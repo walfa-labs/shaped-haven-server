@@ -40,6 +40,7 @@ const combat = @import("combat.zig");
 const spatial = @import("spatial.zig");
 const rng = @import("rng.zig");
 const upgrade = @import("upgrade.zig");
+const loadout = @import("loadout.zig");
 const gem = @import("gem.zig");
 const evolve = @import("evolve.zig");
 
@@ -261,6 +262,16 @@ pub const Simulation = struct {
     /// When set, the world is held at this load every tick instead of being
     /// populated by the spawn curve. See `StressLoad`.
     stress: ?StressLoad = null,
+    /// When set, every run starts with this loadout — the four level-1 weapons
+    /// of DESIGN.md §3 replaced by it — on every join and every restart.
+    ///
+    /// **This is a test affordance, not part of the game.** It exists so a live
+    /// client run can be started already holding a loadout normal play cannot
+    /// reach in the time a scripted run survives: an evolution needs a level-8
+    /// weapon *and* its named passive at max, roughly thirteen level-up picks,
+    /// and a scripted run reaches level 6–7 before dying. Off in normal play;
+    /// the server only turns it on from `--debug-loadout`. See `loadout.zig`.
+    loadout: ?loadout.Loadout = null,
 
     /// Pending level-up offers, one per player whose XP bar filled.
     pending_levelups: [root.max_players]LevelUp = root.filledWithDefault(LevelUp, root.max_players),
@@ -310,13 +321,13 @@ pub const Simulation = struct {
             if (requested_slot >= root.max_players) return null;
             if (self.players[requested_slot].active) return null;
             self.players[requested_slot].active = true;
-            resetPlayer(&self.players[requested_slot]);
+            resetPlayer(&self.players[requested_slot], self.loadout);
             return &self.players[requested_slot];
         }
         for (&self.players) |*p| {
             if (!p.active) {
                 p.active = true;
-                resetPlayer(p);
+                resetPlayer(p, self.loadout);
                 return p;
             }
         }
@@ -324,8 +335,8 @@ pub const Simulation = struct {
     }
 
     /// Give a player a fresh run: the four level 1 weapons of DESIGN.md §3, no
-    /// passives, level 1, full HP.
-    fn resetPlayer(p: *PlayerState) void {
+    /// passives, level 1, full HP — plus `l` when one is set.
+    fn resetPlayer(p: *PlayerState, l: ?loadout.Loadout) void {
         p.flags = .{ .alive = true };
         p.hp = root.player_max_hp;
         p.max_hp = root.player_max_hp;
@@ -353,6 +364,10 @@ pub const Simulation = struct {
             slot.pending_slashes = 0;
             slot.pending_timer = 0;
             slot.shots_fired = 0;
+        }
+        if (l) |load| {
+            load.apply(&p.weapons, &p.passives);
+            p.synergy_mask = upgrade.synergyMask(&p.weapons, &p.passives);
         }
     }
 
@@ -1451,7 +1466,7 @@ pub const Simulation = struct {
 
         for (&self.players) |*p| {
             if (!p.active) continue;
-            resetPlayer(p);
+            resetPlayer(p, self.loadout);
             self.loadout_dirty[p.id] = true;
         }
     }
@@ -2917,6 +2932,58 @@ test "a restart resets the run and revives the player" {
     try std.testing.expectEqual(@as(u32, 0), sim.kills);
     try std.testing.expectEqual(@as(usize, 0), sim.enemies.count);
     try std.testing.expectEqual(@as(usize, 0), sim.gems.count);
+}
+
+test "the debug loadout arms the requested loadout and its evolution" {
+    var sim = Simulation.init();
+    sim.loadout = try loadout.parse("sword=8,clockwork_gear=5");
+    const p = sim.spawnPlayer(0).?;
+
+    // The sword is level 8 with Clockwork Gear at its max, so it is the Vorpal
+    // Blender — the evolved id and the evolved flag, not just the levels.
+    try std.testing.expectEqual(upgrade.ids.vorpal_blender, p.weapons[0].id);
+    try std.testing.expect(p.weapons[0].evolved);
+    try std.testing.expectEqual(root.max_weapon_level, p.weapons[0].level);
+    try std.testing.expectEqual(@as(u8, 5), p.passives[2]);
+    // The other three weapons keep the run's level-1 defaults.
+    try std.testing.expectEqual(@as(u8, 1), p.weapons[1].level);
+    try std.testing.expectEqual(upgrade.ids.axe, p.weapons[1].id);
+    // Synergies are resolved from the loadout, not left at zero.
+    try std.testing.expectEqual(upgrade.synergyMask(&p.weapons, &p.passives), p.synergy_mask);
+}
+
+test "the debug loadout survives a restart" {
+    var sim = Simulation.init();
+    sim.loadout = try loadout.parse("axe=8,amplifier_lens=5");
+    _ = sim.spawnPlayer(0).?;
+    const p = &sim.players[0];
+    // A scripted restart has to start the next run partway there as well, so
+    // the affordance is observable across a C2S_RESTART.
+    p.weapons[0].level = 1;
+    p.weapons[0].id = upgrade.ids.sword;
+    p.weapons[0].evolved = false;
+    p.passives[1] = 0;
+    sim.restart(0);
+
+    const i = upgrade.weaponSlot(&p.weapons, upgrade.ids.axe).?;
+    try std.testing.expectEqual(upgrade.ids.gravity_cleaver, p.weapons[i].id);
+    try std.testing.expect(p.weapons[i].evolved);
+    try std.testing.expectEqual(@as(u8, 5), p.passives[1]);
+    // The run itself is fresh again.
+    try std.testing.expectEqual(@as(u16, 1), p.level);
+    try std.testing.expectEqual(GameState.running, sim.state);
+}
+
+test "a run without the debug loadout keeps the default loadout" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0).?;
+    for (&p.weapons, 0..) |*slot, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), slot.id);
+        try std.testing.expectEqual(@as(u8, 1), slot.level);
+        try std.testing.expect(!slot.evolved);
+    }
+    for (p.passives) |lvl| try std.testing.expectEqual(@as(u8, 0), lvl);
+    try std.testing.expectEqual(@as(u16, 0), p.synergy_mask);
 }
 
 test "the score follows DESIGN.md §1" {
