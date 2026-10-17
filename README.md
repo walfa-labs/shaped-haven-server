@@ -319,6 +319,31 @@ transient 5-tick client-side hiccup near frame 9,420 recovered on its own; the
 TCP connection stayed up for the whole run (the server logged a single join
 and a single final disconnect).
 
+### The phase-4 integration check
+
+A normal run (no stress flags) against the real client at its `phase-4-delta`
+branch, driven by `--input-script` (a wide circle, so the interest neighbourhood
+churns as the player walks) and `--choice-script`: 6,000 frames in 41.87 s, a
+steady **143.3 fps**, 835 snapshots received, **831 deltas applied and none
+refused**, and a worst prediction error of 0.039 world units — an order of
+magnitude inside the 2.0-unit snap threshold. `interest_radius=40` decoded from
+the 21-byte welcome, three level-ups were offered and answered, and the run
+reported `stale=0 staleoffers=0 malformed=0 qdropped=0 sendfail=0 ackretry=0`
+throughout, with the only paused steps being the level-up drafts themselves.
+
+The refusal count is reported rather than claimed as an improvement: the commit
+before this work (`f5edbcb`) had already replaced the acknowledgement-only
+baseline with a carried-forward one, and the same client refused 2 of 737 deltas
+against it. What this phase's fixes change is not visible as refusals — a
+deferred update that is never resent and an entity the client never learns about
+are both *accepted* deltas that leave the client subtly wrong. Those are pinned
+by the unit tests and by the benchmark's refresh-latency and deferred counts
+instead, which is why they are asserted there.
+
+Not exercised live: a game over and a restart, which a 42-second run does not
+reach. The restart boundary is covered by `server.test.a restart takes the held
+state back to nothing` and by the client's own tests.
+
 Deliberately not in this phase (DESIGN.md §6 puts them later): the phase-5
 multiplayer work — party-pooled XP, the synchronised party pause, per-player
 restart, and the catch-up initialisation for a player joining a run already in
