@@ -482,7 +482,13 @@ pub const Simulation = struct {
             const angle = self.rng.range(0.0, 2.0 * std.math.pi);
             const dist = self.rng.range(1.0, radius);
             const pos = placeFrom(around, angle, dist);
-            if (self.enemies.spawnWith(.circle_t1, pos, .{ .hp_mult = hp_mult }) == null) break;
+            // The stress load goes through the same spawn-time curve the real
+            // spawner does, so the benchmark's world is the world the run
+            // produces.
+            if (self.enemies.spawnWith(.circle_t1, pos, .{
+                .hp_mult = hp_mult,
+                .speed_mult = enemy.speedMultiplier(t),
+            }) == null) break;
         }
     }
 
@@ -1535,7 +1541,15 @@ pub const Simulation = struct {
         const t = @as(f32, @floatFromInt(self.tick)) /
             (@as(f32, @floatFromInt(root.tick_hz)) * 60.0);
 
-        var opts = enemy.Pool.SpawnOpts{ .hp_mult = hp_mult };
+        // The endless curve's move-speed escalation (DESIGN.md §1 Phase D) is
+        // baked in at spawn, exactly as the health curve is: below 20:00 the
+        // multiplier is 1.0, so a standard run is unaffected, and past it the
+        // horde that keeps respawning gets faster instead of the escalation
+        // being defined and never applied.
+        var opts = enemy.Pool.SpawnOpts{
+            .hp_mult = hp_mult,
+            .speed_mult = enemy.speedMultiplier(t),
+        };
         var elite_mask: u8 = 0;
         if (self.rng.unit() < enemy.eliteChance(t)) {
             // One modifier per elite, drawn uniformly from the four.
@@ -1549,7 +1563,7 @@ pub const Simulation = struct {
             opts.hp_mult *= enemy.elite.hp_mult;
             opts.radius_mult = enemy.elite.radius_mult;
             if (elite_mask & enemy.elite.vampiric != 0) {
-                opts.speed_mult = enemy.elite.vampiric_speed_mult;
+                opts.speed_mult *= enemy.elite.vampiric_speed_mult;
             }
         }
 
@@ -1565,9 +1579,14 @@ pub const Simulation = struct {
     /// Place a boss at `pos` (DESIGN.md §4): `2500 x M_HP(t) x (1 + 0.75(P-1))`
     /// HP, 100% knockback and freeze immunity.
     fn spawnBoss(self: *Simulation, pos: [2]f32, hp_mult: f32, players: u8) void {
+        const t = @as(f32, @floatFromInt(self.tick)) /
+            (@as(f32, @floatFromInt(root.tick_hz)) * 60.0);
         const party = 1.0 + enemy.boss.party_hp_step * (@as(f32, @floatFromInt(players)) - 1.0);
         const i = self.enemies.spawnWith(.boss, pos, .{
             .hp_mult = hp_mult * party,
+            // A boss is an enemy too, so the endless move-speed escalation
+            // reaches it the same way it reaches the horde.
+            .speed_mult = enemy.speedMultiplier(t),
             .knockback_resist = 1.0,
             .status_immune = true,
         }) orelse return;
@@ -2918,4 +2937,119 @@ test "the smoke test's difficulty escalation is unbounded" {
     try std.testing.expect(enemy.activeCap(20.0) > enemy.activeCap(5.0));
     try std.testing.expectEqual(root.max_enemies, enemy.activeCap(1000.0));
     try std.testing.expect(enemy.spawnRate(100.0, 1) > 1000.0);
+}
+
+/// A player at the origin with no weapons, so nothing it does can kill the
+/// shooter the test is setting up.
+fn disarmedPlayerAtOrigin(sim: *Simulation) *PlayerState {
+    const p = sim.spawnPlayer(0).?;
+    p.pos = .{ 0.0, 0.0 };
+    disarm(p);
+    return p;
+}
+
+test "a spitter's shot travels at its stated speed" {
+    var sim = Simulation.init();
+    _ = disarmedPlayerAtOrigin(&sim);
+
+    // A spitter 10 units away, halted and due to fire this tick.
+    const s = sim.enemies.spawn(.triangle_t2, .{ 10.0, 0.0 }).?;
+    sim.enemies.ai_state[s] = @intFromEnum(enemy.AiState.halt);
+    sim.enemies.ai_timer[s] = 1;
+    sim.updateEnemies(1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, 1), sim.projectiles.count);
+    const shot = sim.projectiles.count - 1;
+    try std.testing.expectEqual(@as(u8, 0xff), sim.projectiles.owner_id[shot]);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, enemy.spitter.shot_speed),
+        std.math.hypot(sim.projectiles.vel[shot][0], sim.projectiles.vel[shot][1]),
+        1e-4,
+    );
+
+    const x0 = sim.projectiles.pos[shot][0];
+    var k: usize = 0;
+    while (k < 10) : (k += 1) sim.advance();
+
+    // Ten ticks at 9.0 u/s is 1.5 units of ground, not a shot sitting on the
+    // muzzle for its whole lifetime.
+    try std.testing.expectApproxEqAbs(
+        @as(f32, enemy.spitter.shot_speed * 10.0 / 60.0),
+        x0 - sim.projectiles.pos[shot][0],
+        0.01,
+    );
+    try std.testing.expect(sim.projectiles.ttl_ticks[shot] > 0);
+}
+
+test "the boss's radial burst travels at its stated speed" {
+    var sim = Simulation.init();
+    _ = disarmedPlayerAtOrigin(&sim);
+
+    const b = sim.enemies.spawn(.boss, .{ 30.0, 0.0 }).?;
+    sim.enemies.ai_timer[b] = 1;
+    sim.enemies.boss_parity[b] = 0;
+    sim.updateEnemies(1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, enemy.boss.burst_count), sim.projectiles.count);
+    // The shot the burst fired along +x: the one with no y velocity.
+    var along_x: ?usize = null;
+    for (0..sim.projectiles.count) |j| {
+        if (sim.projectiles.vel[j][1] == 0.0 and sim.projectiles.vel[j][0] > 0.0) along_x = j;
+    }
+    const shot = along_x orelse return error.NoRadialShot;
+
+    const x0 = sim.projectiles.pos[shot][0];
+    var k: usize = 0;
+    while (k < 10) : (k += 1) sim.advance();
+
+    try std.testing.expectApproxEqAbs(
+        @as(f32, enemy.boss.burst_speed * 10.0 / 60.0),
+        sim.projectiles.pos[shot][0] - x0,
+        0.01,
+    );
+}
+
+test "the endless move-speed escalation is applied when an enemy spawns" {
+    var sim = Simulation.init();
+    _ = disarmedPlayerAtOrigin(&sim);
+
+    // Below 20:00 the multiplier is 1.0, so the curve changes nothing.
+    sim.tick = 10 * 60 * root.tick_hz;
+    sim.topUpLoad(1, 0, 5.0);
+    try std.testing.expectEqual(@as(usize, 1), sim.enemies.count);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.5), sim.enemies.move_speed[0], 1e-5);
+
+    // Past 20:00 a spawn carries the curve's multiplier.
+    sim.tick = 25 * 60 * root.tick_hz;
+    sim.topUpLoad(2, 0, 5.0);
+    const want = 4.5 * enemy.speedMultiplier(25.0);
+    try std.testing.expectApproxEqAbs(want, sim.enemies.move_speed[1], 1e-5);
+    try std.testing.expect(sim.enemies.move_speed[1] > 4.5);
+
+    // The boss takes it too — it is an enemy, and its spawn has no elite roll
+    // to muddy the value.
+    sim.spawnBoss(.{ 50.0, 0.0 }, 1.0, 1);
+    try std.testing.expectEqual(@as(usize, 3), sim.enemies.count);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 5.5 * enemy.speedMultiplier(25.0)),
+        sim.enemies.move_speed[2],
+        1e-5,
+    );
+
+    // And the wave spawner, where the elite roll can only ever add speed: every
+    // enemy it places past 20:00 is at least as fast as the curve demands, and
+    // at most the Vampiric modifier faster. Both bounds fail if the curve is
+    // not applied at all, and the elite roll's composition cannot break them.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) sim.spawnEnemy(.circle_t1, .{ 50.0, 0.0 }, 1.0);
+    try std.testing.expectEqual(@as(usize, 203), sim.enemies.count);
+    var slowest: f32 = std.math.inf(f32);
+    var fastest: f32 = 0.0;
+    for (3..sim.enemies.count) |k| {
+        slowest = @min(slowest, sim.enemies.move_speed[k]);
+        fastest = @max(fastest, sim.enemies.move_speed[k]);
+    }
+    try std.testing.expect(slowest >= want - 1e-4);
+    try std.testing.expect(fastest <= want * enemy.elite.vampiric_speed_mult + 1e-4);
+    try std.testing.expect(fastest > 4.5);
 }

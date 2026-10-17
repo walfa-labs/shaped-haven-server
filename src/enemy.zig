@@ -286,6 +286,14 @@ pub fn activeCap(t_minutes: f32) usize {
 }
 
 /// `R(t) = (3.0 + 2.2t + 0.35t²) × (1 + 0.5(P − 1))` enemies per second.
+///
+/// DESIGN.md §1 describes Phase A as *"spawn density scales linearly 3.0 → 14.0
+/// enemies/sec"*, which is this formula's linear term alone: `3.0 + 2.2t` reads
+/// 14.0 at 5:00, while the full formula reads 22.75. The two readings cannot
+/// both hold. The formula wins: §4 is the section that defines the spawner
+/// ("Spawn formula over time", evaluated every 60 ticks) and §1 is the narrative
+/// pacing summary, whose own endpoint is exactly the linear term's. The
+/// quadratic term is also what makes §4's later phases escalate at all.
 pub fn spawnRate(t_minutes: f32, player_count: u8) f32 {
     const base = 3.0 + 2.2 * t_minutes + 0.35 * t_minutes * t_minutes;
     const party = 1.0 + 0.5 * (@as(f32, @floatFromInt(player_count)) - 1.0);
@@ -713,6 +721,16 @@ test "the spawn rate follows DESIGN.md §4" {
     try std.testing.expectApproxEqAbs(@as(f32, 7.5), spawnRate(0.0, 4), 1e-5);
     // 3.0 + 2.2 + 0.35 at one minute.
     try std.testing.expectApproxEqAbs(@as(f32, 5.55), spawnRate(1.0, 1), 1e-4);
+}
+
+test "the 5:00 spawn rate is the formula's 22.75, not §1's linear 14.0" {
+    // 3.0 + 2.2 x 5 + 0.35 x 25 = 22.75.
+    try std.testing.expectApproxEqAbs(@as(f32, 22.75), spawnRate(5.0, 1), 1e-4);
+    // §1's endpoint is the linear term's, which the formula only reaches if the
+    // quadratic term is dropped. Pinned here so the reading is a decision the
+    // code states rather than an accident of arithmetic.
+    try std.testing.expectApproxEqAbs(@as(f32, 14.0), 3.0 + 2.2 * 5.0, 1e-5);
+    try std.testing.expect(spawnRate(5.0, 1) > 14.0);
 }
 
 test "wave surges run for 15 s every 2 minutes" {

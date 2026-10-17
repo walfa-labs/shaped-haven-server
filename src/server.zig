@@ -583,28 +583,13 @@ pub const Server = struct {
             conn.held_tick.store(0, .release);
         }
 
-        // Nothing the client is known to hold: a full snapshot is the only
-        // honest answer, and the connection keeps getting them until an
-        // acknowledgement proves the client is holding one.
-        if (model == 0) return self.fullSnapshotFrame(conn, centre, tick);
-
-        // The model names a tick the ring has to still hold. When the model was
-        // corrected since the held state was built — an acknowledgement that
-        // disagreed with it — the state is rebuilt from the ring, so the diff
-        // starts from what the client really has rather than from a guess.
-        if (model != conn.held_tick_content or self.snapshots.baseline(model) == null) {
-            const slot = self.snapshots.baseline(model) orelse {
-                conn.held_tick.store(0, .release);
-                return self.fullSnapshotFrame(conn, centre, tick);
-            };
-            const held_centre = delta.playerPosInSlot(slot, conn.player_id) orelse {
-                conn.held_tick.store(0, .release);
-                return self.fullSnapshotFrame(conn, centre, tick);
-            };
-            held.setFromSlot(slot, held_centre, root.interest_radius);
-            conn.held_tick_content = model;
-            // The candidate set changed wholesale, so the rotation starts over.
-            conn.update_rotation = 0;
+        // Bring the held state in line with the model — a no-op while the two
+        // already agree. When they do not, there is no usable model at all and
+        // the client gets a full snapshot: the only honest answer, and one it
+        // keeps getting until an acknowledgement proves it is holding it.
+        if (!self.syncHeld(conn, model)) {
+            conn.held_tick.store(0, .release);
+            return self.fullSnapshotFrame(conn, centre, tick);
         }
 
         const current = self.sim.snapshotViewFor(centre, root.interest_radius);
@@ -632,6 +617,33 @@ pub const Server = struct {
         // budget deferred lead the next window instead of trailing it forever.
         conn.update_rotation +%= @intCast(d.updated.len);
         return frameOrFree(self.gpa, bytes);
+    }
+
+    /// Bring `conn`'s held state in line with the model tick `model`.
+    ///
+    /// The model is corrected by an acknowledgement that disagrees with it
+    /// (PROTOCOL.md "Baseline rules"), so the state it used to describe is no
+    /// longer the state the client holds. When the two disagree, the state is
+    /// rebuilt from the ring's snapshot of that tick, filtered around the
+    /// position the receiver's player held *then* — which is the neighbourhood
+    /// the client's own state was filtered around.
+    ///
+    /// Returns false when there is no usable model: tick 0, a tick the ring no
+    /// longer holds, or one whose snapshot did not carry the player. The caller
+    /// answers that with a full snapshot.
+    fn syncHeld(self: *Server, conn: *ClientConn, model: u32) bool {
+        if (model != 0 and model == conn.held_tick_content and
+            self.snapshots.baseline(model) != null)
+        {
+            return true;
+        }
+        const slot = self.snapshots.baseline(model) orelse return false;
+        const centre = delta.playerPosInSlot(slot, conn.player_id) orelse return false;
+        conn.held.setFromSlot(slot, centre, root.interest_radius);
+        conn.held_tick_content = model;
+        // The candidate set changed wholesale, so the rotation starts over.
+        conn.update_rotation = 0;
+        return true;
     }
 
     /// A full snapshot of `conn`'s neighbourhood, which replaces whatever the
@@ -2288,6 +2300,43 @@ test "a repeated acknowledgement pulls a model that ran ahead back" {
     // model would refuse forever.
     conn.noteAck(36);
     try std.testing.expectEqual(@as(u32, 36), conn.held_tick.load(.acquire));
+}
+
+test "a corrected model rebuilds the held state from the ring" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var server = Server.init(std.Io.failing, gpa, &arena);
+
+    // A player with a neighbourhood: one enemy in interest, one far outside it.
+    const p = server.sim.spawnPlayer(0).?;
+    p.pos = .{ 0.0, 0.0 };
+    _ = server.sim.enemies.spawn(.circle_t1, .{ 5.0, 0.0 }).?;
+    _ = server.sim.enemies.spawn(.circle_t1, .{ 500.0, 0.0 }).?;
+
+    server.sim.tick = 30;
+    server.snapshots.store(server.sim.snapshotView());
+
+    var conn = ClientConn{ .player_id = 0 };
+
+    // Tick 0 is never a model, and neither is a tick the ring never stored.
+    try std.testing.expect(!server.syncHeld(&conn, 0));
+    try std.testing.expect(!server.syncHeld(&conn, 27));
+
+    // A tick the ring holds: the state is rebuilt from it, filtered to the
+    // receiver's own neighbourhood rather than to the whole world.
+    try std.testing.expect(server.syncHeld(&conn, 30));
+    try std.testing.expectEqual(@as(u32, 30), conn.held_tick_content);
+    try std.testing.expectEqual(@as(u16, 1), conn.held.counts[1]);
+    try std.testing.expectEqual(@as(u32, 1), conn.held.enemies[0].id);
+
+    // Already in line: a no-op that stays true.
+    try std.testing.expect(server.syncHeld(&conn, 30));
+
+    // A tick that has fallen out of the 32-snapshot window is no model either.
+    server.sim.tick = 30 + delta.ring_size * root.ticks_per_snapshot;
+    server.snapshots.store(server.sim.snapshotView());
+    try std.testing.expect(!server.syncHeld(&conn, 30));
 }
 
 test "a delta is diffed against the held state, not the last acknowledgement" {
