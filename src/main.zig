@@ -2,9 +2,11 @@ const std = @import("std");
 const root = @import("root.zig");
 const sim = @import("sim.zig");
 const server = @import("server.zig");
+const loadout = @import("loadout.zig");
 
 const usage =
     \\Usage: shaped-haven-server [--port <n>] [--stress-enemies <n>] [--stress-projectiles <n>]
+    \\                      [--debug-loadout <spec>]
     \\
     \\  --port <n>                 TCP port to listen on (default {d})
     \\  --stress-enemies <n>       Hold n enemies live around the players, instead
@@ -12,12 +14,21 @@ const usage =
     \\                             A measurement tool: the natural curve does not
     \\                             reach 1000 enemies for about twelve minutes.
     \\  --stress-projectiles <n>   Hold n gun projectiles live as well.
+    \\  --debug-loadout <spec>     TEST AFFORDANCE, NOT GAMEPLAY. Start every run
+    \\                             with the given loadout instead of the four
+    \\                             level-1 weapons, on every join and every
+    \\                             restart. <spec> is comma-separated name=level
+    \\                             pairs, e.g. "sword=8,clockwork_gear=5" (which
+    \\                             arms the Vorpal Blender), or item ids from
+    \\                             PROTOCOL.md, e.g. "0=8,18=5". An empty spec
+    \\                             starts a run with the normal loadout.
     \\
 ;
 
 pub fn main(init: std.process.Init) !void {
     var port = root.default_port;
     var stress: ?sim.StressLoad = null;
+    var loadout_spec: ?[]const u8 = null;
 
     var args = try std.process.Args.iterateAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
@@ -28,6 +39,11 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next();
             port = std.fmt.parseUnsigned(u16, value orelse "", 10) catch {
                 std.debug.print("error: invalid port '{s}'\n", .{value orelse ""});
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.eql(u8, arg, "--debug-loadout")) {
+            loadout_spec = args.next() orelse {
+                std.debug.print("error: --debug-loadout needs a spec, e.g. --debug-loadout \"sword=8,clockwork_gear=5\"\n", .{});
                 return error.InvalidArguments;
             };
         } else if (std.mem.eql(u8, arg, "--stress-enemies") or
@@ -46,6 +62,18 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(usage, .{root.default_port});
             return error.InvalidArguments;
         }
+    }
+
+    var debug_loadout: ?loadout.Loadout = null;
+    if (loadout_spec) |spec| {
+        debug_loadout = loadout.parse(spec) catch {
+            std.debug.print(
+                "error: invalid --debug-loadout spec '{s}'\n" ++
+                    "  expected comma-separated name=level pairs, e.g. --debug-loadout \"sword=8,clockwork_gear=5\"\n",
+                .{spec},
+            );
+            return error.InvalidArguments;
+        };
     }
 
     std.debug.print(
@@ -71,6 +99,12 @@ pub fn main(init: std.process.Init) !void {
             .{ load.enemies, load.projectiles },
         );
     }
+    if (loadout_spec) |spec| {
+        std.debug.print(
+            "  DEBUG LOADOUT: {s}   (TEST AFFORDANCE — NOT GAMEPLAY)\n",
+            .{spec},
+        );
+    }
 
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
@@ -79,6 +113,7 @@ pub fn main(init: std.process.Init) !void {
     defer threaded.deinit();
     var srv = server.Server.init(threaded.io(), init.gpa, &arena);
     srv.sim.stress = stress;
+    srv.sim.loadout = debug_loadout;
     try srv.listen(port);
     defer srv.shutdown();
 

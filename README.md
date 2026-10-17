@@ -34,6 +34,7 @@ Source layout:
 | `upgrade.zig` | The item id space, the ten passives, the eight evolutions, the five synergies, the XP curve, stat resolution and the level-up choice generator. |
 | `combat.zig` | Projectile pool, arc/circle/ray hit detection, damage, knockback and the projectile-level evolution effects. |
 | `evolve.zig` | The evolved weapons' lingering effects: ground rifts and Cryo Flechette shatters. |
+| `loadout.zig` | The `--debug-loadout` **test affordance**: parse a starting loadout and apply it to a run. Not part of the game. |
 | `gem.zig` | The XP gem pool. |
 | `spatial.zig` | Uniform spatial hash grid used as the combat broadphase. |
 | `rng.zig` | Deterministic SplitMix64, so a run is reproducible from its seed. |
@@ -127,6 +128,7 @@ zig build run                      # run the server (listens on 127.0.0.1:7777)
 | `--port <n>` | TCP port to listen on (default 7777). |
 | `--stress-enemies <n>` | Hold `n` enemies live around the players. |
 | `--stress-projectiles <n>` | Hold `n` gun projectiles live as well. |
+| `--debug-loadout <spec>` | **Test affordance, not gameplay.** Start every run with the given loadout. |
 
 The stress flags are a **measurement tool**, not part of the game. The natural
 spawn curve of DESIGN.md §4 does not reach 1,000 live enemies until roughly
@@ -137,6 +139,34 @@ be measured against a real server. The load is placed around the players'
 centroid, so it only starts once somebody has joined, and it is held at exactly
 the requested counts — the top-up runs every tick, and also when a player
 joins, so even the first snapshot a client receives carries the full load.
+
+### The `--debug-loadout` test affordance
+
+`--debug-loadout` is a **test affordance, not part of the game** — it exists so
+the phase-5 completion criterion *"evolutions appear"* in a live client run can
+be observed at all. An evolution needs a level-8 weapon *and* its named passive
+at its max, roughly thirteen level-up picks, and a scripted run reaches level
+6–7 before dying (see the phase-3 integration check below), so no live run
+reaches one on its own. The flag starts a run already partway there, on every
+join and every restart, so a scripted restart exercises it too. Without the flag
+it is off, and the run's default loadout — the four level-1 weapons of
+DESIGN.md §3 — is unchanged.
+
+```sh
+zig build -Doptimize=ReleaseFast
+zig-out/bin/shaped-haven-server --debug-loadout "sword=8,clockwork_gear=5"
+```
+
+The spec is comma-separated `name=level` pairs. A name is a DESIGN.md §3 item
+name (lower-cased, spaces as underscores), the passive's `P0`–`P9` alias from
+PROTOCOL.md, or a decimal item id from PROTOCOL.md "Item ids" — so
+`"0=8,18=5"` is the same loadout as `"sword=8,clockwork_gear=5"`. Levels above
+an item's cap are clamped to it. Applying a loadout runs the same rule the
+level-up draft uses for evolutions (DESIGN.md §3): a weapon at level 8 whose
+named passive is at its max fuses into that evolution, so
+`"sword=8,clockwork_gear=5"` arms the Vorpal Blender and no separate syntax is
+needed to name one. A weapon slot fuses into the first evolution it qualifies
+for in DESIGN.md §3 order. An empty spec starts a run with the normal loadout.
 
 ## Status
 
@@ -185,6 +215,11 @@ The phase-3 systems are all still in:
 - **Death and restart.** HP reaching 0 ends the run (`game_state = 2` plus
   `S2C_GAME_OVER`); `C2S_RESTART` starts a fresh run.
 - **`S2C_LOADOUT`** whenever level, XP or the item set changes.
+- **A starting-loadout test affordance.** `--debug-loadout "sword=8,clockwork_gear=5"`
+  starts every run — every join and every restart — with that loadout, fusing
+  the evolution the draft would otherwise offer, so the phase-5 criterion
+  *"evolutions appear"* is observable in a live client run. It is a test
+  affordance, off unless the flag is given, and it is not gameplay.
 
 ### The delta protocol
 
@@ -378,4 +413,62 @@ multiplayer work — party-pooled XP, the synchronised party pause, per-player
 restart, and the catch-up initialisation for a player joining a run already in
 progress. The upgrade system, the XP gems, player death, the escalation and the
 delta protocol are all in.
+
+### The phase-5 starting-loadout affordance
+
+`--debug-loadout` is the test affordance described under
+[Server flags](#server-flags): it starts a run already holding a loadout, so the
+phase-5 criterion *"evolutions appear"* can be observed in a live client run
+rather than only in the smoke test. It is a test affordance, off unless the flag
+is given, and it is not gameplay.
+
+The live run: `zig build -Doptimize=ReleaseFast`, then in one foreground shell
+
+```sh
+cd E:/basegame
+bash scratch/p5-run.sh evo 6000 --debug-loadout "sword=8,clockwork_gear=5"
+```
+
+`scratch/p5-run.sh` starts
+`shaped-haven-server.exe --port 7891 --debug-loadout "sword=8,clockwork_gear=5"`,
+runs the real client at `E:/basegame/shaped-haven-client/build/bin/Release/shaped-haven-client.exe`
+with `--host 127.0.0.1 --port 7891 --name p5-evo --verbose --frames 6000
+--input-script scratch/p5_circle.txt --choice-script scratch/p5_choices.txt`,
+then stops the server. The server logs the affordance on startup:
+
+```text
+  DEBUG LOADOUT: sword=8,clockwork_gear=5   (TEST AFFORDANCE — NOT GAMEPLAY)
+[server] player 0 joined as 'p5-evo…'
+```
+
+and the client's per-frame `--verbose` line reports a non-zero `evos=` from the
+first line onwards — 6,000 frames in 41.84 s (143.4 fps), 100 verbose lines, all
+`evos=1`, `stale=0 staleoffers=0 malformed=0 qdropped=0 sendfail=0 ackretry=0`:
+
+```text
+haven: frame=60 tick=24 srv_tick=180 acked=18 pred=(4.74,0.00) err=0.010 interp=9 remotes=0 enemies=0 projs=0 gems=0 snaps=11 d=5/2 acks=11 ir=40 stale=0 staleoffers=0 malformed=0 inputs=24 qdropped=0 prewelcome=0 disconnected=0 sendfail=0 ackretry=0 reconciles=9 key=0 move=(100.00,0.00) state=0 level=1 xp=0/16 choices=0 evos=1 restarts=0 upd_ms=0.525
+haven: frame=6000 tick=2489 srv_tick=2649 acked=2483 pred=(21.72,39.66) err=0.008 interp=32 remotes=0 enemies=20 projs=14 gems=66 snaps=834 d=828/2 acks=834 ir=40 stale=0 staleoffers=0 malformed=0 inputs=2489 qdropped=0 prewelcome=0 disconnected=10 sendfail=0 ackretry=0 reconciles=832 key=1073742050 move=(-71.00,71.00) state=0 level=3 xp=22/38 choices=2 evos=1 restarts=0 upd_ms=1.383
+```
+
+`evos=` counts a weapon slot whose `evolved` byte rose, so `evos=1` is the
+Vorpal Blender the loadout arms — the level-8 sword fused with Clockwork Gear at
+its max — visible to the client in the `S2C_LOADOUT` sent on join.
+
+The control run, the same script with no flag, reports `evos=0` on every line:
+
+```sh
+bash scratch/p5-run.sh ctl 600
+# haven: frame=60 … level=1 xp=0/16 choices=0 evos=0 restarts=0 …
+# haven: 600 frames in 4.44s (135.1 fps)
+```
+
+The `--debug-loadout` spec resolves to the Vorpal Blender through the same rule
+the draft uses, which is pinned by `loadout.test.applying a loadout arms it and
+fuses the evolution` and by the sim-level tests
+`the debug loadout arms the requested loadout and its evolution`,
+`the debug loadout survives a restart` and
+`a run without the debug loadout keeps the default loadout`. The restart path
+itself — that the loadout is re-applied after a `C2S_RESTART` — is covered by
+that sim test; the live runs above do not reach a game over, so no live restart
+was observed.
 

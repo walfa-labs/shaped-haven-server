@@ -201,6 +201,20 @@ pub fn evolutionById(id: u8) ?Evolution {
     return null;
 }
 
+/// Fuse `slot` into `evo`: the whole mutation, in one place.
+///
+/// Both the level-up draft (`sim.applyOption`) and the debug loadout arm an
+/// evolution, and a second copy of this would drift the moment either grew a
+/// field — the draft clears the pending swing timers, and a loadout that forgot
+/// to would arm a weapon mid-swing.
+pub fn fuseInto(slot: *WeaponSlot, evo: Evolution) void {
+    slot.id = evo.id;
+    slot.evolved = true;
+    slot.level = root.max_weapon_level;
+    slot.pending_slashes = 0;
+    slot.pending_timer = 0;
+}
+
 /// The evolution `weapon_id` + `passive_id` fuse into, or `null`.
 pub fn evolutionFor(weapon_id: u8, passive_id: u8) ?Evolution {
     for (evolutions) |e| {
