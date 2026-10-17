@@ -7,24 +7,32 @@
 //! an estimate.
 //!
 //! What is measured: the frames the server's snapshot path actually produces —
-//! `wire.encodeSnapshotDelta` / `wire.encodeSnapshotFull` over the real diff —
+//! `wire.encodeSnapshotDelta` / `wire.encodeSnapshotFull` over the real diff,
+//! through the same per-snapshot budget and update rotation the server uses —
 //! counted over the run and divided by the run's duration. The phase-2 bench
 //! times `Simulation.advance`; this times nothing, it just counts the bytes
 //! the encoder emits, which is the quantity the DoD is about.
 //!
+//! Mean *and* peak. The DoD is a bound on the run, not on its average, so the
+//! test asserts both. Asserting only the mean is what let a peak 40% over
+//! budget stand: the mean was inside it while a single frame was not.
+//!
 //! The world. 2,500 enemies held at the 20:00 difficulty (`M_HP(20) = 73x`),
 //! spread over a disc around the player. The spread is the point: interest
 //! management is what keeps the wire bounded, so the 2,500 enemies must be
-//! spread out enough that only a neighbourhood of them is inside the 50-unit
-//! interest radius. A disc of `spread_radius` around the player holds them at
-//! a realistic density without piling all 2,500 on top of the player, which is
+//! spread out enough that only a neighbourhood of them is inside the interest
+//! radius. A disc of `spread_radius` around the player holds them at a
+//! realistic density without piling all 2,500 on top of the player, which is
 //! the case interest management exists to avoid. The player is armed and
 //! invulnerable so the kill rate keeps the neighbourhood from growing without
 //! bound over the run.
 //!
-//! Run it in a release build — a Debug build's safety checks dominate:
+//! Run it in both build modes. The bytes on the wire are the same either way —
+//! the encoder is deterministic and so is the world — so the budget is asserted
+//! in both, and both numbers are reported:
 //!
 //! ```sh
+//! zig build test
 //! zig build test -Doptimize=ReleaseFast
 //! ```
 
@@ -65,8 +73,18 @@ pub const Report = struct {
     max_frame_bytes: u64,
     /// The quantity the DoD is about: bytes per second at 20 Hz.
     bytes_per_s: f64,
-    /// Peak bytes per second, from the largest single frame.
+    /// Peak bytes per second of the *sustained* stream: the largest delta frame
+    /// at 20 Hz. The DoD bounds the run, not its average, and the steady-state
+    /// stream is what the run is made of.
+    ///
+    /// A connection's first snapshot is a full one, because it has no baseline
+    /// to be diffed against; it carries the whole neighbourhood, is not bounded
+    /// by the per-snapshot budget, and happens once. Its size is reported as
+    /// `full_frame_bytes` rather than folded in here.
     peak_bytes_per_s: f64,
+    /// The one full snapshot the run opens with, in bytes. Reported so the
+    /// uncapped frame stays visible instead of hidden.
+    full_frame_bytes: u64,
     /// Mean live enemies and mean in-interest enemies over the run. Evidence
     /// that the load was real and that interest management was doing the work.
     mean_live_enemies: f64,
@@ -80,11 +98,19 @@ pub const Report = struct {
     mean_proj_updated: f64,
     mean_gem_updated: f64,
     mean_enemy_updated: f64,
+    /// Updated records the per-snapshot budget could not carry.
+    mean_deferred: f64,
+    /// Refresh latency the budget imposes: how many snapshots an entity that
+    /// needed an update waited for one, averaged over every update the run sent.
+    mean_refresh_snapshots: f64,
+    worst_refresh_snapshots: u32,
     kills: u32,
     mode: []const u8,
 
+    /// Both halves of the DoD: the mean is what the run costs and the peak is
+    /// what it costs at its worst, and the budget bounds both.
     pub fn passes(self: Report) bool {
-        return self.bytes_per_s < budget_bytes_per_s;
+        return self.bytes_per_s < budget_bytes_per_s and self.peak_bytes_per_s < budget_bytes_per_s;
     }
 };
 
@@ -118,17 +144,35 @@ pub fn run(gpa: std.mem.Allocator) !Report {
 
     var total_bytes: u64 = 0;
     var max_frame_bytes: u64 = 0;
+    var max_delta_frame_bytes: u64 = 0;
+    var full_frame_bytes: u64 = 0;
     var snapshots: usize = 0;
     var sum_enemies: usize = 0;
     var sum_interest: usize = 0;
     var sum_spawned: usize = 0;
     var sum_updated: usize = 0;
     var sum_destroyed: usize = 0;
+    var sum_deferred: usize = 0;
     var sum_proj_updated: usize = 0;
     var sum_gem_updated: usize = 0;
     var sum_enemy_updated: usize = 0;
     var baseline_tick: u32 = 0;
     var input_seq: u32 = 1;
+    // The connection's update rotation, advanced exactly as the server advances
+    // it, so this measures the real encoder path.
+    var rotation: u32 = 0;
+
+    // Refresh latency: an entity that needed an update and did not get one this
+    // snapshot carries its wait into the next. `waiting` is rebuilt from the
+    // candidate set every snapshot, so an entity that stops needing updates
+    // drops out instead of banking a stale count.
+    var waiting = std.AutoHashMap(u32, u32).init(gpa);
+    defer waiting.deinit();
+    var next_waiting = std.AutoHashMap(u32, u32).init(gpa);
+    defer next_waiting.deinit();
+    var sum_refresh: u64 = 0;
+    var count_refresh: u64 = 0;
+    var worst_refresh: u32 = 0;
 
     i = 0;
     while (i < measure_ticks) : (i += 1) {
@@ -157,17 +201,23 @@ pub fn run(gpa: std.mem.Allocator) !Report {
         var n_destroyed: usize = 0;
         var frame: []u8 = undefined;
         if (baseline_tick == 0) {
-            // No baseline yet: a full snapshot of the neighbourhood.
+            // No baseline yet: a full snapshot of the neighbourhood. Not bounded
+            // by the per-snapshot budget — it is the state the client starts
+            // from — so it is measured separately from the sustained stream.
             const full = s.snapshotViewFor(player.pos, root.interest_radius);
             frame = try wire.encodeSnapshotFull(gpa, full);
+            full_frame_bytes = frame.len;
         } else {
-            // The steady state: a delta against the snapshot the client last
-            // acknowledged, which is the one before this.
+            // The steady state: a delta against the snapshot the client is
+            // holding, which is the one before this.
             const base = ring.baseline(baseline_tick).?;
-            const d = delta.computeDelta(current, base, player.pos, root.interest_radius, &scratch);
+            const d = delta.computeDelta(current, base, player.pos, root.interest_radius, .{
+                .rotation = rotation,
+            }, &scratch);
             n_spawned = d.spawned.len;
             n_updated = d.updated.len;
             n_destroyed = d.destroyed.len;
+            sum_deferred += d.deferred;
             for (d.updated) |r| {
                 switch (r.kindByte()) {
                     wire.kind.projectile => sum_proj_updated += 1,
@@ -176,6 +226,29 @@ pub fn run(gpa: std.mem.Allocator) !Report {
                     else => {},
                 }
             }
+
+            // Refresh latency, over the records the diff found changed.
+            next_waiting.clearRetainingCapacity();
+            for (d.candidates) |c| {
+                const id = c.recordId();
+                var sent = false;
+                for (d.updated) |u| {
+                    if (u.recordId() == id) {
+                        sent = true;
+                        break;
+                    }
+                }
+                const waited = waiting.get(id) orelse 0;
+                if (sent) {
+                    sum_refresh += waited;
+                    count_refresh += 1;
+                    worst_refresh = @max(worst_refresh, waited);
+                } else {
+                    try next_waiting.put(id, waited + 1);
+                }
+            }
+            std.mem.swap(std.AutoHashMap(u32, u32), &waiting, &next_waiting);
+
             frame = try wire.encodeSnapshotDelta(gpa, .{
                 .server_tick = view.server_tick,
                 .baseline_tick = base.tick,
@@ -186,6 +259,8 @@ pub fn run(gpa: std.mem.Allocator) !Report {
                 .updated = d.updated,
                 .destroyed = d.destroyed,
             });
+            rotation +%= @intCast(d.updated.len);
+            max_delta_frame_bytes = @max(max_delta_frame_bytes, frame.len);
         }
         defer gpa.free(frame);
 
@@ -209,8 +284,9 @@ pub fn run(gpa: std.mem.Allocator) !Report {
         .max_frame_bytes = max_frame_bytes,
         // 20 Hz: each snapshot is one twentieth of a second of wire time.
         .bytes_per_s = mean_frame * @as(f64, @floatFromInt(root.snapshot_hz)),
-        .peak_bytes_per_s = @as(f64, @floatFromInt(max_frame_bytes)) *
+        .peak_bytes_per_s = @as(f64, @floatFromInt(max_delta_frame_bytes)) *
             @as(f64, @floatFromInt(root.snapshot_hz)),
+        .full_frame_bytes = full_frame_bytes,
         .mean_live_enemies = @as(f64, @floatFromInt(sum_enemies)) / fsnapshots,
         .mean_in_interest = @as(f64, @floatFromInt(sum_interest)) / fsnapshots,
         .mean_spawned = @as(f64, @floatFromInt(sum_spawned)) / fsnapshots,
@@ -219,6 +295,10 @@ pub fn run(gpa: std.mem.Allocator) !Report {
         .mean_proj_updated = @as(f64, @floatFromInt(sum_proj_updated)) / fsnapshots,
         .mean_gem_updated = @as(f64, @floatFromInt(sum_gem_updated)) / fsnapshots,
         .mean_enemy_updated = @as(f64, @floatFromInt(sum_enemy_updated)) / fsnapshots,
+        .mean_deferred = @as(f64, @floatFromInt(sum_deferred)) / fsnapshots,
+        .mean_refresh_snapshots = @as(f64, @floatFromInt(sum_refresh)) /
+            @as(f64, @floatFromInt(@max(count_refresh, 1))),
+        .worst_refresh_snapshots = worst_refresh,
         .kills = s.kills,
         .mode = @tagName(builtin.mode),
     };
@@ -278,11 +358,14 @@ test "2,500 enemies at 20:00 stay inside the 25 KB/s bandwidth budget" {
 
     std.debug.print(
         "\n[bandwidth] {s} build, {d} snapshots with {d} enemies at 20:00: " ++
-            "mean {d:.1} bytes/s, peak {d:.1} bytes/s (budget {d:.0} bytes/s)\n" ++
-            "[bandwidth] mean frame {d:.0} bytes, worst {d:.0} bytes; " ++
-            "live during the run: {d:.0} enemies, {d:.0} in interest; {d} kills\n" ++
+            "mean {d:.1} bytes/s, peak delta {d:.1} bytes/s (budget {d:.0} bytes/s)\n" ++
+            "[bandwidth] mean frame {d:.0} bytes, worst frame {d:.0} bytes " ++
+            "(the one-off opening full snapshot is {d} bytes)\n" ++
+            "[bandwidth] live during the run: {d:.0} enemies, {d:.0} in interest; {d} kills\n" ++
             "[bandwidth] per snapshot: {d:.1} spawned, {d:.1} updated " ++
-                "({d:.0} enemies, {d:.0} projs, {d:.0} gems), {d:.1} destroyed\n",
+                "({d:.0} enemies, {d:.0} projs, {d:.0} gems), {d:.1} destroyed, " ++
+                "{d:.1} deferred by the budget\n" ++
+            "[bandwidth] refresh latency: mean {d:.2} snapshots, worst {d} snapshots\n",
         .{
             report.mode,
             report.snapshots,
@@ -292,6 +375,7 @@ test "2,500 enemies at 20:00 stay inside the 25 KB/s bandwidth budget" {
             budget_bytes_per_s,
             report.mean_frame_bytes,
             report.max_frame_bytes,
+            report.full_frame_bytes,
             report.mean_live_enemies,
             report.mean_in_interest,
             report.kills,
@@ -301,6 +385,9 @@ test "2,500 enemies at 20:00 stay inside the 25 KB/s bandwidth budget" {
             report.mean_proj_updated,
             report.mean_gem_updated,
             report.mean_destroyed,
+            report.mean_deferred,
+            report.mean_refresh_snapshots,
+            report.worst_refresh_snapshots,
         },
     );
 
@@ -314,16 +401,29 @@ test "2,500 enemies at 20:00 stay inside the 25 KB/s bandwidth budget" {
     try std.testing.expect(report.kills > 0);
     // ... and interest management was actually excluding most of the horde.
     try std.testing.expect(report.mean_in_interest < enemy_count / 2);
+    // ... and the budget was actually binding, so this is a measurement of the
+    // cap rather than of a world that never reached it.
+    try std.testing.expect(report.mean_deferred > 0.0);
+    // ... and the opening full snapshot is a one-off, so leaving it out of the
+    // sustained peak is not a way of hiding a frame that repeats.
+    try std.testing.expect(report.full_frame_bytes > 0);
 
-    // The budget is only meaningful in a release build: Debug keeps bounds
-    // checks and panics on every array access, which is a different order of
-    // cost. The looser Debug bound still catches a pathological regression.
-    const limit = if (builtin.mode == .debug) budget_bytes_per_s * 4.0 else budget_bytes_per_s;
-    if (report.bytes_per_s >= limit) {
+    // The DoD is a bound on the run, not on its average: asserting the mean
+    // alone is what let a peak 40% over budget pass. Both are checked, and in
+    // every build mode — the bytes the encoder puts on the wire do not depend on
+    // how fast the build that computed them runs.
+    if (!report.passes()) {
         std.debug.print(
-            "[bandwidth] FAIL: {d:.1} bytes/s exceeds the {d:.0} bytes/s limit for this build mode\n",
-            .{ report.bytes_per_s, limit },
+            "[bandwidth] FAIL: mean {d:.1} bytes/s, peak delta {d:.1} bytes/s against the {d:.0} bytes/s budget\n",
+            .{ report.bytes_per_s, report.peak_bytes_per_s, budget_bytes_per_s },
         );
         return error.BandwidthBudgetExceeded;
     }
+
+    // The budget is only honest if it does not starve the world it carries: an
+    // entity in interest must still be refreshed within a bounded number of
+    // snapshots. The rotation advances by what each snapshot sent, so the bound
+    // is `ceil(candidates / per-snapshot records)` — a handful, not "never".
+    try std.testing.expect(report.worst_refresh_snapshots <= 4);
+    try std.testing.expect(report.mean_refresh_snapshots < 2.0);
 }

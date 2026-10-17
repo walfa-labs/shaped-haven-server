@@ -57,6 +57,16 @@ pub const interest_radius: f32 = 40.0;
 /// Number of simulation ticks between snapshots.
 pub const ticks_per_snapshot: u32 = tick_hz / snapshot_hz;
 
+/// Wire budget for one delta snapshot frame, in bytes.
+///
+/// DESIGN.md §6 sets the phase-4 definition of done at *"bandwidth stays under
+/// 25 KB/s during a 2,500-enemy 20:00 stress test"*. At the 20 Hz snapshot rate
+/// that is 1,250 bytes per snapshot; this takes 80% of it, so a single frame —
+/// not merely the mean of many — stays inside the budget, with the remainder
+/// left as headroom for the full snapshots a connection starts on and for the
+/// `spawned`/`destroyed` records, which are never dropped to fit.
+pub const snapshot_budget_bytes: usize = 1000;
+
 /// Player movement speed in units per second (DESIGN.md §1).
 pub const move_speed: f32 = 12.0;
 

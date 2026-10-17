@@ -109,6 +109,10 @@ pub const DiffScratch = struct {
     spawned: [max_total]wire.DeltaRecord = undefined,
     updated: [max_total]wire.DeltaRecord = undefined,
     destroyed: [max_total]DestroyedRef = undefined,
+    /// Holds the rotating window while `updated` is being trimmed to the
+    /// per-snapshot budget. Separate from `updated` because the selection reads
+    /// and writes the same array.
+    selected: [max_total]wire.DeltaRecord = undefined,
     n_spawned: usize = 0,
     n_updated: usize = 0,
     n_destroyed: usize = 0,
@@ -119,20 +123,107 @@ pub const Delta = struct {
     spawned: []wire.DeltaRecord,
     updated: []wire.DeltaRecord,
     destroyed: []DestroyedRef,
+    /// Every record the diff found changed, before the per-snapshot budget
+    /// trimmed `updated`. Not a set the encoder reads — it is the measure of
+    /// what the budget left out, so a caller can report the refresh latency the
+    /// budget imposes.
+    candidates: []wire.DeltaRecord,
+    /// Updated records the per-snapshot budget could not carry. They are not
+    /// lost: the rotation starts the next snapshot just past this one, so they
+    /// go out next time.
+    deferred: usize,
 };
+
+// ---------------------------------------------------------------------------
+// Per-snapshot budget
+// ---------------------------------------------------------------------------
+
+/// Bytes a delta spends before any record: the frame header and the 37-byte
+/// snapshot header.
+pub const overhead_bytes: usize = wire.header_size + wire.snapshot_header_wire_size;
+
+/// Wire cost of one `spawned` record: the kind byte and the full record.
+pub fn spawnedBytes(r: wire.DeltaRecord) usize {
+    return 1 + r.recordSize();
+}
+
+/// Wire cost of one `updated` record: the kind byte, the id and the record.
+pub fn updatedBytes(r: wire.DeltaRecord) usize {
+    return 1 + @sizeOf(u32) + r.recordSize();
+}
+
+/// Wire cost of one `destroyed` record: the kind byte and the id.
+pub const destroyed_bytes: usize = 1 + @sizeOf(u32);
+
+/// How many `updated` records one snapshot may carry, and where its window into
+/// the in-interest set starts.
+pub const Budget = struct {
+    /// Bytes the whole frame may spend, from `root.snapshot_budget_bytes`.
+    total_bytes: usize = root.snapshot_budget_bytes,
+    /// Rotating start offset into the updated array. Carried per connection and
+    /// advanced by however many records were actually sent, so successive
+    /// snapshots tile the in-interest set instead of sending the same head of it
+    /// every time and starving the tail.
+    rotation: u32 = 0,
+};
+
+/// Select the updated records this snapshot can afford, in rotating order.
+///
+/// `spawned` and `destroyed` are correctness-critical — an entity the client
+/// does not know about, or one it thinks still exists, is worse than a stale
+/// position — so they are never dropped and their bytes come out of the budget
+/// first. What is left pays for `updated` records, taken as one contiguous
+/// window starting at `budget.rotation` and wrapping: the entities left out are
+/// the ones the next snapshot starts with, so every entity in interest is
+/// refreshed within `ceil(n / k)` snapshots rather than never.
+///
+/// Returns how many records were selected and how many were left over.
+fn selectUpdated(
+    updated: []wire.DeltaRecord,
+    spawned: []const wire.DeltaRecord,
+    destroyed: []const DestroyedRef,
+    budget: Budget,
+    scratch: *DiffScratch,
+) struct { sent: usize, deferred: usize } {
+    if (updated.len == 0) return .{ .sent = 0, .deferred = 0 };
+
+    var spent = overhead_bytes;
+    for (spawned) |r| spent += spawnedBytes(r);
+    spent += destroyed.len * destroyed_bytes;
+
+    const available = budget.total_bytes -| spent;
+    const start = budget.rotation % updated.len;
+
+    var sent: usize = 0;
+    var used: usize = 0;
+    while (sent < updated.len) : (sent += 1) {
+        const r = updated[(start + sent) % updated.len];
+        const cost = updatedBytes(r);
+        // Stop at the first record that does not fit rather than skipping it:
+        // the window stays contiguous, which is what makes the coverage bound
+        // above hold.
+        if (used + cost > available) break;
+        used += cost;
+        scratch.selected[sent] = r;
+    }
+
+    @memcpy(updated[0..sent], scratch.selected[0..sent]);
+    return .{ .sent = sent, .deferred = updated.len - sent };
+}
 
 /// Diff the current world against a baseline, for one receiver.
 ///
 /// `current` is the whole world at the current tick (a ring slot, stored this
-/// broadcast); `baseline` is the whole world at the client's acknowledged tick.
-/// Both are filtered to the receiver's interest radius, so the delta carries
-/// only the neighbourhood and the client's held state stays a faithful subset
-/// of it.
+/// broadcast); `baseline` is the whole world at the tick the client is expected
+/// to hold. Both are filtered to the receiver's interest radius, so the delta
+/// carries only the neighbourhood and the client's held state stays a faithful
+/// subset of it.
 pub fn computeDelta(
     current: *const RingSlot,
     baseline: *const RingSlot,
     centre: [2]f32,
     radius: f32,
+    budget: Budget,
     scratch: *DiffScratch,
 ) Delta {
     scratch.n_spawned = 0;
@@ -144,10 +235,20 @@ pub fn computeDelta(
     diffKind(wire.kind.projectile, current, baseline, centre, radius, scratch);
     diffKind(wire.kind.gem, current, baseline, centre, radius, scratch);
 
+    const updated = scratch.updated[0..scratch.n_updated];
+    const spawned = scratch.spawned[0..scratch.n_spawned];
+    const destroyed = scratch.destroyed[0..scratch.n_destroyed];
+    // `selectUpdated` rewrites the head of `updated` with the rotating window,
+    // which is a subset of it, so the full candidate set survives the trim.
+    const candidates = updated;
+    const kept = selectUpdated(updated, spawned, destroyed, budget, scratch);
+
     return .{
-        .spawned = scratch.spawned[0..scratch.n_spawned],
-        .updated = scratch.updated[0..scratch.n_updated],
-        .destroyed = scratch.destroyed[0..scratch.n_destroyed],
+        .spawned = spawned,
+        .updated = updated[0..kept.sent],
+        .destroyed = destroyed,
+        .candidates = candidates,
+        .deferred = kept.deferred,
     };
 }
 
@@ -340,6 +441,10 @@ test "a baseline that falls out of the 32-snapshot window is refused" {
     try std.testing.expect(ring.baseline(30) == null);
 }
 
+/// A budget large enough that every updated record fits, for the tests that are
+/// about the diff itself rather than about the budget.
+const unlimited = Budget{ .total_bytes = std.math.maxInt(usize) };
+
 /// An empty whole-world view at `tick`, for the ring tests.
 fn emptyView(tick: u32) wire.SnapshotView {
     return .{
@@ -372,7 +477,7 @@ test "a diff reports spawned, updated and destroyed by entity id" {
     cur.enemies[1] = enemySlot(0, 3, .{ 30.0, 0.0 }).enemies[0]; // new
 
     var scratch = DiffScratch{};
-    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 100.0, &scratch);
+    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 100.0, unlimited, &scratch);
 
     // Enemy 3 is new, enemy 2 left, enemy 1 moved.
     try std.testing.expectEqual(@as(usize, 1), d.spawned.len);
@@ -403,7 +508,7 @@ test "interest management filters both sides of the diff to the radius" {
     var scratch = DiffScratch{};
     // A 50-unit radius around the origin: enemy 2 is outside on both sides, so
     // it is not in the diff at all.
-    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 50.0, &scratch);
+    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 50.0, unlimited, &scratch);
 
     // Spawned: enemy 3 (entered). Updated: enemy 1 (moved). Destroyed: none —
     // enemy 2 was never inside the radius, so it is not destroyed either.
@@ -420,7 +525,7 @@ test "an entity leaving the interest radius is destroyed" {
     var cur = enemySlot(30, 1, .{ 500.0, 0.0 });
 
     var scratch = DiffScratch{};
-    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 50.0, &scratch);
+    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 50.0, unlimited, &scratch);
 
     // Enemy 1 was inside the baseline radius and is outside the current one:
     // destroyed, not updated.
@@ -436,10 +541,99 @@ test "an unchanged record is not sent" {
     var cur = enemySlot(30, 1, .{ 10.0, 0.0 });
 
     var scratch = DiffScratch{};
-    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 50.0, &scratch);
+    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 50.0, unlimited, &scratch);
 
     // Nothing changed, so the delta is empty.
     try std.testing.expectEqual(@as(usize, 0), d.spawned.len);
     try std.testing.expectEqual(@as(usize, 0), d.updated.len);
     try std.testing.expectEqual(@as(usize, 0), d.destroyed.len);
+}
+
+/// A slot holding `n` enemies at `tick`, all inside the interest radius, each at
+/// a distinct position offset by `shift` so a pair of these differ everywhere.
+fn enemyLineSlot(tick: u32, n: usize, shift: f32) RingSlot {
+    var slot = RingSlot{};
+    slot.tick = tick;
+    slot.counts = .{ 0, @intCast(n), 0, 0 };
+    for (0..n) |i| {
+        const f: f32 = @floatFromInt(i);
+        slot.enemies[i] = enemySlot(0, @intCast(i + 1), .{ f + shift, shift }).enemies[0];
+    }
+    return slot;
+}
+
+test "the per-snapshot budget caps how many records one delta carries" {
+    // 100 enemies, all moved, and a budget that pays for exactly ten of them:
+    // 44 bytes of headers plus 10 x (1 kind + 4 id + 12 record).
+    const n = 100;
+    const base = enemyLineSlot(27, n, 0.0);
+    const cur = enemyLineSlot(30, n, 1.0);
+
+    const budget_bytes = overhead_bytes + 10 * updatedBytes(.{ .enemy = cur.enemies[0] });
+    var scratch = DiffScratch{};
+    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 1000.0, .{
+        .total_bytes = budget_bytes,
+    }, &scratch);
+
+    try std.testing.expectEqual(@as(usize, 10), d.updated.len);
+    try std.testing.expectEqual(@as(usize, 90), d.deferred);
+    // What it did carry is within the budget, which is the whole point.
+    try std.testing.expect(overhead_bytes + 10 * 17 <= budget_bytes);
+}
+
+test "the rotation refreshes every entity within a bounded number of snapshots" {
+    // 100 moved enemies, a budget for 10 per snapshot, so ten snapshots must
+    // cover all of them. Without the rotation the head of the list would go out
+    // every time and the last ninety would never be refreshed at all.
+    const n = 100;
+    const base = enemyLineSlot(27, n, 0.0);
+    const cur = enemyLineSlot(30, n, 1.0);
+    const per_snapshot = 10;
+    const budget_bytes = overhead_bytes + per_snapshot * updatedBytes(.{ .enemy = cur.enemies[0] });
+
+    var scratch = DiffScratch{};
+    var seen = std.mem.zeroes([n]bool);
+    var rotation: u32 = 0;
+    var snapshot: usize = 0;
+    while (snapshot < 10) : (snapshot += 1) {
+        const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 1000.0, .{
+            .total_bytes = budget_bytes,
+            .rotation = rotation,
+        }, &scratch);
+        try std.testing.expectEqual(@as(usize, per_snapshot), d.updated.len);
+        for (d.updated) |r| seen[r.recordId() - 1] = true;
+        rotation +%= @intCast(d.updated.len);
+    }
+
+    for (seen) |s| try std.testing.expect(s);
+}
+
+test "spawned and destroyed records are never dropped to fit the budget" {
+    // Baseline: enemy 1 at (10, 0), enemy 3 at (30, 0). Current: enemy 1 moved,
+    // enemy 2 new, enemy 3 gone.
+    var base = RingSlot{};
+    base.tick = 27;
+    base.counts = .{ 0, 2, 0, 0 };
+    base.enemies[0] = enemySlot(0, 1, .{ 10.0, 0.0 }).enemies[0];
+    base.enemies[1] = enemySlot(0, 3, .{ 30.0, 0.0 }).enemies[0];
+
+    var cur = RingSlot{};
+    cur.tick = 30;
+    cur.counts = .{ 0, 2, 0, 0 };
+    cur.enemies[0] = enemySlot(0, 1, .{ 11.0, 0.0 }).enemies[0];
+    cur.enemies[1] = enemySlot(0, 2, .{ 20.0, 0.0 }).enemies[0];
+
+    var scratch = DiffScratch{};
+    // A budget far too small for even the headers: the correctness-critical
+    // records still go, and only the update is deferred.
+    const d = computeDelta(&cur, &base, .{ 0.0, 0.0 }, 50.0, .{
+        .total_bytes = 1,
+    }, &scratch);
+
+    try std.testing.expectEqual(@as(usize, 1), d.spawned.len);
+    try std.testing.expectEqual(@as(u32, 2), d.spawned[0].recordId());
+    try std.testing.expectEqual(@as(usize, 1), d.destroyed.len);
+    try std.testing.expectEqual(@as(u32, 3), d.destroyed[0].id);
+    try std.testing.expectEqual(@as(usize, 0), d.updated.len);
+    try std.testing.expectEqual(@as(usize, 1), d.deferred);
 }

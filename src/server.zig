@@ -77,11 +77,15 @@ const max_queued_bytes: usize = 256 * 1024;
 pub const unassigned_player: u8 = 0xff;
 
 /// A decoded client message, queued for the simulation thread.
+///
+/// `C2S_ACK_SNAPSHOT` is deliberately not here: an acknowledgement is pure
+/// connection state, never simulation state, and the broadcast has to be able
+/// to see the newest one at the instant it encodes. See
+/// `ClientConn.last_recv_server_tick`.
 pub const Incoming = union(enum) {
     hello: wire.Hello,
     input: wire.Input,
     levelup_choice: wire.LevelupChoice,
-    ack_snapshot: u32,
     restart: void,
 };
 
@@ -144,8 +148,32 @@ pub const ClientConn = struct {
     accum_offset: usize = 0,
     name: [16]u8 = std.mem.zeroes([16]u8),
     session_token: u64 = 0,
-    /// Last `server_tick` this client acknowledged; drives FULL vs DELTA later.
-    last_recv_server_tick: u32 = 0,
+    /// Newest `server_tick` this client has acknowledged, and the tick it is
+    /// expected to hold a complete state for.
+    ///
+    /// Both are written by the reader thread the instant an ack is decoded, not
+    /// queued for the simulation thread: an acknowledgement is pure connection
+    /// state, and the encoder has to see the freshest one the server has
+    /// processed *at the moment it encodes*.
+    ///
+    /// The acknowledgement alone cannot name the baseline. The client only
+    /// flushes an ack when the next snapshot lands, so the ack for tick N
+    /// reaches the server a few hundred microseconds *after* the broadcast for
+    /// N+3 has been built; a delta diffed against it names a tick the client
+    /// left a whole snapshot ago, and the client refuses it under PROTOCOL.md
+    /// "Baseline rules". Measured against the real client over a live run, 48%
+    /// of every delta was refused that way. So the server carries the tick
+    /// forward itself: a client holds exactly one complete state and moves it to
+    /// any snapshot it applies, so `held_tick` advances to each snapshot's own
+    /// tick as that snapshot is sent, and the acknowledgement is what corrects
+    /// the model whenever the two ever disagree.
+    acked_tick: std.atomic.Value(u32) = .init(0),
+    held_tick: std.atomic.Value(u32) = .init(0),
+    /// Where this connection's per-snapshot update budget starts inside the
+    /// in-interest set. Advanced by the number of records each snapshot actually
+    /// carried, so the entities one snapshot could not afford lead the next.
+    /// The simulation thread is its only writer.
+    update_rotation: u32 = 0,
 
     /// Set when the connection must stop: the peer closed, a read or write
     /// failed, or the server decided the connection is unusable. Written by
@@ -175,6 +203,31 @@ pub const ClientConn = struct {
         c.outgoing.deinit(gpa);
         gpa.free(c.read_buf);
         gpa.free(c.write_buf);
+    }
+
+    /// Record an acknowledgement of `tick`, correcting the held-state model.
+    ///
+    /// Caller holds the lock. Called from the reader thread as the ack is
+    /// decoded, so the correction is in place before the next frame is encoded.
+    pub fn noteAck(c: *ClientConn, tick: u32) void {
+        const previous = c.acked_tick.swap(tick, .acq_rel);
+        const held = c.held_tick.load(.acquire);
+        // The held state only ever moves forward, so an ack ahead of the model
+        // means the model was behind the client. An ack that repeats while the
+        // model is ahead means the client refused the delta the model expected
+        // it to apply and is re-acknowledging the state it does hold: that is
+        // the correction which stops a drifted model from refusing forever.
+        if (tick > held or (tick == previous and tick != held)) {
+            c.held_tick.store(tick, .release);
+        }
+    }
+
+    /// Drop the held-state model: the run it described has ended.
+    ///
+    /// Caller holds the lock.
+    pub fn forgetRun(c: *ClientConn) void {
+        c.acked_tick.store(0, .release);
+        c.held_tick.store(0, .release);
     }
 };
 
@@ -498,17 +551,31 @@ pub const Server = struct {
         }
     }
 
-    /// Encode the one snapshot this connection wants: a delta against its
-    /// acknowledged baseline, or a full snapshot of its neighbourhood when it
-    /// has no baseline the ring still holds.
+    /// Encode the one snapshot this connection wants: a delta against the tick
+    /// its client is expected to hold, or a full snapshot of its neighbourhood
+    /// when there is no such baseline the ring still holds.
     fn snapshotFrame(self: *Server, conn: *ClientConn, current: *const delta.RingSlot) !*Frame {
         const centre = self.sim.players[conn.player_id].pos;
-        const baseline = self.snapshots.baseline(conn.last_recv_server_tick);
+        const tick = self.sim.tick;
+
+        // Read at the moment of encoding, not at the top of the tick: an ack
+        // that landed while the tick was being simulated is exactly the one
+        // this frame should be diffed against.
+        var held = conn.held_tick.load(.acquire);
+        if (held > tick) {
+            // A restart took the server's tick back to zero, so a tick held
+            // from the dead run names nothing this client has any more.
+            held = 0;
+            conn.held_tick.store(0, .release);
+        }
+        const baseline = self.snapshots.baseline(held);
 
         if (baseline) |base| {
-            const d = delta.computeDelta(current, base, centre, root.interest_radius, self.diff_scratch);
+            const d = delta.computeDelta(current, base, centre, root.interest_radius, .{
+                .rotation = conn.update_rotation,
+            }, self.diff_scratch);
             const bytes = wire.encodeSnapshotDelta(self.gpa, .{
-                .server_tick = self.sim.tick,
+                .server_tick = tick,
                 .baseline_tick = base.tick,
                 .run_time_ms = self.sim.runTimeMs(),
                 .acked_seq = self.sim.ackedSeq(),
@@ -517,11 +584,22 @@ pub const Server = struct {
                 .updated = d.updated,
                 .destroyed = d.destroyed,
             }) catch |e| return e;
+            // The client moves its one complete state onto a delta it applies,
+            // which is every delta diffed against what it holds.
+            conn.held_tick.store(tick, .release);
+            // Start the next snapshot where this one stopped, so the entities
+            // the budget deferred lead the next window instead of trailing it
+            // forever.
+            conn.update_rotation +%= @intCast(d.updated.len);
             return frameOrFree(self.gpa, bytes);
         }
 
         const full = self.sim.snapshotViewFor(centre, root.interest_radius);
         const bytes = wire.encodeSnapshotFull(self.gpa, full) catch |e| return e;
+        // A full snapshot replaces the client's state outright. While nothing
+        // has been acknowledged the model stays at zero, so the connection keeps
+        // getting full snapshots until the client has proved it is holding one.
+        if (held != 0) conn.held_tick.store(tick, .release);
         return frameOrFree(self.gpa, bytes);
     }
 
@@ -675,9 +753,13 @@ fn dispatch(self: *Server, conn: *ClientConn, message: Incoming) void {
         .restart => {
             if (conn.player_id == unassigned_player) return;
             self.sim.restart(conn.player_id);
-        },
-        .ack_snapshot => |server_tick| {
-            conn.last_recv_server_tick = server_tick;
+            // The run's tick goes back to zero, so every connection's
+            // held-state model names a tick of the dead run. Left alone, a model
+            // whose tick happened to coincide with the new run's would diff
+            // against it, and the client — which drops its own baseline with the
+            // run — refuses a delta whose baseline it does not hold *without
+            // acknowledging*, so the two could never re-converge.
+            for (self.clients.items) |c| c.forgetRun();
         },
     }
 }
@@ -1107,21 +1189,31 @@ fn accumulateAndParse(self: *Server, conn: *ClientConn, bytes: []const u8) bool 
     return true;
 }
 
-/// Decode one client frame and queue it for the simulation thread.
+/// Decode one client frame and hand it to the right consumer.
 ///
-/// Every message type goes through the queue, including `C2S_HELLO`: the
+/// Simulation messages go through the queue, including `C2S_HELLO`: the
 /// simulation is only ever touched by the simulation thread, so a reader thread
 /// can never be applying an input while a step is integrating.
+///
+/// `C2S_ACK_SNAPSHOT` is the exception. It names no simulation state at all —
+/// it only tells the server which tick this connection holds — and the
+/// broadcast has to see the newest one at the instant it encodes, so it is
+/// stored here, under the lock, the moment it is decoded.
 fn routeClient(self: *Server, conn: *ClientConn, msg_type: u8, payload: []const u8) void {
+    if (msg_type == wire.msg.c2s_ack_snapshot) {
+        const ack = wire.decodePayload(wire.AckSnapshot, payload) orelse return;
+        self.lock();
+        defer self.unlock();
+        if (conn.closed.load(.acquire)) return;
+        conn.noteAck(ack.last_recv_server_tick);
+        return;
+    }
+
     const message: Incoming = switch (msg_type) {
         wire.msg.c2s_hello => .{ .hello = wire.decodeHello(payload) orelse return },
         wire.msg.c2s_input => .{ .input = wire.decodePayload(wire.Input, payload) orelse return },
         wire.msg.c2s_levelup_choice => .{
             .levelup_choice = wire.decodePayload(wire.LevelupChoice, payload) orelse return,
-        },
-        wire.msg.c2s_ack_snapshot => .{
-            .ack_snapshot = (wire.decodePayload(wire.AckSnapshot, payload) orelse return)
-                .last_recv_server_tick,
         },
         wire.msg.c2s_restart => .{ .restart = {} },
         else => {
@@ -1680,6 +1772,29 @@ fn waitForIncoming(server: *Server, want: usize) !void {
     return error.MessageNeverArrived;
 }
 
+/// Spin until every accepted connection has acknowledged `tick`.
+///
+/// An acknowledgement is applied by the reader thread the moment it is decoded
+/// rather than queued for the simulation thread, so there is nothing for
+/// `waitForIncoming` to count: the atomic the reader stored is what a test has
+/// to watch.
+fn waitForAck(server: *Server, tick: u32) !void {
+    var spins: usize = 0;
+    while (spins < 2_000_000) : (spins += 1) {
+        server.lock();
+        var seen: usize = 0;
+        var done = true;
+        for (server.clients.items) |conn| {
+            seen += 1;
+            if (conn.acked_tick.load(.acquire) != tick) done = false;
+        }
+        server.unlock();
+        if (done and seen > 0) return;
+        std.Thread.yield() catch {};
+    }
+    return error.AckNeverArrived;
+}
+
 /// True when `frame` is a full snapshot whose first player has moved in +x.
 fn snapshotShowsMovement(frame: []const u8) bool {
     const header = wire.decodeFrameHeader(frame) orelse return false;
@@ -2019,7 +2134,7 @@ test "a client that acknowledges a baseline gets a delta against it" {
     const full_payload = full[wire.header_size..];
     const full_tick = wire.readLe(u32, full_payload, 0);
     try client.ack(full_tick);
-    try waitForIncoming(&loop.server, 1);
+    try waitForAck(&loop.server, full_tick);
 
     // Step to the first broadcast tick (3): a full snapshot, because tick 0 is
     // not a baseline the ring holds.
@@ -2034,7 +2149,7 @@ test "a client that acknowledges a baseline gets a delta against it" {
     // Acknowledge the tick-3 full snapshot. The next broadcast is a delta
     // against it.
     try client.ack(full2_tick);
-    try waitForIncoming(&loop.server, 1);
+    try waitForAck(&loop.server, full2_tick);
     loop.server.step();
     loop.server.step();
     loop.server.step();
@@ -2067,11 +2182,155 @@ test "a delta baseline the ring no longer holds falls back to a full snapshot" {
     // Acknowledge a tick far outside the 32-snapshot window: the server must
     // answer with a full snapshot, not a delta against a stale baseline.
     try client.ack(30 * root.ticks_per_snapshot);
-    try waitForIncoming(&loop.server, 1);
+    try waitForAck(&loop.server, 30 * root.ticks_per_snapshot);
     loop.server.step();
     loop.server.step();
 
     const full = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
     const full_payload = full[wire.header_size..];
     try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, full_payload, 4)); // baseline_tick = 0
+}
+
+test "the held-state model follows a forward acknowledgement" {
+    var conn: ClientConn = .{};
+
+    // Nothing acknowledged yet: no state the client is known to hold.
+    try std.testing.expectEqual(@as(u32, 0), conn.held_tick.load(.acquire));
+
+    // The first ack seeds it.
+    conn.noteAck(30);
+    try std.testing.expectEqual(@as(u32, 30), conn.held_tick.load(.acquire));
+
+    // Acks that run ahead of the model move it forward.
+    conn.noteAck(33);
+    try std.testing.expectEqual(@as(u32, 33), conn.held_tick.load(.acquire));
+    conn.noteAck(39);
+    try std.testing.expectEqual(@as(u32, 39), conn.held_tick.load(.acquire));
+
+    // A single lagging ack is the normal case — the client only flushes it when
+    // the next snapshot lands — and must not drag the model backwards.
+    conn.noteAck(36);
+    try std.testing.expectEqual(@as(u32, 39), conn.held_tick.load(.acquire));
+
+    // Repeating it is not lag, it is the client refusing and re-acknowledging:
+    // that is the drift correction, and it is the test below.
+    conn.noteAck(36);
+    try std.testing.expectEqual(@as(u32, 36), conn.held_tick.load(.acquire));
+}
+
+test "a repeated acknowledgement pulls a model that ran ahead back" {
+    var conn: ClientConn = .{};
+    conn.noteAck(30);
+
+    // The model advances the way `snapshotFrame` does, onto each snapshot it
+    // sends, without any further acknowledgement.
+    conn.held_tick.store(45, .release);
+
+    // A single older ack is still just a lagging one.
+    conn.noteAck(36);
+    try std.testing.expectEqual(@as(u32, 45), conn.held_tick.load(.acquire));
+
+    // Repeating it means the client refused the delta the model expected it to
+    // apply and is re-acknowledging the state it really holds: without this the
+    // model would refuse forever.
+    conn.noteAck(36);
+    try std.testing.expectEqual(@as(u32, 36), conn.held_tick.load(.acquire));
+}
+
+test "a delta is diffed against the held state, not the last acknowledgement" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got); // immediate full snapshot
+    _ = try client.readFrame(&got); // loadout
+
+    // Reach the first broadcast tick and acknowledge the full snapshot it sends.
+    loop.server.step();
+    loop.server.step();
+    const first = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const first_tick = wire.readLe(u32, first[wire.header_size..], 0);
+    try client.ack(first_tick);
+    try waitForAck(&loop.server, first_tick);
+
+    // From here the client acknowledges nothing more. The server still carries
+    // the held state forward, so every delta names the snapshot the client is
+    // holding rather than the one it last acknowledged: with the ack alone as
+    // the baseline, every delta after the first would name `first_tick` again.
+    var expected_baseline = first_tick;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        loop.server.step();
+        loop.server.step();
+        loop.server.step();
+        const d = try client.expectFrame(&got, wire.msg.s2c_snapshot_delta, 4);
+        const payload = d[wire.header_size..];
+        try std.testing.expectEqual(expected_baseline, wire.readLe(u32, payload, 4));
+        try std.testing.expectEqual(
+            expected_baseline + root.ticks_per_snapshot,
+            wire.readLe(u32, payload, 0),
+        );
+        expected_baseline += root.ticks_per_snapshot;
+    }
+}
+
+test "a restart takes the held state back to nothing" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got); // immediate full snapshot
+    _ = try client.readFrame(&got); // loadout
+
+    loop.server.step();
+    loop.server.step();
+    const first = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const first_tick = wire.readLe(u32, first[wire.header_size..], 0);
+    try client.ack(first_tick);
+    try waitForAck(&loop.server, first_tick);
+
+    // The run restarts: the server's tick goes back to zero, so a held tick from
+    // the dead run names nothing the client has, and the client must be given a
+    // full snapshot rather than a delta against it. The new run reaches the same
+    // tick the client had acknowledged, which is exactly the case a model that
+    // was only clamped by the tick going backwards would get wrong.
+    try client.restart();
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    loop.server.step();
+    loop.server.step();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const frame = try client.readFrame(&got);
+        const header = wire.decodeFrameHeader(frame).?;
+        if (header.msg_type == wire.msg.s2c_snapshot_delta) return error.DeltaAfterRestart;
+        if (header.msg_type == wire.msg.s2c_snapshot_full) {
+            try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, frame[wire.header_size..], 4));
+            return;
+        }
+    }
+    return error.FrameNeverArrived;
 }
