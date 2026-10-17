@@ -1386,11 +1386,7 @@ pub const Simulation = struct {
         if (opt.is_evo) {
             if (upgrade.evolutionById(opt.item_id)) |evo| {
                 if (upgrade.weaponSlot(&p.weapons, evo.weapon_id)) |i| {
-                    p.weapons[i].id = evo.id;
-                    p.weapons[i].evolved = true;
-                    p.weapons[i].level = root.max_weapon_level;
-                    p.weapons[i].pending_slashes = 0;
-                    p.weapons[i].pending_timer = 0;
+                    upgrade.fuseInto(&p.weapons[i], evo);
                 }
             }
         } else if (opt.item_id < root.max_weapons) {

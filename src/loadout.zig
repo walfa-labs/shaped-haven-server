@@ -98,11 +98,7 @@ pub const Loadout = struct {
             const i = upgrade.weaponSlot(weapons, evo.weapon_id) orelse continue;
             if (upgrade.isEvolutionId(weapons[i].id)) continue;
 
-            weapons[i].id = evo.id;
-            weapons[i].level = root.max_weapon_level;
-            weapons[i].evolved = true;
-            weapons[i].pending_slashes = 0;
-            weapons[i].pending_timer = 0;
+            upgrade.fuseInto(&weapons[i], evo);
         }
     }
 };
@@ -160,7 +156,14 @@ pub fn parse(spec: []const u8) error{InvalidLoadout}!Loadout {
 }
 
 /// The item id a spec name stands for, or `null`.
-fn resolveId(name: []const u8) ?u8 {
+///
+/// The name is normalised before matching — lower-cased, spaces as underscores —
+/// so `SWORD`, `Sword` and `sword` all resolve, matching what the documented
+/// syntax promises rather than requiring the caller to have got the case right.
+fn resolveId(raw_name: []const u8) ?u8 {
+    var buf: [64]u8 = undefined;
+    const name = snakeInto(raw_name, &buf);
+
     for (weapon_names, 0..) |n, i| {
         if (std.mem.eql(u8, n, name)) return @intCast(i);
     }
@@ -168,9 +171,7 @@ fn resolveId(name: []const u8) ?u8 {
         if (std.mem.eql(u8, n, name)) return upgrade.passive_table[i].id;
     }
     // The `P0`–`P9` aliases PROTOCOL.md gives the passives.
-    if (name.len == 2 and (name[0] == 'P' or name[0] == 'p') and
-        name[1] >= '0' and name[1] <= '9')
-    {
+    if (name.len == 2 and name[0] == 'p' and name[1] >= '0' and name[1] <= '9') {
         const i: usize = name[1] - '0';
         if (i < passive_names.len) return upgrade.passive_table[i].id;
     }
@@ -216,6 +217,21 @@ test "a spec accepts item ids and the passive aliases" {
     try std.testing.expectEqual(by_name.passives[2], by_id.passives[2]);
     try std.testing.expectEqual(by_name.weapons[0], by_alias.weapons[0]);
     try std.testing.expectEqual(by_name.passives[2], by_alias.passives[2]);
+}
+
+test "a spec name is normalised, so its case does not matter" {
+    // The documented syntax says a name is the item's name lower-cased with
+    // spaces as underscores, which reads as a promise that the flag does the
+    // normalising. `SWORD` and `Sword` used to be rejected while `sword` worked.
+    const canonical = try parse("sword=8,clockwork_gear=5");
+    const shouted = try parse("SWORD=8,CLOCKWORK_GEAR=5");
+    const titled = try parse("Sword=8,Clockwork_Gear=5");
+    const spaced = try parse("Sword=8,Clockwork Gear=5");
+
+    try std.testing.expectEqual(canonical.weapons[0], shouted.weapons[0]);
+    try std.testing.expectEqual(canonical.passives[2], shouted.passives[2]);
+    try std.testing.expectEqual(canonical.weapons[0], titled.weapons[0]);
+    try std.testing.expectEqual(canonical.passives[2], spaced.passives[2]);
 }
 
 test "an empty spec changes nothing" {
