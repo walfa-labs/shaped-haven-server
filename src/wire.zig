@@ -1,4 +1,4 @@
-//! Shaped Haven server — protocol v1 (DESIGN.md §5).
+//! Shaped Haven server — protocol v2 (protocol-v2-spec.md).
 //!
 //! Every packet on the wire is a 7-byte frame header followed by `payload_len`
 //! bytes of payload:
@@ -15,16 +15,16 @@
 //! are i16 in 0.05 unit steps, orientation is a u8 angle mapping 0..255 onto
 //! 0..2π.
 //!
-//! DESIGN.md §5 does not fix the byte layout of the `EnemyNet` / `ProjNet` /
-//! `GemNet` records, so the layouts below are this repository's choice. They are
-//! empty in phase 1 but are defined now so later phases only append fields.
+//! v2 grows the player and enemy records (race, mana, dash and telegraph fields)
+//! and the level-up offer (per-option stat deltas); the frame header, snapshot
+//! header, projectile and gem records, and every other message are unchanged.
 
 const std = @import("std");
 const root = @import("root.zig");
 
 comptime {
     if (@import("builtin").cpu.arch.endian() != .little)
-        @compileError("wire.zig: protocol v1 is defined as little-endian");
+        @compileError("wire.zig: protocol v2 is defined as little-endian");
 }
 
 /// Length in bytes of the frame header shared by every message (DESIGN.md §5).
@@ -73,54 +73,66 @@ pub const FrameHeader = packed struct {
 // Client -> server payloads
 // ---------------------------------------------------------------------------
 
-/// `C2S_HELLO` payload (DESIGN.md §5).
+/// `C2S_HELLO` payload (protocol v2).
 ///
 /// Field order is the wire order, and the payload is always decoded field by
-/// field rather than by casting the whole struct, so the token sits at offset 2
-/// and the payload stays a tight 26 bytes.
+/// field rather than by casting the whole struct, so the name sits at offset 4
+/// and the payload stays a tight 20 bytes.
 ///
 /// ```text
-/// proto_ver:      u8      @ 0
-/// requested_slot: u8      @ 1
-/// session_token:  u64     @ 2
-/// name:           [16]u8  @ 10
-/// total:          26 bytes
+/// proto_ver:          u8      @ 0   (must be 2)
+/// race_id:            u8      @ 1   (0..9)
+/// starting_weapon_id: u8      @ 2   (0=sword, 1=axe, 2=bow, 3=gun)
+/// reserved:           u8      @ 3   (0)
+/// player_name:        [16]u8  @ 4   (UTF-8, null-padded)
+/// total:              20 bytes
 /// ```
-pub const hello_wire_size = 26;
+pub const hello_wire_size = 20;
 
 /// In-memory form of a decoded `C2S_HELLO`.
 pub const Hello = struct {
     proto_ver: u8,
-    requested_slot: u8,
-    session_token: u64,
+    race_id: u8,
+    starting_weapon_id: u8,
+    reserved: u8,
     name: [16]u8,
 };
 
-/// Decode a `C2S_HELLO` payload; `null` unless exactly 26 bytes arrive.
+/// Decode a `C2S_HELLO` payload; `null` unless exactly 20 bytes arrive.
 pub fn decodeHello(bytes: []const u8) ?Hello {
     if (bytes.len != hello_wire_size) return null;
     var name: [16]u8 = undefined;
-    @memcpy(&name, bytes[10..hello_wire_size]);
+    @memcpy(&name, bytes[4..hello_wire_size]);
     return .{
         .proto_ver = bytes[0],
-        .requested_slot = bytes[1],
-        .session_token = readLe(u64, bytes, 2),
+        .race_id = bytes[1],
+        .starting_weapon_id = bytes[2],
+        .reserved = bytes[3],
         .name = name,
     };
 }
 
-/// `C2S_INPUT` — 13 bytes (DESIGN.md §5).
+/// `C2S_INPUT` — 11 bytes (protocol v2).
 ///
-/// Every field carries a default so test code can build inputs with the `.{...}`
-/// literal form. The decoder ignores defaults: it always reads every field off
-/// the wire.
+/// The movement axes are analog (`-127..127`, 0 when the digital buttons are
+/// used instead); `buttons` is a bitmask with the dash on bit 4. `input_seq`
+/// stays in the payload for continuity with v1 — the frame header's `seq` slot
+/// carries it too — and the simulation drops anything but the newest.
 pub const Input = packed struct {
     input_seq: u32 = 0,
     client_tick: u32 = 0,
-    move_x: i8 = 0,
-    move_y: i8 = 0,
-    aim_angle: u16 = 0,
     buttons: u8 = 0,
+    axis_x: i8 = 0,
+    axis_y: i8 = 0,
+};
+
+/// `C2S_INPUT.buttons` bit layout.
+pub const button = struct {
+    pub const up: u8 = 0x01;
+    pub const down: u8 = 0x02;
+    pub const left: u8 = 0x04;
+    pub const right: u8 = 0x08;
+    pub const dash: u8 = 0x10;
 };
 
 /// `C2S_LEVELUP_CHOICE` — 3 bytes (PROTOCOL.md).
@@ -189,26 +201,66 @@ pub const Welcome = packed struct {
 /// between two wider arrays costs no padding bytes on the wire.
 pub const snapshot_header_wire_size = 37;
 
-/// Player record inside a snapshot (PROTOCOL.md "PlayerNet", 8 bytes).
+/// Player record inside a snapshot (protocol v2 "PlayerNet", 20 bytes).
 ///
 /// ```text
-/// player_id:   u8   @ 0
-/// state_flags: u8   @ 1   (1 = ALIVE)
-/// pos_x:       i16  @ 2   0.05 unit steps
-/// pos_y:       i16  @ 4
-/// vel_angle:   u8   @ 6   0..255 mapping 0..2pi
-/// hp_pct:      u8   @ 7   hp / max_hp * 100
+/// player_id:          u8   @ 0
+/// state_flags:        u8   @ 1   (1 = ALIVE, 2 = INVULNERABLE, 4 = AWAITING_LEVELUP)
+/// race_id:            u8   @ 2
+/// pos_x:              i16  @ 3   0.05 unit steps
+/// pos_y:              i16  @ 5
+/// vel_angle:          u8   @ 7   0..255 mapping 0..2π
+/// hp_pct:             u8   @ 8   hp / max_hp * 100
+/// shield_pct:         u8   @ 9   shield / max_shield * 100 (0 if max_shield == 0)
+/// mana_pct:           u8   @ 10  mana / max_mana * 100
+/// dash_cd_remaining:  u16  @ 11  milliseconds remaining on dash cooldown
+/// dash_cd_total:      u16  @ 13  total dash cooldown in milliseconds
+/// is_dashing:         u8   @ 15  (1 during dash i-frames, 0 otherwise)
+/// max_hp:             u16  @ 16  (for client-side HP bar)
+/// max_shield:         u16  @ 18
+/// total:              20 bytes
 /// ```
+///
+/// The spec's "total: 21 bytes" line disagrees with its own field layout: the
+/// v1 record's 8 bytes plus the 12 bytes these eight fields add come to 20,
+/// and every offset above is explicit and contiguous. The offsets are the
+/// contract; this record is 20 bytes.
 pub const PlayerNet = packed struct {
     player_id: u8,
     state_flags: u8,
+    race_id: u8,
     pos_x: i16,
     pos_y: i16,
     vel_angle: u8,
     hp_pct: u8,
+    shield_pct: u8,
+    mana_pct: u8,
+    dash_cd_remaining: u16,
+    dash_cd_total: u16,
+    is_dashing: u8,
+    max_hp: u16,
+    max_shield: u16,
 };
 
-/// Enemy record inside a snapshot (PROTOCOL.md "EnemyNet", 12 bytes).
+/// Enemy record inside a snapshot (protocol v2 "EnemyNet", 18 bytes).
+///
+/// The last six bytes are the telegraph: what the client draws as the windup
+/// warning before the enemy commits to an attack.
+///
+/// ```text
+/// id:                  u32 @ 0
+/// archetype:           u8  @ 4
+/// elite_mask:          u8  @ 5
+/// pos_x:               i16 @ 6   0.05 unit steps
+/// pos_y:               i16 @ 8
+/// vel_angle:           u8  @ 10
+/// hp_pct:              u8  @ 11
+/// telegraph_progress:  u8  @ 12  (0 = no windup, 1..255 = windup progress)
+/// telegraph_shape:     u8  @ 13  (0=None, 1=CircleAoE, 2=ConeSlash, 3=LineCharge)
+/// telegraph_angle:     u16 @ 14  (facing angle in milliradians, -3142..3142)
+/// telegraph_radius:    u16 @ 16  (radius for circle/cone or length for line)
+/// total:               18 bytes
+/// ```
 pub const EnemyNet = packed struct {
     id: u32,
     archetype: u8,
@@ -217,6 +269,10 @@ pub const EnemyNet = packed struct {
     pos_y: i16,
     vel_angle: u8,
     hp_pct: u8,
+    telegraph_progress: u8,
+    telegraph_shape: u8,
+    telegraph_angle: u16,
+    telegraph_radius: u16,
 };
 
 /// Projectile record inside a snapshot (PROTOCOL.md "ProjNet", 12 bytes).
@@ -240,18 +296,39 @@ pub const GemNet = packed struct {
     reserved: u8,
 };
 
-/// One entry of `S2C_LEVELUP_OFFER` (PROTOCOL.md `UpgradeOptionNet`, 3 bytes).
+/// One entry of `S2C_LEVELUP_OFFER` (protocol v2 `UpgradeOptionNet`, 8 bytes).
+///
+/// The three fixed fields name the item; the stat fields say what the purchase
+/// changes, as fixed-point values scaled by 100 so `500` reads as `5.0`. A
+/// negative delta is a reduction (cooldown per level, for instance).
 pub const UpgradeOptionNet = packed struct {
     item_id: u8,
     next_level: u8,
     is_evo: u8,
+    stat_type: u8,
+    current_stat_fp: i16,
+    upgraded_stat_fp: i16,
 };
 
-/// `S2C_LEVELUP_OFFER` — 14 bytes (PROTOCOL.md).
+/// `UpgradeOptionNet.stat_type` values.
+pub const StatType = struct {
+    pub const damage: u8 = 0;
+    pub const armor: u8 = 1;
+    pub const max_hp: u8 = 2;
+    pub const move_speed: u8 = 3;
+    pub const cooldown: u8 = 4;
+    pub const area: u8 = 5;
+    pub const projectiles: u8 = 6;
+    pub const crit_chance: u8 = 7;
+    pub const max_mana: u8 = 8;
+    pub const max_shield: u8 = 9;
+};
+
+/// `S2C_LEVELUP_OFFER` — 29 bytes (protocol v2).
 ///
-/// The options array is carried as raw bytes because a packed struct cannot
-/// contain an array of packed structs in this toolchain; the encoder writes the
-/// nine option bytes field by field.
+/// Five header bytes then three 8-byte options, written field by field (see
+/// `encodeLevelupOffer`) because a packed struct cannot hold an array of
+/// packed structs in this toolchain.
 pub const LevelupOffer = packed struct {
     player_id: u8,
     event_id: u16,
@@ -259,12 +336,21 @@ pub const LevelupOffer = packed struct {
     opt0_item_id: u8,
     opt0_next_level: u8,
     opt0_is_evo: u8,
+    opt0_stat_type: u8,
+    opt0_current_stat_fp: i16,
+    opt0_upgraded_stat_fp: i16,
     opt1_item_id: u8,
     opt1_next_level: u8,
     opt1_is_evo: u8,
+    opt1_stat_type: u8,
+    opt1_current_stat_fp: i16,
+    opt1_upgraded_stat_fp: i16,
     opt2_item_id: u8,
     opt2_next_level: u8,
     opt2_is_evo: u8,
+    opt2_stat_type: u8,
+    opt2_current_stat_fp: i16,
+    opt2_upgraded_stat_fp: i16,
 };
 
 /// `S2C_GAME_OVER` — 16 bytes (PROTOCOL.md).
@@ -371,6 +457,20 @@ pub const WeaponId = enum(u8) {
     gun = 3,
 };
 
+/// `EnemyNet.telegraph_shape` values.
+///
+/// A telegraph is the windup before an attack the client can see coming: the
+/// darter's pause before its lunge and the boss's stand-still before its dash
+/// are both a `line_charge`. `circle_aoe` and `cone_slash` are the shapes a
+/// future telegraphed attack would use; none of the phase-1 archetypes emit
+/// them yet.
+pub const TelegraphShape = enum(u8) {
+    none = 0,
+    circle_aoe = 1,
+    cone_slash = 2,
+    line_charge = 3,
+};
+
 /// Quantization step for positions and velocities (DESIGN.md §2, PROTOCOL.md).
 pub const quant_step: f32 = 0.05;
 
@@ -388,8 +488,8 @@ pub fn dequantize(value: i16) f32 {
 /// Pack a `FrameHeader` + payload into a single little-endian buffer.
 ///
 /// `seq` goes in the header's 4-byte slot: the server tick for
-/// `S2C_SNAPSHOT_*`, and 0 everywhere else in protocol v1 (PROTOCOL.md
-/// "Framing").
+/// `S2C_SNAPSHOT_*`, the client's `input_seq` for `C2S_INPUT`, and 0
+/// everywhere else (protocol v2 spec "Framing").
 pub fn encodeFrame(gpa: std.mem.Allocator, msg_type: u8, payload: []const u8, seq: u32) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
@@ -642,7 +742,9 @@ fn writeRaw(gpa: std.mem.Allocator, payload: *Sink, v: anytype) !void {
     try payload.fixedBytes(gpa, raw[0..wireSize(T)]);
 }
 
-/// Encode `S2C_LEVELUP_OFFER` (0x84, PROTOCOL.md).
+/// Encode `S2C_LEVELUP_OFFER` (0x84, protocol v2): 5 header bytes then three
+/// 8-byte options, 29 in total. Each option is appended through `Sink.records`,
+/// which trims it to `wireSize` field by field.
 pub fn encodeLevelupOffer(
     gpa: std.mem.Allocator,
     player_id: u8,
@@ -819,57 +921,57 @@ test "decodeFrameHeader rejects short buffers" {
     try std.testing.expect(decodeFrameHeader(&.{ 1, 2, 3, 4, 5, 6, 7 }) != null);
 }
 
-test "hello payload matches the DESIGN.md field order" {
-    // The token is deliberately unaligned on the wire, so the payload is
+test "hello payload matches the protocol v2 field order" {
+    // The name is deliberately unaligned on the wire, so the payload is
     // decoded field by field from a hand-built byte buffer.
-    var raw = std.mem.zeroes([26]u8);
-    raw[0] = 1; // proto_ver
-    raw[1] = 0; // requested_slot
-    writeLe(u64, raw[0..], 2, 0x1122334455667788);
+    var raw = std.mem.zeroes([20]u8);
+    raw[0] = 2; // proto_ver
+    raw[1] = 3; // race_id
+    raw[2] = 1; // starting_weapon_id
+    raw[3] = 0; // reserved
     var abc = [_]u8{ 'a', 'b', 'c' };
-    @memcpy(raw[10..13], &abc);
+    @memcpy(raw[4..7], &abc);
 
     const decoded = decodeHello(&raw).?;
-    try std.testing.expectEqual(@as(u8, 1), decoded.proto_ver);
-    try std.testing.expectEqual(@as(u8, 0), decoded.requested_slot);
-    try std.testing.expectEqual(@as(u64, 0x1122334455667788), decoded.session_token);
+    try std.testing.expectEqual(@as(u8, 2), decoded.proto_ver);
+    try std.testing.expectEqual(@as(u8, 3), decoded.race_id);
+    try std.testing.expectEqual(@as(u8, 1), decoded.starting_weapon_id);
+    try std.testing.expectEqual(@as(u8, 0), decoded.reserved);
     try std.testing.expectEqualStrings("abc", decoded.name[0..3]);
 
     // The length must match exactly: short and over-long payloads are both
     // malformed frames.
-    try std.testing.expect(decodeHello(raw[0..25]) == null);
+    try std.testing.expect(decodeHello(raw[0..19]) == null);
     try std.testing.expect(decodeHello(&.{}) == null);
-    var too_long = std.mem.zeroes([27]u8);
-    @memcpy(too_long[0..26], &raw);
+    var too_long = std.mem.zeroes([21]u8);
+    @memcpy(too_long[0..20], &raw);
     try std.testing.expect(decodeHello(&too_long) == null);
 }
 
-test "input payload matches DESIGN.md field list" {
-    try std.testing.expectEqual(@as(usize, 13), wireSize(Input));
+test "input payload matches the protocol v2 field list" {
+    try std.testing.expectEqual(@as(usize, 11), wireSize(Input));
 
     var payload = Sink.init();
     defer payload.deinit(std.testing.allocator);
-    try payload.leU32(std.testing.allocator, 1234);
-    try payload.leU32(std.testing.allocator, 99);
-    try payload.byte(std.testing.allocator, @as(u8, @bitCast(@as(i8, -100))));
-    try payload.byte(std.testing.allocator, 100);
-    try payload.leU16(std.testing.allocator, 65535);
-    try payload.byte(std.testing.allocator, 0xff);
+    try payload.leU32(std.testing.allocator, 1234); // input_seq
+    try payload.leU32(std.testing.allocator, 99); // client_tick
+    try payload.byte(std.testing.allocator, 0x10); // buttons: dash
+    try payload.byte(std.testing.allocator, @as(u8, @bitCast(@as(i8, -100)))); // axis_x
+    try payload.byte(std.testing.allocator, 100); // axis_y
 
     const decoded = decodePayload(Input, payload.bytes()).?;
     try std.testing.expectEqual(@as(u32, 1234), decoded.input_seq);
     try std.testing.expectEqual(@as(u32, 99), decoded.client_tick);
-    try std.testing.expectEqual(@as(i8, -100), decoded.move_x);
-    try std.testing.expectEqual(@as(i8, 100), decoded.move_y);
-    try std.testing.expectEqual(@as(u16, 65535), decoded.aim_angle);
-    try std.testing.expectEqual(@as(u8, 0xff), decoded.buttons);
+    try std.testing.expectEqual(@as(u8, 0x10), decoded.buttons);
+    try std.testing.expectEqual(@as(i8, -100), decoded.axis_x);
+    try std.testing.expectEqual(@as(i8, 100), decoded.axis_y);
 
     // A payload that is not exactly the message size is rejected rather than
     // partially decoded.
-    try std.testing.expect(decodePayload(Input, payload.bytes()[0..12]) == null);
-    var too_long: [14]u8 = undefined;
-    @memcpy(too_long[0..13], payload.bytes());
-    too_long[13] = 0;
+    try std.testing.expect(decodePayload(Input, payload.bytes()[0..10]) == null);
+    var too_long: [12]u8 = undefined;
+    @memcpy(too_long[0..11], payload.bytes());
+    too_long[11] = 0;
     try std.testing.expect(decodePayload(Input, &too_long) == null);
     try std.testing.expect(decodePayload(Input, payload.bytes()) != null);
 }
@@ -910,16 +1012,28 @@ test "a delta frame matches the PROTOCOL.md layout" {
             .pos_y = -200,
             .vel_angle = 64,
             .hp_pct = 80,
+            .telegraph_progress = 0,
+            .telegraph_shape = 0,
+            .telegraph_angle = 0,
+            .telegraph_radius = 0,
         } },
     };
     const updated = [_]DeltaRecord{
         .{ .player = .{
             .player_id = 0,
             .state_flags = 1,
+            .race_id = 0,
             .pos_x = 12,
             .pos_y = 34,
             .vel_angle = 0,
             .hp_pct = 100,
+            .shield_pct = 0,
+            .mana_pct = 0,
+            .dash_cd_remaining = 0,
+            .dash_cd_total = 0,
+            .is_dashing = 0,
+            .max_hp = 0,
+            .max_shield = 0,
         } },
     };
     const destroyed = [_]DestroyedRef{
@@ -943,9 +1057,9 @@ test "a delta frame matches the PROTOCOL.md layout" {
     try std.testing.expectEqual(msg.s2c_snapshot_delta, header.msg_type);
     try std.testing.expectEqual(@as(u32, 30), header.seq);
 
-    // 37-byte header, then spawned (1 + 12), updated (1 + 4 + 8), destroyed (1 + 4).
+    // 37-byte header, then spawned (1 + 18), updated (1 + 4 + 20), destroyed (1 + 4).
     try std.testing.expectEqual(
-        @as(usize, header_size + 37 + (1 + 12) + (1 + 4 + 8) + (1 + 4)),
+        @as(usize, header_size + 37 + (1 + 18) + (1 + 4 + 20) + (1 + 4)),
         frame.len,
     );
     const p = frame[header_size..];
@@ -959,25 +1073,34 @@ test "a delta frame matches the PROTOCOL.md layout" {
         0, // game_state
         1, 0, 1, 0, 1, 0, 0, 0, // counts
     }, p[0..37]);
-    // spawned[0]: kind + EnemyNet.
+    // spawned[0]: kind + EnemyNet (18 bytes with the six telegraph bytes).
     try std.testing.expectEqualSlices(u8, &.{
         1, // kind = enemy
         7, 0, 0, 0, // id
         1, 0, // archetype, elite_mask
         100, 0, 56, 255, // pos_x, pos_y = -200
         64, 80, // vel_angle, hp_pct
-    }, p[37..37 + 1 + 12]);
-    // updated[0]: kind + id + PlayerNet.
+        0, 0, 0, 0, 0, 0, // telegraph_progress/shape/angle/radius
+    }, p[37..37 + 1 + 18]);
+    // updated[0]: kind + id + PlayerNet (20 bytes).
     try std.testing.expectEqualSlices(u8, &.{
         0, // kind = player
         0, 0, 0, 0, // id (player_id widened)
-        0, 1, 12, 0, 34, 0, 0, 100, // PlayerNet
-    }, p[37 + 13..37 + 13 + 1 + 4 + 8]);
+        // player_id, state_flags, race_id
+        0, 1, 0,
+        12, 0, 34, 0, // pos_x, pos_y
+        0, // vel_angle
+        100, // hp_pct
+        0, 0, // shield_pct, mana_pct
+        0, 0, 0, 0, // dash_cd_remaining, dash_cd_total
+        0, // is_dashing
+        0, 0, 0, 0, // max_hp, max_shield
+    }, p[37 + 19..37 + 19 + 1 + 4 + 20]);
     // destroyed[0]: kind + id.
     try std.testing.expectEqualSlices(u8, &.{
         3, // kind = gem
         9, 0, 0, 0, // id
-    }, p[37 + 13 + 13..]);
+    }, p[37 + 19 + 25..]);
 }
 
 test "snapshot header is 37 bytes with no padding after game_state" {
@@ -1069,11 +1192,11 @@ test "sink encodes integers little-endian and arrays verbatim" {
     players[0].hp_pct = 100;
     try s.records(gpa, PlayerNet, &players);
 
-    // 15 bytes of integers, then two 8-byte player records.
-    try std.testing.expectEqual(@as(usize, 15 + 2 * 8), s.bytes().len);
+    // 15 bytes of integers, then two 20-byte player records.
+    try std.testing.expectEqual(@as(usize, 15 + 2 * 20), s.bytes().len);
     try std.testing.expectEqualSlices(u8, &.{
-        1, 1, 200, 0, 0, 0, 64, 100,
-        0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 0, 200, 0, 0, 0, 64, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     }, s.bytes()[15..]);
 }
 
@@ -1084,18 +1207,34 @@ test "snapshot frame matches the DESIGN.md header then quantized players" {
         .{
             .player_id = 0,
             .state_flags = 1,
+            .race_id = 0,
             .pos_x = quantize(12.0),
             .pos_y = quantize(-4.0),
             .vel_angle = angleToByte(0.0),
             .hp_pct = 100,
+            .shield_pct = 100,
+            .mana_pct = 100,
+            .dash_cd_remaining = 3500,
+            .dash_cd_total = 3500,
+            .is_dashing = 1,
+            .max_hp = 110,
+            .max_shield = 25,
         },
         .{
             .player_id = 1,
             .state_flags = 0,
+            .race_id = 3,
             .pos_x = quantize(-40.0),
             .pos_y = quantize(20.0),
             .vel_angle = angleToByte(0.0),
             .hp_pct = 50,
+            .shield_pct = 0,
+            .mana_pct = 80,
+            .dash_cd_remaining = 1234,
+            .dash_cd_total = 2400,
+            .is_dashing = 0,
+            .max_hp = 75,
+            .max_shield = 20,
         },
     };
 
@@ -1119,8 +1258,8 @@ test "snapshot frame matches the DESIGN.md header then quantized players" {
     try std.testing.expectEqual(msg.s2c_snapshot_full, header.msg_type);
     try std.testing.expectEqual(@as(u16, @intCast(frame.len - header_size)), header.payload_len);
 
-    // SnapshotHeader (37 bytes) then two 8-byte player records.
-    try std.testing.expectEqual(@as(usize, 37 + 2 * 8), frame.len - header_size);
+    // SnapshotHeader (37 bytes) then two 20-byte player records.
+    try std.testing.expectEqual(@as(usize, 37 + 2 * 20), frame.len - header_size);
     // `seq` carries the server tick on S2C_SNAPSHOT_* (PROTOCOL.md).
     try std.testing.expectEqual(@as(u32, 6), header.seq);
     try std.testing.expectEqualSlices(u8, &.{
@@ -1130,16 +1269,18 @@ test "snapshot frame matches the DESIGN.md header then quantized players" {
         11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // acked_seq
         0, // game_state
         2, 0, 0, 0, 0, 0, 0, 0, // counts
-        // players[0]: id, flags, pos_x, pos_y, vel_angle, hp_pct
-        0, 1, 240, 0, 176, 255, 0, 100,
+        // players[0]: id, flags, race_id, pos_x, pos_y, vel_angle, hp_pct,
+        // shield_pct, mana_pct, dash_cd_remaining, dash_cd_total, is_dashing,
+        // max_hp, max_shield
+        0, 1, 0, 240, 0, 176, 255, 0, 100, 100, 100, 172, 13, 172, 13, 1, 110, 0, 25, 0,
         // players[1]
-        1, 0, 224, 252, 144, 1, 0, 50,
-    }, frame[header_size..][0..37 + 2 * 8]);
+        1, 0, 3, 224, 252, 144, 1, 0, 50, 0, 80, 210, 4, 96, 9, 0, 75, 0, 20, 0,
+    }, frame[header_size..][0..37 + 2 * 20]);
 }
 
 test "entity net records are fixed size" {
-    try std.testing.expectEqual(@as(usize, 8), wireSize(PlayerNet));
-    try std.testing.expectEqual(@as(usize, 12), wireSize(EnemyNet));
+    try std.testing.expectEqual(@as(usize, 20), wireSize(PlayerNet));
+    try std.testing.expectEqual(@as(usize, 18), wireSize(EnemyNet));
     try std.testing.expectEqual(@as(usize, 12), wireSize(ProjNet));
     try std.testing.expectEqual(@as(usize, 12), wireSize(GemNet));
 }
@@ -1167,10 +1308,10 @@ test "the enum byte values PROTOCOL.md leaves open are the documented ones" {
 
 test "the phase-3 payload sizes match PROTOCOL.md" {
     try std.testing.expectEqual(@as(usize, 3), wireSize(LevelupChoice));
-    try std.testing.expectEqual(@as(usize, 14), wireSize(LevelupOffer));
+    try std.testing.expectEqual(@as(usize, 29), wireSize(LevelupOffer));
     try std.testing.expectEqual(@as(usize, 16), wireSize(GameOver));
     try std.testing.expectEqual(@as(usize, 45), wireSize(Loadout));
-    try std.testing.expectEqual(@as(usize, 3), wireSize(UpgradeOptionNet));
+    try std.testing.expectEqual(@as(usize, 8), wireSize(UpgradeOptionNet));
     try std.testing.expectEqual(@as(usize, 3), wireSize(WeaponNet));
     try std.testing.expectEqual(@as(usize, 2), wireSize(PassiveNet));
 }
@@ -1178,23 +1319,26 @@ test "the phase-3 payload sizes match PROTOCOL.md" {
 test "the level-up offer encodes in PROTOCOL.md order" {
     const gpa = std.testing.allocator;
     const options = [_]UpgradeOptionNet{
-        .{ .item_id = 0, .next_level = 2, .is_evo = 0 },
-        .{ .item_id = 16, .next_level = 1, .is_evo = 0 },
-        .{ .item_id = 32, .next_level = 8, .is_evo = 1 },
+        .{ .item_id = 0, .next_level = 2, .is_evo = 0, .stat_type = 0, .current_stat_fp = 2000, .upgraded_stat_fp = 3000 },
+        .{ .item_id = 16, .next_level = 1, .is_evo = 0, .stat_type = 0, .current_stat_fp = 0, .upgraded_stat_fp = 1000 },
+        .{ .item_id = 32, .next_level = 8, .is_evo = 1, .stat_type = 0, .current_stat_fp = 9000, .upgraded_stat_fp = 6500 },
     };
     const frame = try encodeLevelupOffer(gpa, 1, 7, 3, &options);
     defer gpa.free(frame);
 
     const header = decodeFrameHeader(frame).?;
     try std.testing.expectEqual(msg.s2c_levelup_offer, header.msg_type);
-    try std.testing.expectEqual(@as(u16, 14), header.payload_len);
+    try std.testing.expectEqual(@as(u16, 29), header.payload_len);
     try std.testing.expectEqualSlices(u8, &.{
         1, // player_id
         7, 0, // event_id
         3, 0, // new_level
-        0, 2, 0, // option 0
-        16, 1, 0, // option 1
-        32, 8, 1, // option 2
+        // option 0: sword level 2, damage 20.00 -> 30.00
+        0, 2, 0, 0, 208, 7, 184, 11,
+        // option 1: P0 level 1, damage +0.00 -> +10.00
+        16, 1, 0, 0, 0, 0, 232, 3,
+        // option 2: Vorpal Blender, damage 90.00 -> 65.00
+        32, 8, 1, 0, 40, 35, 100, 25,
     }, frame[header_size..]);
 }
 

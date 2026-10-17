@@ -7,7 +7,10 @@
 //! Phase 3 adds the upgrade engine on top of the phase-2 combat core: XP gems
 //! and the magnet, the XP curve and the level-up pause, the ten passives, the
 //! eight-level weapon tables, the eight evolutions, the five synergies, the
-//! uncapped Overclock endgame, and player death.
+//! uncapped Overclock endgame, and player death. Phase 6 adds the protocol v2
+//! race system: `C2S_HELLO` picks a race (base stats, mana, dash) and a single
+//! starting weapon, and the player dashes on the input's dash bit when the
+//! cooldown and the mana allow it.
 //!
 //! The order of systems inside a tick is fixed, because determinism depends on
 //! it:
@@ -43,6 +46,7 @@ const upgrade = @import("upgrade.zig");
 const loadout = @import("loadout.zig");
 const gem = @import("gem.zig");
 const evolve = @import("evolve.zig");
+const races = @import("races.zig");
 
 /// Simulation state (DESIGN.md §5 game_state values).
 pub const GameState = enum(u8) {
@@ -55,10 +59,9 @@ pub const GameState = enum(u8) {
 pub const InputFrame = struct {
     input_seq: u32 = 0,
     client_tick: u32 = 0,
-    move_x: i8 = 0,
-    move_y: i8 = 0,
-    aim_angle: u16 = 0,
     buttons: u8 = 0,
+    axis_x: i8 = 0,
+    axis_y: i8 = 0,
 };
 
 /// DESIGN.md §2 `state_flags` bit layout.
@@ -144,6 +147,14 @@ pub const PlayerState = struct {
     id: u8 = 0,
     active: bool = false,
     flags: StateFlags = .{},
+    /// The race `C2S_HELLO` chose; indexes `races.RACE_SPECS`.
+    race_id: u8 = 0,
+    /// The weapon `C2S_HELLO` chose as the run's only starting weapon. Kept
+    /// across a restart, which resets to the same single weapon (protocol v2).
+    starting_weapon_id: u8 = 0,
+    /// The race's flat damage reduction, kept apart from the loadout's armor so
+    /// the two are never confused (races.zig `base_armor`).
+    race_armor: i16 = 0,
     pos: [2]f32 = .{ 0.0, 0.0 },
     vel: [2]f32 = .{ 0.0, 0.0 },
     aim_dir: [2]f32 = .{ 1.0, 0.0 },
@@ -151,6 +162,16 @@ pub const PlayerState = struct {
     max_hp: f32 = root.player_max_hp,
     /// Temporary shield, absorbed before HP (Juggernaut Halberd).
     shield: f32 = 0.0,
+    /// The race's shield ceiling; `shield` never rises above it on its own.
+    max_shield: f32 = 0.0,
+    /// Mana, spent on the race's dash and refilled at `races.mana_regen_per_sec`.
+    mana: f32 = 0.0,
+    max_mana: f32 = 0.0,
+    /// Ticks until the dash is available again.
+    dash_cd_ticks: u16 = 0,
+    /// Ticks of dash i-frames left; `is_dashing` mirrors this for the wire.
+    dash_iframe_ticks: u16 = 0,
+    is_dashing: bool = false,
     xp: u32 = 0,
     /// XP needed to reach the next level (`upgrade.xpForLevel(level)`).
     xp_next: u32 = upgrade.xpForLevel(1),
@@ -184,8 +205,17 @@ pub const PlayerState = struct {
 
     /// Integrate one fixed step. Pure function of `(input, dt, move_speed_mult)`.
     pub fn integrate(p: *PlayerState, dt: f32, move_speed_mult: f32) void {
-        var mx: f32 = @as(f32, @floatFromInt(p.input.move_x)) / 100.0;
-        var my: f32 = @as(f32, @floatFromInt(p.input.move_y)) / 100.0;
+        var mx: f32 = @as(f32, @floatFromInt(p.input.axis_x)) / 100.0;
+        var my: f32 = @as(f32, @floatFromInt(p.input.axis_y)) / 100.0;
+
+        // Digital buttons are the fallback when no analog axis is held: the bit
+        // layout is bit0=up, bit1=down, bit2=left, bit3=right.
+        if (mx == 0.0 and my == 0.0) {
+            mx = @as(f32, @intFromBool(p.input.buttons & wire.button.right != 0)) -
+                @as(f32, @intFromBool(p.input.buttons & wire.button.left != 0));
+            my = @as(f32, @intFromBool(p.input.buttons & wire.button.up != 0)) -
+                @as(f32, @intFromBool(p.input.buttons & wire.button.down != 0));
+        }
 
         // Keep diagonal movement at the same speed as axis-aligned movement.
         const mag = std.math.hypot(mx, my);
@@ -215,6 +245,38 @@ pub const PlayerState = struct {
             p.kinetic_charge += 10.0 * std.math.hypot(dx, dy);
         }
     }
+
+    /// The race's dash: spend the mana, start the cooldown, grant the i-frames
+    /// and translate the player along the direction of travel (protocol v2).
+    ///
+    /// The i-frames are real invulnerability, not just a wire flag — a dash
+    /// through a swarm has to actually cross it. The direction is the current
+    /// movement, or the aim the player is holding when standing still.
+    pub fn tryDash(p: *PlayerState) void {
+        const spec = races.RACE_SPECS[p.race_id];
+        if (p.dash_cd_ticks > 0) return;
+        const cost: f32 = @as(f32, @floatFromInt(spec.dash_mana_cost));
+        if (p.mana < cost) return;
+
+        p.mana -= cost;
+        p.dash_cd_ticks = spec.dash_cooldown_ticks;
+        p.dash_iframe_ticks = spec.dash_iframe_ticks;
+        p.is_dashing = true;
+        p.invuln_ticks = @max(p.invuln_ticks, spec.dash_iframe_ticks);
+
+        var dir = p.aim_dir;
+        const mx: f32 = @as(f32, @floatFromInt(p.input.axis_x)) / 100.0;
+        const my: f32 = @as(f32, @floatFromInt(p.input.axis_y)) / 100.0;
+        if (mx != 0.0 or my != 0.0) {
+            const mag = std.math.hypot(mx, my);
+            dir = .{ mx / mag, my / mag };
+        }
+        p.pos[0] += dir[0] * spec.dash_distance;
+        p.pos[1] += dir[1] * spec.dash_distance;
+        const limit = root.arena_half_size - root.player_half_extent;
+        p.pos[0] = std.math.clamp(p.pos[0], -limit, limit);
+        p.pos[1] = std.math.clamp(p.pos[1], -limit, limit);
+    }
 };
 
 /// True when `pos` is within `r2` (a squared radius) of `centre`. The
@@ -224,6 +286,23 @@ fn inRadius(pos: [2]f32, centre: [2]f32, r2: f32) bool {
     const dx = pos[0] - centre[0];
     const dy = pos[1] - centre[1];
     return dx * dx + dy * dy <= r2;
+}
+
+/// Windup progress on the wire's 1..255 scale: 1 at the start of the windup,
+/// 255 at the end. Zero total means there is no windup to report.
+fn telegraphProgress(elapsed: f32, total: f32) u8 {
+    if (total <= 0.0) return 0;
+    if (elapsed <= 0.0) return 1;
+    const p = 1.0 + @min(elapsed / total, 1.0) * 254.0;
+    return @intFromFloat(@min(p, 255.0));
+}
+
+/// An angle in radians as the wire's `telegraph_angle`: milliradians in the
+/// -3142..3142 range the spec gives a i16.
+fn angleToMillirads(angle: f32) i16 {
+    if (!std.math.isFinite(angle)) return 0;
+    const scaled = @round(angle * 1000.0);
+    return @intFromFloat(std.math.clamp(scaled, -3142.0, 3142.0));
 }
 
 /// Fixed-timestep simulation. One instance per running game.
@@ -316,31 +395,58 @@ pub const Simulation = struct {
     }
 
     /// Reserve a player slot for `hello`. Returns `null` when full.
-    pub fn spawnPlayer(self: *Simulation, requested_slot: u8) ?*PlayerState {
+    ///
+    /// `race_id` and `starting_weapon_id` come from `C2S_HELLO`: the race fixes
+    /// the player's base stats, and the run starts with only that one weapon at
+    /// level 1, the other three slots empty (protocol v2).
+    pub fn spawnPlayer(
+        self: *Simulation,
+        requested_slot: u8,
+        race_id: u8,
+        starting_weapon_id: u8,
+    ) ?*PlayerState {
+        if (races.spec(race_id) == null) return null;
+        if (starting_weapon_id >= root.max_weapons) return null;
         if (requested_slot != 0) {
             if (requested_slot >= root.max_players) return null;
             if (self.players[requested_slot].active) return null;
             self.players[requested_slot].active = true;
-            resetPlayer(&self.players[requested_slot], self.loadout);
+            resetPlayer(&self.players[requested_slot], self.loadout, race_id, starting_weapon_id);
             return &self.players[requested_slot];
         }
         for (&self.players) |*p| {
             if (!p.active) {
                 p.active = true;
-                resetPlayer(p, self.loadout);
+                resetPlayer(p, self.loadout, race_id, starting_weapon_id);
                 return p;
             }
         }
         return null;
     }
 
-    /// Give a player a fresh run: the four level 1 weapons of DESIGN.md §3, no
-    /// passives, level 1, full HP — plus `l` when one is set.
-    fn resetPlayer(p: *PlayerState, l: ?loadout.Loadout) void {
-        p.flags = .{ .alive = true };
-        p.hp = root.player_max_hp;
-        p.max_hp = root.player_max_hp;
+    /// Give a player a fresh run: the race's base stats, only the starting
+    /// weapon at level 1, no passives, level 1, full HP — plus `l` when one is
+    /// set.
+    fn resetPlayer(
+        p: *PlayerState,
+        l: ?loadout.Loadout,
+        race_id: u8,
+        starting_weapon_id: u8,
+    ) void {
+        const spec = races.RACE_SPECS[race_id];
+        p.race_id = race_id;
+        p.starting_weapon_id = starting_weapon_id;
+        p.race_armor = spec.base_armor;
+        p.max_hp = @as(f32, @floatFromInt(spec.max_hp));
+        p.hp = p.max_hp;
+        p.max_shield = @as(f32, @floatFromInt(spec.max_shield));
         p.shield = 0.0;
+        p.max_mana = @as(f32, @floatFromInt(spec.max_mana));
+        p.mana = p.max_mana;
+        p.dash_cd_ticks = 0;
+        p.dash_iframe_ticks = 0;
+        p.is_dashing = false;
+        p.flags = .{ .alive = true };
         p.pos = .{ 0.0, 0.0 };
         p.vel = .{ 0.0, 0.0 };
         p.aim_dir = .{ 1.0, 0.0 };
@@ -356,15 +462,16 @@ pub const Simulation = struct {
         p.sword_reach_bonus = 0.0;
         p.carapace_cd = 0;
         p.weapons = root.filledWithDefault(WeaponSlot, root.max_weapons);
-        for (&p.weapons, 0..) |*slot, i| {
-            slot.id = @intCast(i);
-            slot.level = 1;
-            slot.cooldown_ticks = 0;
-            slot.evolved = false;
-            slot.pending_slashes = 0;
-            slot.pending_timer = 0;
-            slot.shots_fired = 0;
-        }
+        // Only the starting weapon, at level 1, in its own slot; the other
+        // three stay empty until a level-up offers them (protocol v2).
+        const slot = &p.weapons[starting_weapon_id];
+        slot.id = starting_weapon_id;
+        slot.level = 1;
+        slot.cooldown_ticks = 0;
+        slot.evolved = false;
+        slot.pending_slashes = 0;
+        slot.pending_timer = 0;
+        slot.shots_fired = 0;
         if (l) |load| {
             load.apply(&p.weapons, &p.passives);
             p.synergy_mask = upgrade.synergyMask(&p.weapons, &p.passives);
@@ -387,10 +494,9 @@ pub const Simulation = struct {
         p.input = .{
             .input_seq = input.input_seq,
             .client_tick = input.client_tick,
-            .move_x = input.move_x,
-            .move_y = input.move_y,
-            .aim_angle = input.aim_angle,
             .buttons = input.buttons,
+            .axis_x = input.axis_x,
+            .axis_y = input.axis_y,
         };
         p.last_input_seq = input.input_seq;
     }
@@ -411,7 +517,20 @@ pub const Simulation = struct {
         for (&self.players) |*p| {
             if (!p.active or !p.flags.alive) continue;
             const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
-            p.integrate(dt, stats.move_speed_mult);
+            const spec = races.RACE_SPECS[p.race_id];
+            p.integrate(dt, stats.move_speed_mult * spec.move_speed_mult);
+
+            // The race's dash: on the buttons' dash bit, when the cooldown has
+            // elapsed and the mana is there to pay for it.
+            if (p.input.buttons & wire.button.dash != 0) PlayerState.tryDash(p);
+
+            // Mana refills flat, so the dash stays available over a long run.
+            p.mana = @min(p.mana + races.mana_regen_per_sec * dt, p.max_mana);
+            if (p.dash_cd_ticks > 0) p.dash_cd_ticks -= 1;
+            if (p.dash_iframe_ticks > 0) {
+                p.dash_iframe_ticks -= 1;
+                if (p.dash_iframe_ticks == 0) p.is_dashing = false;
+            }
 
             // Nano Repair (DESIGN.md §3): HP restored per second.
             if (stats.regen_per_sec > 0.0 and p.hp < p.max_hp) {
@@ -616,9 +735,55 @@ pub const Simulation = struct {
                         vel = .{ dir[0] * speed, dir[1] * speed };
                     },
                 }
+
+                // Telegraph (protocol v2 EnemyNet): what the client draws as the
+                // windup warning. The darter's pause and the boss's stand-still
+                // are both a line charge along the locked direction, over the
+                // distance the lunge or dash covers. Every other enemy reports
+                // no windup, so a stale record can never describe an attack
+                // that is not coming.
+                const state: enemy.AiState = @enumFromInt(self.enemies.ai_state[i]);
+                if (archetype == .triangle_t1 and state == .windup) {
+                    const total: f32 = @floatFromInt(enemy.darter.pause_ticks);
+                    self.enemies.telegraph_progress[i] =
+                        telegraphProgress(total - @as(f32, @floatFromInt(self.enemies.ai_timer[i])), total);
+                    self.enemies.telegraph_shape[i] =
+                        @intFromEnum(wire.TelegraphShape.line_charge);
+                    self.enemies.telegraph_angle[i] =
+                        angleToMillirads(std.math.atan2(dir[1], dir[0]));
+                    self.enemies.telegraph_radius[i] = @intFromFloat(@round(
+                        enemy.darter.lunge_speed *
+                            (@as(f32, @floatFromInt(enemy.darter.lunge_ticks)) /
+                                @as(f32, @floatFromInt(root.tick_hz))),
+                    ));
+                } else if (archetype == .boss and state == .telegraph) {
+                    const total: f32 = @floatFromInt(enemy.boss.telegraph_ticks);
+                    self.enemies.telegraph_progress[i] =
+                        telegraphProgress(total - @as(f32, @floatFromInt(self.enemies.ai_timer[i])), total);
+                    self.enemies.telegraph_shape[i] =
+                        @intFromEnum(wire.TelegraphShape.line_charge);
+                    self.enemies.telegraph_angle[i] = angleToMillirads(std.math.atan2(
+                        self.enemies.facing[i][1],
+                        self.enemies.facing[i][0],
+                    ));
+                    self.enemies.telegraph_radius[i] = @intFromFloat(@round(
+                        enemy.boss.dash_speed *
+                            (@as(f32, @floatFromInt(enemy.boss.dash_ticks)) /
+                                @as(f32, @floatFromInt(root.tick_hz))),
+                    ));
+                } else {
+                    self.enemies.telegraph_progress[i] = 0;
+                    self.enemies.telegraph_shape[i] = 0;
+                    self.enemies.telegraph_angle[i] = 0;
+                    self.enemies.telegraph_radius[i] = 0;
+                }
             } else {
                 self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
                 self.enemies.ai_timer[i] = 0;
+                self.enemies.telegraph_progress[i] = 0;
+                self.enemies.telegraph_shape[i] = 0;
+                self.enemies.telegraph_angle[i] = 0;
+                self.enemies.telegraph_radius[i] = 0;
             }
 
             // Cryo Flechette: a frozen enemy does not move; a slowed one moves
@@ -986,9 +1151,13 @@ pub const Simulation = struct {
         spec: weapon.Spec,
         dir: [2]f32,
     ) void {
+        // The race's damage multiplier (protocol v2) scales the resolved spec
+        // on top of the loadout's own multipliers.
+        var spec_mut = spec;
+        spec_mut.damage *= races.RACE_SPECS[p.race_id].damage_mult;
+
         // Kinetic Charge: at 100 charge the activation gains +40% damage and
         // +50% projectile speed (DESIGN.md §3).
-        var spec_mut = spec;
         if (p.synergy_mask & upgrade.synergy_kinetic_charge != 0 and p.kinetic_charge >= 100.0) {
             spec_mut.damage *= 1.4;
             spec_mut.speed *= 1.5;
@@ -1106,8 +1275,11 @@ pub const Simulation = struct {
                 self.enemies.contact_cd[e] = enemy.contact_cooldown_ticks;
 
                 const raw = self.enemies.contact_dmg[e];
-                // Titanium Plating: -3 flat damage taken, minimum 1.
-                var taken = @max(raw - stats.armor_flat, 1.0);
+                // The race's base armor (protocol v2) and Titanium Plating both
+                // reduce the damage taken, minimum 1.
+                const reduction = stats.armor_flat +
+                    @as(f32, @floatFromInt(p.race_armor));
+                var taken = @max(raw - reduction, 1.0);
                 if (p.shield > 0.0) {
                     const absorbed = @min(p.shield, taken);
                     p.shield -= absorbed;
@@ -1194,7 +1366,9 @@ pub const Simulation = struct {
                 )) continue;
 
                 const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
-                var taken = @max(self.projectiles.damage[i] - stats.armor_flat, 1.0);
+                const reduction = stats.armor_flat +
+                    @as(f32, @floatFromInt(p.race_armor));
+                var taken = @max(self.projectiles.damage[i] - reduction, 1.0);
                 if (p.shield > 0.0) {
                     const absorbed = @min(p.shield, taken);
                     p.shield -= absorbed;
@@ -1232,8 +1406,12 @@ pub const Simulation = struct {
                 for (&self.players) |*p| {
                     if (!p.active or !p.flags.alive) continue;
                     const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
+                    // The race's pickup multiplier (protocol v2) widens the
+                    // magnet's attraction range on top of Magnet Array's.
+                    const pickup = stats.pickup_radius *
+                        races.RACE_SPECS[p.race_id].pickup_radius_mult;
                     const d = combat.sub(p.pos, self.gems.pos[i]);
-                    if (d[0] * d[0] + d[1] * d[1] <= stats.pickup_radius * stats.pickup_radius) {
+                    if (d[0] * d[0] + d[1] * d[1] <= pickup * pickup) {
                         self.gems.magnet_target[i] = p.id;
                         break;
                     }
@@ -1279,11 +1457,20 @@ pub const Simulation = struct {
     }
 
     /// Award XP to a player.
+    ///
+    /// The race's XP multiplier (protocol v2) scales every gem collected, so a
+    /// Cervid Sylvan levels faster than the spec's 1.00 races for the same
+    /// gems.
     pub fn gainXp(self: *Simulation, player_id: u8, amount: u32) void {
         if (player_id >= root.max_players) return;
         const p = &self.players[player_id];
         if (!p.active or !p.flags.alive) return;
-        p.xp += amount;
+        const mult = races.RACE_SPECS[p.race_id].xp_gain_mult;
+        const gained: u32 = @intFromFloat(@max(
+            1.0,
+            @as(f32, @floatFromInt(amount)) * mult,
+        ));
+        p.xp += gained;
         self.loadout_dirty[player_id] = true;
     }
 
@@ -1462,7 +1649,9 @@ pub const Simulation = struct {
 
         for (&self.players) |*p| {
             if (!p.active) continue;
-            resetPlayer(p, self.loadout);
+            // A restart is not a new `C2S_HELLO`: the player keeps the race
+            // and the starting weapon the run began with.
+            resetPlayer(p, self.loadout, p.race_id, p.starting_weapon_id);
             self.loadout_dirty[p.id] = true;
         }
     }
@@ -1631,21 +1820,45 @@ pub const Simulation = struct {
         return n;
     }
 
-    /// Quantized wire form of one player (PROTOCOL.md "PlayerNet", 8 bytes).
+    /// Quantized wire form of one player (protocol v2 "PlayerNet", 20 bytes).
+    ///
+    /// The dash cooldown travels in milliseconds while the simulation counts it
+    /// in ticks; `is_dashing` mirrors the dash i-frames so the client can both
+    /// show the cooldown bar and flash the player during them.
     pub fn playerNet(p: *const PlayerState) wire.PlayerNet {
+        const spec = races.RACE_SPECS[p.race_id];
+        const shield_pct: u8 = if (p.max_shield > 0.0)
+            hpPercent(p.shield, p.max_shield)
+        else
+            0;
         return .{
             .player_id = p.id,
             .state_flags = StateFlags.byte(p.flags),
+            .race_id = p.race_id,
             .pos_x = wire.quantize(p.pos[0]),
             .pos_y = wire.quantize(p.pos[1]),
             .vel_angle = wire.angleToByte(
                 std.math.atan2(@as(f32, p.vel[1]), @as(f32, p.vel[0])),
             ),
             .hp_pct = hpPercent(p.hp, p.max_hp),
+            .shield_pct = shield_pct,
+            .mana_pct = hpPercent(p.mana, p.max_mana),
+            .dash_cd_remaining = ticksToMs(p.dash_cd_ticks),
+            .dash_cd_total = ticksToMs(spec.dash_cooldown_ticks),
+            .is_dashing = @intFromBool(p.is_dashing),
+            // Clamped: the wire fields are u16 and a stress load can push max
+            // HP past 65535, which must not become a panic here.
+            .max_hp = @as(u16, @intFromFloat(std.math.clamp(p.max_hp, 0.0, 65535.0))),
+            .max_shield = @as(u16, @intFromFloat(std.math.clamp(p.max_shield, 0.0, 65535.0))),
         };
     }
 
-    /// Quantized wire form of one enemy (PROTOCOL.md "EnemyNet", 12 bytes).
+    /// Simulation ticks to the milliseconds the wire reports them in.
+    fn ticksToMs(ticks: u16) u16 {
+        return @intCast(@as(u32, ticks) * 1000 / root.tick_hz);
+    }
+
+    /// Quantized wire form of one enemy (protocol v2 "EnemyNet", 18 bytes).
     pub fn enemyNet(pool: *const enemy.Pool, i: usize) wire.EnemyNet {
         const pos = pool.pos[i];
         const facing = pool.facing[i];
@@ -1661,6 +1874,12 @@ pub const Simulation = struct {
             .pos_y = wire.quantize(pos[1]),
             .vel_angle = wire.angleToByte(std.math.atan2(facing[1], facing[0])),
             .hp_pct = hpPercent(hp, pool.max_hp[i]),
+            .telegraph_progress = pool.telegraph_progress[i],
+            .telegraph_shape = pool.telegraph_shape[i],
+            // The pool keeps the angle as a signed i16; the wire field is a
+            // u16 carrying the same two's-complement bit pattern.
+            .telegraph_angle = @as(u16, @bitCast(pool.telegraph_angle[i])),
+            .telegraph_radius = pool.telegraph_radius[i],
         };
     }
 
@@ -1801,15 +2020,14 @@ pub const Simulation = struct {
 
 test "integrator moves a player at 12 units per second" {
     var sim = Simulation.init();
-    const player = sim.spawnPlayer(0).?;
+    const player = sim.spawnPlayer(0, 0, 0).?;
 
     const input = wire.Input{
         .input_seq = 1,
         .client_tick = 1,
-        .move_x = 100,
-        .move_y = 0,
-        .aim_angle = 0,
         .buttons = 0,
+        .axis_x = 100,
+        .axis_y = 0,
     };
     sim.applyInput(0, input);
 
@@ -1824,8 +2042,8 @@ test "integrator moves a player at 12 units per second" {
 
 test "integrator advances at most 0.2 units per tick" {
     var sim = Simulation.init();
-    const player = sim.spawnPlayer(0).?;
-    sim.applyInput(0, .{ .input_seq = 1, .move_x = 100, .move_y = 100 });
+    const player = sim.spawnPlayer(0, 0, 0).?;
+    sim.applyInput(0, .{ .input_seq = 1, .axis_x = 100, .axis_y = 100 });
 
     const before = player.pos;
     sim.advance();
@@ -1838,12 +2056,12 @@ test "integrator advances at most 0.2 units per tick" {
 
 test "diagonal input is not faster than axis input" {
     var sim = Simulation.init();
-    const straight = sim.spawnPlayer(0).?;
-    sim.applyInput(0, .{ .input_seq = 1, .move_x = 100, .move_y = 0 });
+    const straight = sim.spawnPlayer(0, 0, 0).?;
+    sim.applyInput(0, .{ .input_seq = 1, .axis_x = 100, .axis_y = 0 });
 
     var sim2 = Simulation.init();
-    const diagonal = sim2.spawnPlayer(0).?;
-    sim2.applyInput(0, .{ .input_seq = 1, .move_x = 100, .move_y = 100 });
+    const diagonal = sim2.spawnPlayer(0, 0, 0).?;
+    sim2.applyInput(0, .{ .input_seq = 1, .axis_x = 100, .axis_y = 100 });
 
     var i: usize = 0;
     while (i < 60) : (i += 1) {
@@ -1858,8 +2076,8 @@ test "diagonal input is not faster than axis input" {
 
 test "integrator clamps to the arena walls" {
     var sim = Simulation.init();
-    const player = sim.spawnPlayer(0).?;
-    sim.applyInput(0, .{ .input_seq = 1, .move_x = 100, .move_y = 0 });
+    const player = sim.spawnPlayer(0, 0, 0).?;
+    sim.applyInput(0, .{ .input_seq = 1, .axis_x = 100, .axis_y = 0 });
 
     var i: usize = 0;
     // 999.5 units at 12 u/s needs ~84 s == ~5000 ticks.
@@ -1876,7 +2094,7 @@ test "integrator clamps to the arena walls" {
 
 test "a stationary player stays put" {
     var sim = Simulation.init();
-    const player = sim.spawnPlayer(0).?;
+    const player = sim.spawnPlayer(0, 0, 0).?;
     var i: usize = 0;
     while (i < 120) : (i += 1) sim.advance();
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), player.pos[0], 0.000001);
@@ -1885,20 +2103,20 @@ test "a stationary player stays put" {
 
 test "acked_seq reports the newest applied input and nothing else" {
     var sim = Simulation.init();
-    _ = sim.spawnPlayer(0).?;
+    _ = sim.spawnPlayer(0, 0, 0).?;
 
     const acked = sim.ackedSeq();
     try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 0, 0, 0 }, &acked);
 
-    sim.applyInput(0, .{ .input_seq = 5, .move_x = 100 });
+    sim.applyInput(0, .{ .input_seq = 5, .axis_x = 100 });
     try std.testing.expectEqual(@as(u32, 5), sim.ackedSeq()[0]);
 
     // Duplicates and out-of-order sequences are ignored.
-    sim.applyInput(0, .{ .input_seq = 5, .move_x = 0 });
-    sim.applyInput(0, .{ .input_seq = 3, .move_x = 0 });
+    sim.applyInput(0, .{ .input_seq = 5, .axis_x = 0 });
+    sim.applyInput(0, .{ .input_seq = 3, .axis_x = 0 });
     try std.testing.expectEqual(@as(u32, 5), sim.ackedSeq()[0]);
 
-    sim.applyInput(0, .{ .input_seq = 6, .move_x = 0 });
+    sim.applyInput(0, .{ .input_seq = 6, .axis_x = 0 });
     try std.testing.expectEqual(@as(u32, 6), sim.ackedSeq()[0]);
     // Player slots that never joined stay at zero.
     try std.testing.expectEqual(@as(u32, 0), sim.ackedSeq()[1]);
@@ -1906,22 +2124,22 @@ test "acked_seq reports the newest applied input and nothing else" {
 
 test "spawn refuses to hand out more than max_players slots" {
     var sim = Simulation.init();
-    try std.testing.expect(sim.spawnPlayer(0) != null);
-    try std.testing.expect(sim.spawnPlayer(0) != null);
-    try std.testing.expect(sim.spawnPlayer(0) != null);
-    try std.testing.expect(sim.spawnPlayer(0) != null);
-    try std.testing.expect(sim.spawnPlayer(0) == null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 0) != null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 0) != null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 0) != null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 0) != null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 0) == null);
     try std.testing.expectEqual(@as(u8, 4), sim.activePlayerCount());
 
     // An explicit slot is honoured and double-booked only once.
     var sim2 = Simulation.init();
-    try std.testing.expect(sim2.spawnPlayer(2) != null);
-    try std.testing.expect(sim2.spawnPlayer(2) == null);
+    try std.testing.expect(sim2.spawnPlayer(2, 0, 0) != null);
+    try std.testing.expect(sim2.spawnPlayer(2, 0, 0) == null);
     try std.testing.expectEqual(@as(u8, 1), sim2.activePlayerCount());
-    try std.testing.expect(sim2.spawnPlayer(9) == null);
+    try std.testing.expect(sim2.spawnPlayer(9, 0, 0) == null);
 
     sim.despawnPlayer(0);
-    try std.testing.expect(sim.spawnPlayer(0) != null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 0) != null);
 }
 
 test "run_time_ms is derived from the tick counter" {
@@ -1932,11 +2150,101 @@ test "run_time_ms is derived from the tick counter" {
     try std.testing.expectEqual(@as(u32, 500), sim.runTimeMs());
 }
 
+// ---------------------------------------------------------------------------
+// Protocol v2 — the race's dash
+// ---------------------------------------------------------------------------
+
+test "the dash spends mana, starts the cooldown and translates the player" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0, 0, 0).?;
+    disarm(p);
+    // Race 0: dash distance 180, cost 25, cooldown 210 ticks, 12 i-frame
+    // ticks. One walking tick covers 0.2 units, so the dash lands 180.2 out.
+    sim.applyInput(0, .{ .input_seq = 1, .buttons = wire.button.dash, .axis_x = 100 });
+    sim.advance();
+
+    try std.testing.expectApproxEqAbs(@as(f32, 180.2), p.pos[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), p.pos[1], 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f32, 75.07), p.mana, 0.01);
+    try std.testing.expectEqual(@as(u16, 209), p.dash_cd_ticks);
+    try std.testing.expectEqual(@as(u16, 11), p.dash_iframe_ticks);
+    try std.testing.expect(p.is_dashing);
+
+    // The i-frames are real invulnerability: a swarmer on top of the player
+    // cannot hurt it mid-dash.
+    _ = sim.enemies.spawn(.circle_t1, .{ p.pos[0] + 0.4, p.pos[1] }).?;
+    sim.advance();
+    try std.testing.expectApproxEqAbs(@as(f32, 110.0), p.hp, 1e-4);
+
+    // A second dash input is refused while the cooldown runs. The mana cap is
+    // pinned to the current mana so the refill cannot masquerade as a second
+    // dash's cost.
+    p.max_mana = p.mana;
+    const mana_before = p.mana;
+    const pos_before = p.pos[0];
+    sim.applyInput(0, .{ .input_seq = 2, .buttons = wire.button.dash, .axis_x = 100 });
+    sim.advance();
+    try std.testing.expectEqual(mana_before, p.mana);
+    try std.testing.expectApproxEqAbs(pos_before + 0.2, p.pos[0], 0.001);
+    try std.testing.expectEqual(@as(u16, 207), p.dash_cd_ticks);
+}
+
+test "a dash without the mana does not fire" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0, 0, 0).?;
+    disarm(p);
+    p.mana = 10.0; // race 0's dash costs 25
+    p.max_mana = 10.0;
+    const x_before = p.pos[0];
+    sim.applyInput(0, .{ .input_seq = 1, .buttons = wire.button.dash, .axis_x = 100 });
+    sim.advance();
+
+    // Only the walking tick's movement happened.
+    try std.testing.expectApproxEqAbs(x_before + 0.2, p.pos[0], 0.001);
+    try std.testing.expectEqual(@as(u16, 0), p.dash_cd_ticks);
+    try std.testing.expect(!p.is_dashing);
+}
+
+test "the dash cooldown is reported in milliseconds on the wire" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0, 0, 0).?;
+    sim.applyInput(0, .{ .input_seq = 1, .buttons = wire.button.dash });
+    sim.advance();
+
+    const net = Simulation.playerNet(p);
+    try std.testing.expectEqual(@as(u8, 0), net.race_id);
+    // Race 0's cooldown is 210 ticks; 210 x 1000 / 60 = 3500 ms, and 209
+    // ticks remain after the tick that fired it.
+    try std.testing.expectEqual(@as(u16, 209 * 1000 / 60), net.dash_cd_remaining);
+    try std.testing.expectEqual(@as(u16, 210 * 1000 / 60), net.dash_cd_total);
+    try std.testing.expectEqual(@as(u8, 1), net.is_dashing);
+    try std.testing.expectEqual(@as(u16, 110), net.max_hp);
+    try std.testing.expectEqual(@as(u16, 25), net.max_shield);
+    try std.testing.expectEqual(@as(u8, 75), net.mana_pct);
+    // Shield starts at zero, so the shield bar reads empty.
+    try std.testing.expectEqual(@as(u8, 0), net.shield_pct);
+}
+
+test "mana refills over time so the dash stays available" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0, 0, 0).?;
+    disarm(p);
+    p.mana = 0.0;
+    // 4.0 per second: 24 mana at 6 s, short of the 25 the dash costs.
+    var i: usize = 0;
+    while (i < 6 * 60) : (i += 1) sim.advance();
+    try std.testing.expectApproxEqAbs(@as(f32, 24.0), p.mana, 0.01);
+    // Fifteen more ticks is enough.
+    i = 0;
+    while (i < 15) : (i += 1) sim.advance();
+    try std.testing.expect(p.mana >= 25.0);
+}
+
 test "snapshot view quantizes positions and reports acked sequences" {
     var sim = Simulation.init();
-    const player = sim.spawnPlayer(0).?;
+    const player = sim.spawnPlayer(0, 0, 0).?;
     _ = player;
-    sim.applyInput(0, .{ .input_seq = 7, .move_x = 100, .move_y = -100 });
+    sim.applyInput(0, .{ .input_seq = 7, .axis_x = 100, .axis_y = -100 });
     sim.advance();
 
     const view = sim.snapshotView();
@@ -1955,21 +2263,83 @@ test "snapshot view quantizes positions and reports acked sequences" {
     try std.testing.expectEqual(@as(u8, 0), view.players[0].player_id);
     try std.testing.expectEqual(@as(u8, 1), view.players[0].state_flags);
     try std.testing.expectEqual(@as(u8, 100), view.players[0].hp_pct);
+    // The protocol v2 player fields ride along with the position.
+    try std.testing.expectEqual(@as(u8, 0), view.players[0].race_id);
+    try std.testing.expectEqual(@as(u16, 110), view.players[0].max_hp);
+    try std.testing.expectEqual(@as(u16, 25), view.players[0].max_shield);
+    try std.testing.expectEqual(@as(u8, 100), view.players[0].mana_pct);
+    try std.testing.expectEqual(@as(u16, 210 * 1000 / 60), view.players[0].dash_cd_total);
+    try std.testing.expectEqual(@as(u16, 0), view.players[0].dash_cd_remaining);
+    try std.testing.expectEqual(@as(u8, 0), view.players[0].is_dashing);
+}
+
+test "a darter's windup telegraphs a line charge at the player" {
+    var sim = Simulation.init();
+    const p = sim.spawnPlayer(0, 0, 0).?;
+    disarm(p);
+    const e = sim.enemies.spawn(.triangle_t1, .{ 10.0, 0.0 }).?;
+
+    // The darter reaches its 10-unit pause range and stands still, winding up
+    // for 24 ticks; the telegraph runs from 1 to 255 over that pause.
+    sim.advance();
+    try std.testing.expectEqual(
+        @as(u8, @intFromEnum(enemy.AiState.windup)),
+        sim.enemies.ai_state[e],
+    );
+    const net0 = Simulation.enemyNet(&sim.enemies, e);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(wire.TelegraphShape.line_charge)), net0.telegraph_shape);
+    try std.testing.expect(net0.telegraph_progress >= 1);
+    try std.testing.expect(net0.telegraph_progress < 255);
+    try std.testing.expectEqual(@as(u16, 8), net0.telegraph_radius); // 15 u/s x 0.5 s, rounded
+
+    var i: usize = 0;
+    while (i < 23) : (i += 1) sim.advance();
+    const net1 = Simulation.enemyNet(&sim.enemies, e);
+    try std.testing.expect(net1.telegraph_progress > net0.telegraph_progress);
+
+    // The lunge begins: the telegraph ends with it.
+    sim.advance();
+    try std.testing.expectEqual(
+        @as(u8, @intFromEnum(enemy.AiState.lunge)),
+        sim.enemies.ai_state[e],
+    );
+    const net2 = Simulation.enemyNet(&sim.enemies, e);
+    try std.testing.expectEqual(@as(u8, 0), net2.telegraph_progress);
+    try std.testing.expectEqual(@as(u8, 0), net2.telegraph_shape);
+    try std.testing.expectEqual(@as(u16, 0), net2.telegraph_radius);
+}
+
+test "a boss's telegraph faces the locked dash direction" {
+    var sim = Simulation.init();
+    _ = disarmedPlayerAtOrigin(&sim);
+
+    const b = sim.enemies.spawn(.boss, .{ 30.0, 0.0 }).?;
+    sim.enemies.ai_timer[b] = 1;
+    sim.enemies.boss_parity[b] = 1; // next attack is the telegraphed dash
+    sim.updateEnemies(1.0 / 60.0);
+
+    const net = Simulation.enemyNet(&sim.enemies, b);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(wire.TelegraphShape.line_charge)), net.telegraph_shape);
+    try std.testing.expect(net.telegraph_progress >= 1);
+    try std.testing.expectEqual(@as(u16, 22), net.telegraph_radius); // 22 u/s x 1.0 s
+    // The boss faces the player at (-30, 0) from (30, 0): an angle of pi, so
+    // the milliradians are clamped to the i16 range's positive end.
+    try std.testing.expectEqual(@as(u16, @bitCast(@as(i16, 3142))), net.telegraph_angle);
 }
 
 test "simulation is deterministic for a fixed input script" {
     var a = Simulation.init();
-    const pa = a.spawnPlayer(0).?;
+    const pa = a.spawnPlayer(0, 0, 0).?;
     var b = Simulation.init();
-    const pb = b.spawnPlayer(0).?;
+    const pb = b.spawnPlayer(0, 0, 0).?;
 
     var seq: u32 = 1;
     var i: usize = 0;
     while (i < 600) : (i += 1) {
         // Alternate direction every 30 ticks.
         const move_x: i8 = if (@mod(i / 30, 2) == 0) 100 else -100;
-        a.applyInput(0, .{ .input_seq = seq, .move_x = move_x, .move_y = 10 });
-        b.applyInput(0, .{ .input_seq = seq, .move_x = move_x, .move_y = 10 });
+        a.applyInput(0, .{ .input_seq = seq, .axis_x = move_x, .axis_y = 10 });
+        b.applyInput(0, .{ .input_seq = seq, .axis_x = move_x, .axis_y = 10 });
         seq += 1;
         a.advance();
         b.advance();
@@ -1995,28 +2365,65 @@ fn disarm(p: *PlayerState) void {
     }
 }
 
-test "a joining player carries all four weapons at level 1" {
+test "a joining player carries only the starting weapon at level 1" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    // Race 0 (Terran Kin) starting with the sword (weapon 0).
+    const p = sim.spawnPlayer(0, 0, 0).?;
     try std.testing.expectEqual(root.max_weapons, p.weapons.len);
-    for (&p.weapons, 0..) |slot, i| {
-        try std.testing.expectEqual(@as(u8, @intCast(i)), slot.id);
-        try std.testing.expectEqual(@as(u8, 1), slot.level);
-        try std.testing.expectEqual(@as(u16, 0), slot.cooldown_ticks);
-        try std.testing.expect(!slot.evolved);
-        try std.testing.expect(slot.spec() != null);
+    try std.testing.expectEqual(@as(u8, 0), p.weapons[0].id);
+    try std.testing.expectEqual(@as(u8, 1), p.weapons[0].level);
+    try std.testing.expectEqual(@as(u16, 0), p.weapons[0].cooldown_ticks);
+    try std.testing.expect(!p.weapons[0].evolved);
+    try std.testing.expect(p.weapons[0].spec() != null);
+    // The other three slots are empty until a level-up offers them.
+    for (p.weapons[1..]) |slot| {
+        try std.testing.expect(slot.isFree());
     }
+
+    // The race's base stats are the player's, before any item touches them.
+    try std.testing.expectEqual(@as(u8, 0), p.race_id);
+    try std.testing.expectEqual(@as(f32, 110.0), p.max_hp);
+    try std.testing.expectEqual(@as(f32, 110.0), p.hp);
+    try std.testing.expectEqual(@as(f32, 25.0), p.max_shield);
+    try std.testing.expectEqual(@as(f32, 100.0), p.max_mana);
+    try std.testing.expectEqual(@as(f32, 100.0), p.mana);
+    try std.testing.expectEqual(@as(i16, 0), p.race_armor);
 
     // A respawned slot is re-equipped rather than inheriting the old cooldowns.
     p.weapons[0].cooldown_ticks = 40;
     sim.despawnPlayer(0);
-    const again = sim.spawnPlayer(0).?;
+    const again = sim.spawnPlayer(0, 0, 0).?;
     try std.testing.expectEqual(@as(u16, 0), again.weapons[0].cooldown_ticks);
+}
+
+test "a joining race carries its own stats" {
+    var sim = Simulation.init();
+    // Race 4 (Saurian Scute): the tank row — most HP and armor, the longest
+    // dash cooldown, the shortest dash.
+    const p = sim.spawnPlayer(0, 4, 3).?;
+    try std.testing.expectEqual(@as(u8, 4), p.race_id);
+    try std.testing.expectEqual(@as(f32, 145.0), p.max_hp);
+    try std.testing.expectEqual(@as(f32, 145.0), p.hp);
+    try std.testing.expectEqual(@as(f32, 40.0), p.max_shield);
+    try std.testing.expectEqual(@as(f32, 80.0), p.max_mana);
+    try std.testing.expectEqual(@as(i16, 8), p.race_armor);
+    // The starting weapon is the gun, in its own slot.
+    try std.testing.expectEqual(@as(u8, 3), p.weapons[3].id);
+    try std.testing.expect(p.weapons[0].isFree());
+}
+
+test "spawn refuses an unknown race or starting weapon" {
+    var sim = Simulation.init();
+    try std.testing.expect(sim.spawnPlayer(0, 10, 0) == null);
+    try std.testing.expect(sim.spawnPlayer(0, 0xff, 0) == null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 4) == null);
+    try std.testing.expect(sim.spawnPlayer(0, 0, 0xff) == null);
+    try std.testing.expectEqual(@as(u8, 0), sim.activePlayerCount());
 }
 
 test "a swarmer pursues the nearest player at 4.5 units per second" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     const e = sim.enemies.spawn(.circle_t1, .{ 20.0, 0.0 }).?;
 
@@ -2032,7 +2439,7 @@ test "a swarmer pursues the nearest player at 4.5 units per second" {
 
 test "the darter pauses 0.4 s at 10 units and then lunges at 15 u/s" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     const e = sim.enemies.spawn(.triangle_t1, .{ 10.0, 0.0 }).?;
 
@@ -2073,22 +2480,22 @@ test "the darter pauses 0.4 s at 10 units and then lunges at 15 u/s" {
 
 test "contact damage hurts the player and can kill them" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
-    try std.testing.expectEqual(@as(f32, 100.0), p.hp);
+    try std.testing.expectEqual(@as(f32, 110.0), p.hp);
 
     // A swarmer sitting on top of the player: 5 damage, twice a second.
     _ = sim.enemies.spawn(.circle_t1, .{ 0.6, 0.0 }).?;
 
     sim.advance();
-    try std.testing.expectApproxEqAbs(@as(f32, 95.0), p.hp, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 105.0), p.hp, 1e-4);
 
     // Held on cooldown for the next 29 ticks.
     var i: usize = 0;
     while (i < 29) : (i += 1) sim.advance();
-    try std.testing.expectApproxEqAbs(@as(f32, 95.0), p.hp, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 105.0), p.hp, 1e-4);
     sim.advance();
-    try std.testing.expectApproxEqAbs(@as(f32, 90.0), p.hp, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0), p.hp, 1e-4);
 
     // Unlike phase 2, HP now reaches zero and the run ends.
     i = 0;
@@ -2101,23 +2508,23 @@ test "contact damage hurts the player and can kill them" {
 
 test "contact damage needs an actual overlap" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     // 1.2 units out: its 0.5 radius does not yet reach the player's 0.5 box.
     _ = sim.enemies.spawn(.circle_t1, .{ 1.2, 0.0 }).?;
 
     sim.advance();
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0), p.hp, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 110.0), p.hp, 1e-4);
 
     // It closes at 4.5 u/s and lands its first hit a couple of ticks later.
     sim.advance();
     sim.advance();
-    try std.testing.expect(p.hp < 100.0);
+    try std.testing.expect(p.hp < 110.0);
 }
 
 test "the spawn wave places enemies in the 48 to 56 unit ring" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.pos = .{ 0.0, 0.0 };
 
@@ -2142,7 +2549,7 @@ test "the spawn wave places enemies in the 48 to 56 unit ring" {
 
 test "the spawn wave follows the players' centroid" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.pos = .{ 400.0, -300.0 };
 
@@ -2191,7 +2598,7 @@ test "placeFrom keeps the ring's radius and stays inside the arena" {
 
 test "a wave spawned against the arena wall keeps its 48 unit inner radius" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     // Hard against the +x wall, where clamping each enemy to the wall would
     // pull it inside the ring.
@@ -2214,7 +2621,7 @@ test "a wave spawned against the arena wall keeps its 48 unit inner radius" {
 
 test "enemies owed to a full active cap are placed by a later wave" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.pos = .{ 0.0, 0.0 };
 
@@ -2245,7 +2652,7 @@ test "enemies owed to a full active cap are placed by a later wave" {
 
 test "spawn debt past the pool size is still owed, not truncated" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.pos = .{ 0.0, 0.0 };
 
@@ -2270,7 +2677,7 @@ test "no spawn happens without a player, and the cap bounds the pool" {
     sim.spawnWave();
     try std.testing.expectEqual(@as(usize, 0), sim.enemies.count);
 
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     // At t = 10 s the cap is 40, however many waves are evaluated.
     sim.tick = 600;
@@ -2282,7 +2689,7 @@ test "no spawn happens without a player, and the cap bounds the pool" {
 test "the triangle archetype only spawns after 1:30" {
     // Before the unlock: every wave is circles.
     var before = Simulation.init();
-    const pb = before.spawnPlayer(0).?;
+    const pb = before.spawnPlayer(0, 0, 0).?;
     disarm(pb);
     before.tick = 89 * root.tick_hz;
     var i: usize = 0;
@@ -2298,7 +2705,7 @@ test "the triangle archetype only spawns after 1:30" {
     // After it, both are in play. A fresh simulation, because the first one is
     // already sitting on the active cap for this point in the run.
     var after = Simulation.init();
-    const pa = after.spawnPlayer(0).?;
+    const pa = after.spawnPlayer(0, 0, 0).?;
     disarm(pa);
     after.tick = 90 * root.tick_hz;
     var circles: usize = 0;
@@ -2318,7 +2725,7 @@ test "the triangle archetype only spawns after 1:30" {
 
 test "a full enemy pool degrades instead of crashing" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
 
     var i: usize = 0;
@@ -2342,7 +2749,7 @@ test "a full enemy pool degrades instead of crashing" {
 
 test "a full projectile pool degrades instead of crashing" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     const gun = weapon.spec(@intFromEnum(weapon.Id.gun)).?;
 
     var i: usize = 0;
@@ -2361,7 +2768,14 @@ test "a full projectile pool degrades instead of crashing" {
 
 test "all four weapons fire, and between them kill enemies" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
+    // v2 starts a run with one weapon; this test is about the four weapons'
+    // firing, so the other three are armed the way a level-up would.
+    for (p.weapons[1..], 1..) |*slot, i| {
+        slot.id = @intCast(i);
+        slot.level = 1;
+        slot.cooldown_ticks = 0;
+    }
 
     // A ring of swarmers just outside the sword's reach but inside the gun's.
     var i: usize = 0;
@@ -2385,12 +2799,11 @@ test "all four weapons fire, and between them kill enemies" {
     while (i < 600) : (i += 1) sim.advance();
     // Kills, not a shrinking pool: the spawn wave is adding enemies throughout.
     try std.testing.expect(sim.kills > 0);
-    _ = p;
 }
 
 test "the sword kills what is in front of it and spares what is behind" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     // Sword only, so the other three cannot confound the result.
     for (&p.weapons, 0..) |*slot, i| {
         if (i != @intFromEnum(weapon.Id.sword)) slot.id = 0xff;
@@ -2417,7 +2830,7 @@ test "the sword kills what is in front of it and spares what is behind" {
 
 test "weapons auto-aim at the nearest enemy without any input" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.weapons[@intFromEnum(weapon.Id.gun)].id = @intFromEnum(weapon.Id.gun);
     p.weapons[@intFromEnum(weapon.Id.gun)].cooldown_ticks = 0;
@@ -2434,7 +2847,7 @@ test "weapons auto-aim at the nearest enemy without any input" {
 
 test "knockback pushes an enemy away from the hit and decays" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.weapons[0].id = @intFromEnum(weapon.Id.sword);
     p.weapons[0].cooldown_ticks = 0;
@@ -2462,7 +2875,7 @@ test "knockback pushes an enemy away from the hit and decays" {
 
 test "the snapshot carries the enemy, projectile and gem arrays" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     _ = p;
 
     const e0 = sim.enemies.spawn(.circle_t1, .{ 3.0, -4.0 }).?;
@@ -2502,28 +2915,30 @@ test "the snapshot carries the enemy, projectile and gem arrays" {
     try std.testing.expectEqual(wire.quantize(2.0), view.gems[0].pos_x);
 
     // The wire layout is header, then players, enemies, projectiles, gems.
+    // v2 records: 20-byte players, 18-byte enemies, 12-byte projectiles and
+    // gems.
     const frame = try wire.encodeSnapshotFull(std.testing.allocator, view);
     defer std.testing.allocator.free(frame);
     try std.testing.expectEqual(
         @as(usize, wire.header_size + wire.snapshot_header_wire_size +
-            8 * 1 + 12 * 2 + 12 * 1 + 12 * 1),
+            20 * 1 + 18 * 2 + 12 * 1 + 12 * 1),
         frame.len,
     );
 }
 
 test "the whole combat simulation is deterministic" {
     var a = Simulation.init();
-    const pa = a.spawnPlayer(0).?;
+    const pa = a.spawnPlayer(0, 0, 0).?;
     var b = Simulation.init();
-    const pb = b.spawnPlayer(0).?;
+    const pb = b.spawnPlayer(0, 0, 0).?;
     pa.pos = .{ 30.0, -20.0 };
     pb.pos = .{ 30.0, -20.0 };
 
     var i: usize = 0;
     while (i < 900) : (i += 1) {
         const move_x: i8 = if (@mod(i / 45, 2) == 0) 100 else -37;
-        a.applyInput(0, .{ .input_seq = @intCast(i + 1), .move_x = move_x, .move_y = -20 });
-        b.applyInput(0, .{ .input_seq = @intCast(i + 1), .move_x = move_x, .move_y = -20 });
+        a.applyInput(0, .{ .input_seq = @intCast(i + 1), .axis_x = move_x, .axis_y = -20 });
+        b.applyInput(0, .{ .input_seq = @intCast(i + 1), .axis_x = move_x, .axis_y = -20 });
         a.advance();
         b.advance();
     }
@@ -2555,7 +2970,7 @@ test "the stress load holds exactly the requested counts on the wire" {
     // close to them. The player is left armed: enemies die and are reaped every
     // tick, and the load is still what the next snapshot advertises.
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     _ = p;
     sim.stress = .{ .enemies = 1000, .projectiles = 500 };
 
@@ -2572,7 +2987,7 @@ test "the stress load holds exactly the requested counts on the wire" {
 
 test "the stress load holds the world at a fixed size" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     // The stressed projectiles kill enemies, so gems drop and the player would
     // level up, and 500 enemies clustering on an unarmed player would kill it;
@@ -2614,7 +3029,7 @@ test "the stress load holds the world at a fixed size" {
 
 test "a paused simulation advances nothing" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     _ = sim.enemies.spawn(.circle_t1, .{ 10.0, 0.0 }).?;
     sim.advance();
@@ -2634,7 +3049,7 @@ test "a paused simulation advances nothing" {
 
 test "a dead enemy drops a gem worth its archetype's XP" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     const e = sim.enemies.spawn(.circle_t1, .{ 5.0, 5.0 }).?;
     sim.enemies.hp[e] = 0.0;
@@ -2650,7 +3065,7 @@ test "a dead enemy drops a gem worth its archetype's XP" {
 
 test "a gem is collected when the player walks onto it" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.pos = .{ 0.0, 0.0 };
     _ = sim.gems.spawn(.{ 1.0, 0.0 }, gem.small_xp).?;
@@ -2666,7 +3081,7 @@ test "a gem is collected when the player walks onto it" {
 
 test "a gem outside the pickup radius stays put" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.pos = .{ 0.0, 0.0 };
     _ = sim.gems.spawn(.{ 20.0, 0.0 }, gem.small_xp).?;
@@ -2679,7 +3094,7 @@ test "a gem outside the pickup radius stays put" {
 
 test "Magnet Array scales the pickup radius" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.pos = .{ 0.0, 0.0 };
     // Level 5 Magnet Array: 3.0 * 2.75 = 8.25 units.
@@ -2694,7 +3109,7 @@ test "Magnet Array scales the pickup radius" {
 
 test "a filled XP bar pauses the run and offers three choices" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.xp = p.xp_next;
 
@@ -2716,7 +3131,7 @@ test "a filled XP bar pauses the run and offers three choices" {
 
 test "answering the offer applies the choice and resumes" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.xp = p.xp_next;
     sim.advance();
@@ -2736,7 +3151,7 @@ test "answering the offer applies the choice and resumes" {
 
 test "a stale or repeated choice is ignored" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.xp = p.xp_next;
     sim.advance();
@@ -2750,7 +3165,7 @@ test "a stale or repeated choice is ignored" {
 
 test "the 15 second timeout auto-selects option 0" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.xp = p.xp_next;
     sim.advance();
@@ -2769,7 +3184,7 @@ test "the 15 second timeout auto-selects option 0" {
 
 test "a level-8 weapon with its passive maxed evolves" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.weapons[0].id = upgrade.ids.sword;
     p.weapons[0].level = 8;
@@ -2802,7 +3217,7 @@ test "a level-8 weapon with its passive maxed evolves" {
 
 test "the weapon level table changes what a weapon does" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     // Sword only, level 1.
     for (&p.weapons, 0..) |*slot, i| {
         if (i != 0) slot.id = 0xff;
@@ -2824,7 +3239,7 @@ test "the weapon level table changes what a weapon does" {
 
 test "passives change the simulation" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     // Sword only.
     for (&p.weapons, 0..) |*slot, i| {
         if (i != 0) slot.id = 0xff;
@@ -2846,7 +3261,7 @@ test "passives change the simulation" {
 
 test "Nano Repair restores HP over time" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.hp = 50.0;
     p.passives[9] = 5; // +4.0 HP/s
@@ -2858,29 +3273,31 @@ test "Nano Repair restores HP over time" {
 
 test "Titanium Plating reduces contact damage" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.passives[8] = 5; // -15 flat, so 5 damage becomes the 1 minimum
     _ = sim.enemies.spawn(.circle_t1, .{ 0.6, 0.0 }).?;
 
     sim.advance();
-    try std.testing.expectApproxEqAbs(@as(f32, 99.0), p.hp, 1e-4);
+    // 110 - max(5 - 15, 1) = 109.
+    try std.testing.expectApproxEqAbs(@as(f32, 109.0), p.hp, 1e-4);
 }
 
 test "Overclock raises max HP without a cap" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.overclock[2] = 4; // +100 max HP
     p.max_hp += 100.0;
     p.hp = p.max_hp;
-    try std.testing.expectEqual(@as(f32, 200.0), p.max_hp);
+    // Race 0's 110, not the phase-1 default 100.
+    try std.testing.expectEqual(@as(f32, 210.0), p.max_hp);
     try std.testing.expectEqual(@as(u8, 100), Simulation.hpPercent(p.hp, p.max_hp));
 }
 
 test "Overclock purchases past 255 do not wrap" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
 
     // One purchase away from the old `u8` wrap on each counter.
@@ -2909,7 +3326,7 @@ test "Overclock purchases past 255 do not wrap" {
 
 test "a restart resets the run and revives the player" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     disarm(p);
     p.level = 12;
     p.xp = 999;
@@ -2924,7 +3341,8 @@ test "a restart resets the run and revives the player" {
     try std.testing.expect(p.flags.alive);
     try std.testing.expectEqual(@as(u16, 1), p.level);
     try std.testing.expectEqual(@as(u32, 0), p.xp);
-    try std.testing.expectEqual(@as(f32, root.player_max_hp), p.hp);
+    // The race's own max HP, not the phase-1 default.
+    try std.testing.expectEqual(@as(f32, 110.0), p.hp);
     try std.testing.expectEqual(@as(u32, 0), sim.kills);
     try std.testing.expectEqual(@as(usize, 0), sim.enemies.count);
     try std.testing.expectEqual(@as(usize, 0), sim.gems.count);
@@ -2933,7 +3351,7 @@ test "a restart resets the run and revives the player" {
 test "the debug loadout arms the requested loadout and its evolution" {
     var sim = Simulation.init();
     sim.loadout = try loadout.parse("sword=8,clockwork_gear=5");
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
 
     // The sword is level 8 with Clockwork Gear at its max, so it is the Vorpal
     // Blender — the evolved id and the evolved flag, not just the levels.
@@ -2941,9 +3359,8 @@ test "the debug loadout arms the requested loadout and its evolution" {
     try std.testing.expect(p.weapons[0].evolved);
     try std.testing.expectEqual(root.max_weapon_level, p.weapons[0].level);
     try std.testing.expectEqual(@as(u8, 5), p.passives[2]);
-    // The other three weapons keep the run's level-1 defaults.
-    try std.testing.expectEqual(@as(u8, 1), p.weapons[1].level);
-    try std.testing.expectEqual(upgrade.ids.axe, p.weapons[1].id);
+    // The run started with only the sword; the other three slots stay empty.
+    try std.testing.expect(p.weapons[1].isFree());
     // Synergies are resolved from the loadout, not left at zero.
     try std.testing.expectEqual(upgrade.synergyMask(&p.weapons, &p.passives), p.synergy_mask);
 }
@@ -2951,7 +3368,7 @@ test "the debug loadout arms the requested loadout and its evolution" {
 test "the debug loadout survives a restart" {
     var sim = Simulation.init();
     sim.loadout = try loadout.parse("axe=8,amplifier_lens=5");
-    _ = sim.spawnPlayer(0).?;
+    _ = sim.spawnPlayer(0, 0, 0).?;
     const p = &sim.players[0];
     // A scripted restart has to start the next run partway there as well, so
     // the affordance is observable across a C2S_RESTART.
@@ -2972,19 +3389,19 @@ test "the debug loadout survives a restart" {
 
 test "a run without the debug loadout keeps the default loadout" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
-    for (&p.weapons, 0..) |*slot, i| {
-        try std.testing.expectEqual(@as(u8, @intCast(i)), slot.id);
-        try std.testing.expectEqual(@as(u8, 1), slot.level);
-        try std.testing.expect(!slot.evolved);
-    }
+    const p = sim.spawnPlayer(0, 0, 0).?;
+    // Only the starting weapon, at level 1; the other three slots are empty.
+    try std.testing.expectEqual(@as(u8, 0), p.weapons[0].id);
+    try std.testing.expectEqual(@as(u8, 1), p.weapons[0].level);
+    try std.testing.expect(!p.weapons[0].evolved);
+    for (p.weapons[1..]) |slot| try std.testing.expect(slot.isFree());
     for (p.passives) |lvl| try std.testing.expectEqual(@as(u8, 0), lvl);
     try std.testing.expectEqual(@as(u16, 0), p.synergy_mask);
 }
 
 test "the score follows DESIGN.md §1" {
     var sim = Simulation.init();
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     _ = p;
     sim.tick = 60 * 30; // 30 seconds
     sim.kills = 10;
@@ -3005,7 +3422,7 @@ test "the smoke test's difficulty escalation is unbounded" {
 /// A player at the origin with no weapons, so nothing it does can kill the
 /// shooter the test is setting up.
 fn disarmedPlayerAtOrigin(sim: *Simulation) *PlayerState {
-    const p = sim.spawnPlayer(0).?;
+    const p = sim.spawnPlayer(0, 0, 0).?;
     p.pos = .{ 0.0, 0.0 };
     disarm(p);
     return p;

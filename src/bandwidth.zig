@@ -124,7 +124,7 @@ pub const Report = struct {
 pub fn run(gpa: std.mem.Allocator) !Report {
     var s = sim.Simulation.init();
     s.tick = stress_tick;
-    const player = s.spawnPlayer(0).?;
+    const player = s.spawnPlayer(0, 0, 0).?;
     player.pos = .{ 0.0, 0.0 };
     // A full evolution build, so the kill rate keeps the neighbourhood bounded
     // against the 73x health of the 20:00 curve.
@@ -137,8 +137,12 @@ pub fn run(gpa: std.mem.Allocator) !Report {
     player.flags.invulnerable = true;
     s.stress = .{ .enemies = enemy_count, .projectiles = 0, .radius = spread_radius };
 
-    var ring = delta.SnapshotRing{};
-    zeroRing(&ring);
+    // The ring is heap-allocated: at 32 snapshots of a whole v2 world it is
+    // several megabytes, which does not fit a test thread's stack.
+    const ring = try gpa.create(delta.SnapshotRing);
+    defer gpa.destroy(ring);
+    ring.* = .{};
+    zeroRing(ring);
     var scratch = delta.DiffScratch{};
 
     // Warm-up: let the neighbourhood reach its steady state.
@@ -196,10 +200,9 @@ pub fn run(gpa: std.mem.Allocator) !Report {
         s.applyInput(0, .{
             .input_seq = input_seq,
             .client_tick = s.tick,
-            .move_x = @as(i8, @intFromFloat(@round(@cos(angle) * 100.0))),
-            .move_y = @as(i8, @intFromFloat(@round(@sin(angle) * 100.0))),
-            .aim_angle = 0,
             .buttons = 0,
+            .axis_x = @as(i8, @intFromFloat(@round(@cos(angle) * 100.0))),
+            .axis_y = @as(i8, @intFromFloat(@round(@sin(angle) * 100.0))),
         });
         input_seq += 1;
         s.advance();
@@ -448,6 +451,9 @@ test "2,500 enemies at 20:00 stay inside the 25 KB/s bandwidth budget" {
     // entity in interest must still be refreshed within a bounded number of
     // snapshots. The rotation advances by what each snapshot sent, so the bound
     // is `ceil(candidates / per-snapshot records)` — a handful, not "never".
-    try std.testing.expect(report.worst_refresh_snapshots <= 4);
+    // The v2 enemy record is 18 bytes, not v1's 12, so the same 1000-byte
+    // budget carries fewer updates per snapshot and the rotation takes one more
+    // lap around the candidate set; the bound follows the record size.
+    try std.testing.expect(report.worst_refresh_snapshots <= 6);
     try std.testing.expect(report.mean_refresh_snapshots < 2.0);
 }

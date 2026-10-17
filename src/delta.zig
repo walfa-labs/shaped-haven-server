@@ -38,8 +38,20 @@ const max_kind = root.max_enemies;
 /// Largest total candidate set across every kind, for the output scratch.
 const max_total = root.max_enemies + root.max_projectiles + root.max_gems + root.max_players;
 
-/// Bytes large enough to hold any net record, for the comparison scratch.
-const record_bytes: usize = 16;
+/// Bytes large enough to hold any net record, for the comparison scratch. The
+/// v2 player record is the widest at 21 bytes; computed rather than written so
+/// a future record growth cannot silently truncate a comparison.
+const record_bytes: usize = blk: {
+    const sizes = [_]usize{
+        wire.wireSize(wire.PlayerNet),
+        wire.wireSize(wire.EnemyNet),
+        wire.wireSize(wire.ProjNet),
+        wire.wireSize(wire.GemNet),
+    };
+    var max: usize = 0;
+    for (sizes) |s| max = @max(max, s);
+    break :blk max;
+};
 
 /// One stored snapshot: the whole world at one snapshot tick.
 ///
@@ -566,6 +578,10 @@ fn enemyNet(id: u32, pos: [2]f32) wire.EnemyNet {
         .pos_y = wire.quantize(pos[1]),
         .vel_angle = 0,
         .hp_pct = 100,
+        .telegraph_progress = 0,
+        .telegraph_shape = 0,
+        .telegraph_angle = 0,
+        .telegraph_radius = 0,
     };
 }
 
@@ -777,7 +793,7 @@ test "the candidate set survives the budget trim intact" {
 
 test "the per-snapshot budget caps how many records one delta carries" {
     // 100 enemies, all moved, and a budget that pays for exactly ten of them:
-    // 44 bytes of headers plus 10 x (1 kind + 4 id + 12 record).
+    // the frame header and snapshot header, plus 10 x (1 kind + 4 id + record).
     const n = 100;
     var cur_buf: [max_kind]wire.EnemyNet = undefined;
     var base_buf: [max_kind]wire.EnemyNet = undefined;
@@ -788,14 +804,15 @@ test "the per-snapshot budget caps how many records one delta carries" {
     held.counts[1] = @intCast(n);
     @memcpy(held.enemies[0..n], base);
 
-    const budget_bytes = overhead_bytes + 10 * updatedBytes(.{ .enemy = cur[0] });
+    const per_record = updatedBytes(.{ .enemy = cur[0] });
+    const budget_bytes = overhead_bytes + 10 * per_record;
     var scratch = DiffScratch{};
     const d = computeDelta(viewOf(30, cur), &held, .{ .total_bytes = budget_bytes }, &scratch);
 
     try std.testing.expectEqual(@as(usize, 10), d.updated.len);
     try std.testing.expectEqual(@as(usize, 90), d.deferred);
     // What it did carry is within the budget, which is the whole point.
-    try std.testing.expect(overhead_bytes + 10 * 17 <= budget_bytes);
+    try std.testing.expect(overhead_bytes + 10 * per_record <= budget_bytes);
 }
 
 test "the rotation refreshes every entity within a bounded number of snapshots" {

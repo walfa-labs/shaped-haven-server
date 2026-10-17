@@ -5,7 +5,7 @@
 const std = @import("std");
 
 /// Protocol version carried in `C2S_HELLO.proto_ver` (DESIGN.md §5).
-pub const protocol_version: u8 = 1;
+pub const protocol_version: u8 = 2;
 
 /// Fixed simulation rate, in ticks per second (DESIGN.md §1).
 pub const tick_hz: u32 = 60;

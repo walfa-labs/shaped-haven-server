@@ -15,8 +15,8 @@ const usage =
     \\                             reach 1000 enemies for about twelve minutes.
     \\  --stress-projectiles <n>   Hold n gun projectiles live as well.
     \\  --debug-loadout <spec>     TEST AFFORDANCE, NOT GAMEPLAY. Start every run
-    \\                             with the given loadout instead of the four
-    \\                             level-1 weapons, on every join and every
+    \\                             with the given loadout instead of the single
+    \\                             starting weapon, on every join and every
     \\                             restart. <spec> is comma-separated name=level
     \\                             pairs, e.g. "sword=8,clockwork_gear=5" (which
     \\                             arms the Vorpal Blender), or item ids from
