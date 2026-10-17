@@ -26,7 +26,7 @@ shared contract both repos implement.
 - **Difficulty curve** by elapsed minutes `t`:
   - **Phase A (0:00–5:00, linear onboarding):** enemy HP multiplier
     `M_HP(t) = 1.0 + 0.20t`. Spawn density follows the §4 formula,
-    `R(t) = 3.0 + 2.2t + 0.35t²` enemies/sec — 3.0/s at the start, 14.0/s at
+    `R(t) = 3.0 + 2.2t + 0.35t²` enemies/sec — 3.0/s at the start, 5.55/s at
     1:00, 22.75/s at 5:00.
   - **Phase B (5:00–15:00, quadratic mid-game):**
     `M_HP(t) = 2.0 + 0.25(t − 5)²`. Tier 2 enemies enter; the first weapon
