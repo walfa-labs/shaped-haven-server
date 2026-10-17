@@ -509,6 +509,12 @@ pub fn updateProjectiles(
 
         const spec = projectiles.spec[i];
         const dir = normalize(projectiles.vel[i]);
+        // A hostile (enemy-owned) projectile passes through its own side: it
+        // damages players, resolved by the simulation, not enemies.
+        if (projectiles.owner_id[i] == 0xff) {
+            projectiles.age(i);
+            continue;
+        }
         const n = grid.queryCircle(
             projectiles.pos[i],
             spec.radius + enemy.max_radius,
@@ -596,6 +602,9 @@ fn applyOnHit(enemies: *enemy.Pool, e: usize, spec: weapon.Spec, synergy_mask: u
     if (spec.slow_ticks > 0) {
         enemies.slow_ticks[e] = spec.slow_ticks;
         enemies.slow_factor[e] = 1.0 - spec.slow_mult;
+        // The boss is freeze-immune (DESIGN.md §4): it slows, but the stacks
+        // that would freeze it never land.
+        if (enemies.status_immune[e]) return;
         enemies.cryo_stacks[e] +%= 1;
         if (spec.freeze_stacks > 0 and enemies.cryo_stacks[e] >= spec.freeze_stacks) {
             enemies.freeze_ticks[e] = spec.freeze_ticks;

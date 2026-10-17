@@ -216,6 +216,15 @@ pub const PlayerState = struct {
     }
 };
 
+/// True when `pos` is within `r2` (a squared radius) of `centre`. The
+/// interest test and the broadphase's circle query both want this, and
+/// comparing in squared space keeps it a multiply and no square root.
+fn inRadius(pos: [2]f32, centre: [2]f32, r2: f32) bool {
+    const dx = pos[0] - centre[0];
+    const dy = pos[1] - centre[1];
+    return dx * dx + dy * dy <= r2;
+}
+
 /// Fixed-timestep simulation. One instance per running game.
 pub const Simulation = struct {
     tick: u32 = 0,
@@ -273,6 +282,9 @@ pub const Simulation = struct {
     /// Scratch space for the enemy indices a swing hit, so the evolution
     /// effects (pull, shield) can walk them.
     hit_scratch: [root.max_enemies]u32 = @splat(0),
+    /// Scratch space for the Haste Aura elite indices, collected once per tick
+    /// so every enemy can be tested against the aura field.
+    aura_scratch: [root.max_enemies]u32 = @splat(0),
 
     pub fn init() Simulation {
         var self = Simulation{};
@@ -399,6 +411,10 @@ pub const Simulation = struct {
 
         self.updateEnemies(dt);
         self.rebuildGrid();
+        // A Goliath crushes Tier 1 enemies out of its path (DESIGN.md §4): a
+        // knockback impulse, applied here so it fits the tick's rule that only
+        // knockback velocity moves between the grid build and the compaction.
+        self.crushPass();
         self.updateWeapons();
         combat.updateProjectiles(
             &self.projectiles,
@@ -408,9 +424,12 @@ pub const Simulation = struct {
             dt,
             self.synergyMask(),
         );
+        // Hostile projectiles (Spitter shots, the boss's burst) damage players.
+        self.updateHostileProjectiles();
         self.updateContact();
         self.dropGems();
 
+        const bosses_before = self.enemies.bossCount();
         self.kills += @intCast(self.enemies.reapDead());
         // `reapDead` compacts the pool, so the broadphase indices it left
         // behind no longer match the slots; rebuild before the shatter query
@@ -418,10 +437,14 @@ pub const Simulation = struct {
         self.rebuildGrid();
         evolve.processShatter(&self.enemies, &self.grid, &self.query_scratch);
         self.projectiles.reapSpent();
+        // A boss died this tick: its cache drops with its corpse and every
+        // living player is offered an immediate draft (DESIGN.md §4).
+        if (self.enemies.bossCount() < bosses_before) self.offerBossChest();
 
         self.updateGems(dt);
         evolve.updateRifts(&self.rifts, &self.enemies, &self.grid, &self.query_scratch, dt);
         self.rifts.reapExpired();
+        self.enemies.tickShieldRegen();
         self.checkLevelUps();
 
         self.tick += 1;
@@ -443,6 +466,9 @@ pub const Simulation = struct {
     ) void {
         const around = self.playerCentroid() orelse return;
         const gun = weapon.spec(@intFromEnum(weapon.Id.gun)) orelse return;
+        const t = @as(f32, @floatFromInt(self.tick)) /
+            (@as(f32, @floatFromInt(root.tick_hz)) * 60.0);
+        const hp_mult = enemy.hpMultiplier(t);
 
         while (self.projectiles.count < want_projectiles) {
             const angle = self.rng.range(0.0, 2.0 * std.math.pi);
@@ -456,7 +482,13 @@ pub const Simulation = struct {
             const angle = self.rng.range(0.0, 2.0 * std.math.pi);
             const dist = self.rng.range(1.0, radius);
             const pos = placeFrom(around, angle, dist);
-            if (self.enemies.spawn(.circle_t1, pos) == null) break;
+            // The stress load goes through the same spawn-time curve the real
+            // spawner does, so the benchmark's world is the world the run
+            // produces.
+            if (self.enemies.spawnWith(.circle_t1, pos, .{
+                .hp_mult = hp_mult,
+                .speed_mult = enemy.speedMultiplier(t),
+            }) == null) break;
         }
     }
 
@@ -515,8 +547,25 @@ pub const Simulation = struct {
     /// DESIGN.md §1 calls the arena walls hard, and gives them for the player;
     /// enemies are clamped the same way so nothing can be pushed out of the
     /// world and out of the broadphase's covered range.
+    ///
+    /// Each archetype runs its own state machine (`darterStep`, `spitterStep`,
+    /// `lancerStep`, `bossStep`); the circles and the boss pursue directly. A
+    /// Haste Aura elite speeds up everything near it, and every enemy's facing
+    /// is recorded for the wire.
     fn updateEnemies(self: *Simulation, dt: f32) void {
         const limit = root.arena_half_size;
+
+        // Haste Aura elites (DESIGN.md §4): collect their positions first, so
+        // every enemy this tick can be tested against the aura field. Elites
+        // are rare, so the list is short and the per-enemy scan is cheap.
+        var aura_count: usize = 0;
+        for (0..self.enemies.count) |i| {
+            if (self.enemies.elite_mask[i] & enemy.elite.haste_aura != 0) {
+                self.aura_scratch[aura_count] = @intCast(i);
+                aura_count += 1;
+            }
+        }
+
         var i: usize = 0;
         while (i < self.enemies.count) : (i += 1) {
             if (self.enemies.contact_cd[i] > 0) self.enemies.contact_cd[i] -= 1;
@@ -531,12 +580,25 @@ pub const Simulation = struct {
                 const dist = std.math.hypot(to_player[0], to_player[1]);
                 const dir = combat.normalize(to_player);
 
+                var speed = self.enemies.move_speed[i];
+                // Haste Aura: +35% movement speed within 8.0 u of the source.
+                if (self.inHasteAura(i, aura_count)) speed *= enemy.elite.haste_speed_mult;
+
                 switch (archetype) {
                     .triangle_t1 => {
                         vel = self.darterStep(i, dir, dist);
                     },
+                    .triangle_t2 => {
+                        vel = self.spitterStep(i, dir, dist);
+                    },
+                    .triangle_t3 => {
+                        vel = self.lancerStep(i, dir, dist);
+                    },
+                    .boss => {
+                        vel = self.bossStep(i, dir, dist);
+                    },
                     else => {
-                        vel = .{ dir[0] * self.enemies.move_speed[i], dir[1] * self.enemies.move_speed[i] };
+                        vel = .{ dir[0] * speed, dir[1] * speed };
                     },
                 }
             } else {
@@ -557,6 +619,17 @@ pub const Simulation = struct {
 
             self.enemies.vel[i] = vel;
 
+            // Facing follows movement, except for a telegraphing boss, which
+            // stands still but faces the dash it is about to make: `bossStep`
+            // locked that direction when the telegraph began, and that is how
+            // the client learns the dash direction from `vel_angle`.
+            const telegraphing = archetype == .boss and
+                self.enemies.ai_state[i] == @intFromEnum(enemy.AiState.telegraph);
+            if (!telegraphing and std.math.hypot(vel[0], vel[1]) > 1e-4) {
+                const inv = 1.0 / std.math.hypot(vel[0], vel[1]);
+                self.enemies.facing[i] = .{ vel[0] * inv, vel[1] * inv };
+            }
+
             // Knockback decays towards nothing and is added on top of whatever
             // the AI asked for, so a shove interrupts the movement without
             // cancelling it.
@@ -572,6 +645,20 @@ pub const Simulation = struct {
             self.enemies.pos[i][0] = std.math.clamp(self.enemies.pos[i][0], -edge, edge);
             self.enemies.pos[i][1] = std.math.clamp(self.enemies.pos[i][1], -edge, edge);
         }
+    }
+
+    /// True when enemy `i` is within a Haste Aura elite's 8.0 u field. The
+    /// source does not haste itself.
+    fn inHasteAura(self: *const Simulation, i: usize, aura_count: usize) bool {
+        for (0..aura_count) |k| {
+            const src: usize = @intCast(self.aura_scratch[k]);
+            if (src == i) continue;
+            const dx = self.enemies.pos[i][0] - self.enemies.pos[src][0];
+            const dy = self.enemies.pos[i][1] - self.enemies.pos[src][1];
+            const r = enemy.elite.haste_radius + self.enemies.radius[i];
+            if (dx * dx + dy * dy <= r * r) return true;
+        }
+        return false;
     }
 
     /// Triangle T1 (Darter): pursue, pause 0.4 s at 10 units, then lunge at
@@ -621,6 +708,194 @@ pub const Simulation = struct {
                     locked[1] * enemy.darter.lunge_speed,
                 };
             },
+            // A darter never leaves pursue for these; they belong to the other
+            // archetypes' state machines.
+            else => {
+                self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
+                return .{
+                    dir[0] * self.enemies.move_speed[i],
+                    dir[1] * self.enemies.move_speed[i],
+                };
+            },
+        }
+    }
+
+    /// Triangle T2 (Spitter): pursue until 18 units out, halt, and fire a 9.0 u/s
+    /// hostile projectile (10 dmg) at the player every 2.5 s (DESIGN.md §4).
+    fn spitterStep(self: *Simulation, i: usize, dir: [2]f32, dist: f32) [2]f32 {
+        const state: enemy.AiState = @enumFromInt(self.enemies.ai_state[i]);
+        const speed = self.enemies.move_speed[i];
+        switch (state) {
+            .pursue => {
+                if (dist <= enemy.spitter.fire_range) {
+                    self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.halt);
+                    self.enemies.ai_timer[i] = enemy.spitter.fire_interval_ticks;
+                    return .{ 0.0, 0.0 };
+                }
+                return .{ dir[0] * speed, dir[1] * speed };
+            },
+            .halt => {
+                if (dist > enemy.spitter.fire_range + enemy.spitter.resume_band) {
+                    self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
+                    return .{ dir[0] * speed, dir[1] * speed };
+                }
+                if (self.enemies.ai_timer[i] > 0) self.enemies.ai_timer[i] -= 1;
+                if (self.enemies.ai_timer[i] == 0) {
+                    self.enemies.ai_timer[i] = enemy.spitter.fire_interval_ticks;
+                    self.fireHostile(i, dir, enemy.spitter.shot_speed, enemy.spitter.shot_damage, enemy.spitter.shot_ttl_ticks);
+                }
+                return .{ 0.0, 0.0 };
+            },
+            else => {
+                self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
+                return .{ dir[0] * speed, dir[1] * speed };
+            },
+        }
+    }
+
+    /// Triangle T3 (Lancer): pursue, and every 4.0 s lock a charge vector and
+    /// charge 24.0 units at 20.0 u/s, knockback-immune while charging
+    /// (DESIGN.md §4). The charge is 1.2 s of the 4.0 s cycle, so the next lock
+    /// lands one full interval after the last.
+    fn lancerStep(self: *Simulation, i: usize, dir: [2]f32, dist: f32) [2]f32 {
+        _ = dist;
+        const state: enemy.AiState = @enumFromInt(self.enemies.ai_state[i]);
+        const speed = self.enemies.move_speed[i];
+        switch (state) {
+            .pursue => {
+                self.enemies.kb_resist[i] = 0.0;
+                if (self.enemies.ai_timer[i] > 0) self.enemies.ai_timer[i] -= 1;
+                if (self.enemies.ai_timer[i] == 0) {
+                    self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.charge);
+                    self.enemies.ai_timer[i] = enemy.lancer.charge_ticks;
+                    self.enemies.facing[i] = dir;
+                    self.enemies.kb_resist[i] = 1.0;
+                    return .{
+                        dir[0] * enemy.lancer.charge_speed,
+                        dir[1] * enemy.lancer.charge_speed,
+                    };
+                }
+                return .{ dir[0] * speed, dir[1] * speed };
+            },
+            .charge => {
+                self.enemies.kb_resist[i] = 1.0;
+                if (self.enemies.ai_timer[i] > 0) self.enemies.ai_timer[i] -= 1;
+                const locked = combat.normalize(self.enemies.vel[i]);
+                if (self.enemies.ai_timer[i] == 0) {
+                    self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
+                    self.enemies.ai_timer[i] = enemy.lancer.lock_interval_ticks - enemy.lancer.charge_ticks;
+                    self.enemies.kb_resist[i] = 0.0;
+                    return .{ dir[0] * speed, dir[1] * speed };
+                }
+                return .{
+                    locked[0] * enemy.lancer.charge_speed,
+                    locked[1] * enemy.lancer.charge_speed,
+                };
+            },
+            else => {
+                self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
+                return .{ dir[0] * speed, dir[1] * speed };
+            },
+        }
+    }
+
+    /// Boss (DESIGN.md §4): pursue the player, and every 3.0 s alternate a
+    /// 12-projectile radial burst with a telegraphed 22.0 u/s dash. The dash is
+    /// announced by a 1.0 s warning — the boss stands still and faces the locked
+    /// direction, which is what the client reads from `vel_angle` — then runs
+    /// for 1.0 s. The post-dash timer keeps attacks 3.0 s apart.
+    fn bossStep(self: *Simulation, i: usize, dir: [2]f32, dist: f32) [2]f32 {
+        _ = dist;
+        const state: enemy.AiState = @enumFromInt(self.enemies.ai_state[i]);
+        const speed = self.enemies.move_speed[i];
+        switch (state) {
+            .pursue => {
+                if (self.enemies.ai_timer[i] > 0) self.enemies.ai_timer[i] -= 1;
+                if (self.enemies.ai_timer[i] == 0) {
+                    if (self.enemies.boss_parity[i] == 0) {
+                        self.fireBurst(i);
+                        self.enemies.boss_parity[i] = 1;
+                        self.enemies.ai_timer[i] = enemy.boss.attack_interval_ticks;
+                    } else {
+                        self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.telegraph);
+                        self.enemies.ai_timer[i] = enemy.boss.telegraph_ticks;
+                        self.enemies.boss_parity[i] = 0;
+                        self.enemies.facing[i] = dir;
+                    }
+                    return .{ 0.0, 0.0 };
+                }
+                return .{ dir[0] * speed, dir[1] * speed };
+            },
+            .telegraph => {
+                if (self.enemies.ai_timer[i] > 0) self.enemies.ai_timer[i] -= 1;
+                if (self.enemies.ai_timer[i] == 0) {
+                    self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.lunge);
+                    self.enemies.ai_timer[i] = enemy.boss.dash_ticks;
+                    return .{
+                        self.enemies.facing[i][0] * enemy.boss.dash_speed,
+                        self.enemies.facing[i][1] * enemy.boss.dash_speed,
+                    };
+                }
+                return .{ 0.0, 0.0 };
+            },
+            .lunge => {
+                if (self.enemies.ai_timer[i] > 0) self.enemies.ai_timer[i] -= 1;
+                const locked = self.enemies.facing[i];
+                if (self.enemies.ai_timer[i] == 0) {
+                    self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
+                    self.enemies.ai_timer[i] = enemy.boss.attack_interval_ticks -
+                        enemy.boss.telegraph_ticks - enemy.boss.dash_ticks;
+                    return .{ dir[0] * speed, dir[1] * speed };
+                }
+                return .{
+                    locked[0] * enemy.boss.dash_speed,
+                    locked[1] * enemy.boss.dash_speed,
+                };
+            },
+            else => {
+                self.enemies.ai_state[i] = @intFromEnum(enemy.AiState.pursue);
+                return .{ dir[0] * speed, dir[1] * speed };
+            },
+        }
+    }
+
+    /// Fire one hostile (enemy-owned) projectile from enemy `i` along `dir`.
+    ///
+    /// `owner_id = 0xff` marks the shot as hostile: it damages players rather
+    /// than enemies, and the client renders it as an enemy shot.
+    fn fireHostile(
+        self: *Simulation,
+        i: usize,
+        dir: [2]f32,
+        speed: f32,
+        damage: f32,
+        ttl_ticks: u16,
+    ) void {
+        var spec = weapon.zero_spec;
+        spec.shape = .circle;
+        spec.speed = speed;
+        spec.damage = damage;
+        spec.radius = 0.4;
+        spec.pierce = 1;
+        spec.ttl_ticks = ttl_ticks;
+        spec.knockback = 0.0;
+        _ = self.projectiles.spawn(0xff, spec, self.enemies.pos[i], dir);
+    }
+
+    /// The boss's radial burst: 12 projectiles evenly spaced around the circle
+    /// (DESIGN.md §4).
+    fn fireBurst(self: *Simulation, i: usize) void {
+        var k: usize = 0;
+        while (k < enemy.boss.burst_count) : (k += 1) {
+            const a = @as(f32, @floatFromInt(k)) *
+                (2.0 * std.math.pi / @as(f32, @floatFromInt(enemy.boss.burst_count)));
+            self.fireHostile(
+                i,
+                .{ @cos(a), @sin(a) },
+                enemy.boss.burst_speed,
+                enemy.boss.burst_damage,
+                enemy.boss.burst_ttl_ticks,
+            );
         }
     }
 
@@ -825,6 +1100,15 @@ pub const Simulation = struct {
                 }
                 p.hp -= taken;
 
+                // Vampiric: restores 15% max HP upon damaging a player
+                // (DESIGN.md §4).
+                if (self.enemies.elite_mask[e] & enemy.elite.vampiric != 0) {
+                    self.enemies.hp[e] = @min(
+                        self.enemies.hp[e] + enemy.elite.vampiric_heal * self.enemies.max_hp[e],
+                        self.enemies.max_hp[e],
+                    );
+                }
+
                 // Reactive Carapace: taking contact damage emits a 4.0 u radial
                 // shockwave for 12 x Regen damage (DESIGN.md §3).
                 if (p.synergy_mask & upgrade.synergy_reactive_carapace != 0 and p.carapace_cd == 0) {
@@ -843,6 +1127,73 @@ pub const Simulation = struct {
                     p.flags.alive = false;
                     self.killPlayer(p.id);
                 }
+            }
+        }
+    }
+
+    /// Circle T3 (Goliath): crushes Tier 1 enemies out of its path (DESIGN.md
+    /// §4). A Goliath shoves aside any Tier 1 enemy its body overlaps, as a
+    /// knockback impulse rather than damage, so the shove shows up as movement
+    /// over the next ticks and not as lost health.
+    fn crushPass(self: *Simulation) void {
+        for (0..self.enemies.count) |i| {
+            if (self.enemies.archetype[i] != @intFromEnum(enemy.Archetype.circle_t3)) continue;
+            const reach = self.enemies.radius[i] + enemy.max_radius;
+            const n = self.grid.queryCircle(self.enemies.pos[i], reach, &self.query_scratch);
+            for (self.query_scratch[0..n]) |ej| {
+                const e: usize = ej;
+                if (e == i) continue;
+                const a: enemy.Archetype = @enumFromInt(self.enemies.archetype[e]);
+                if (a != .circle_t1 and a != .triangle_t1) continue;
+                if (!combat.circlesOverlap(
+                    self.enemies.pos[i],
+                    self.enemies.radius[i],
+                    self.enemies.pos[e],
+                    self.enemies.radius[e],
+                )) continue;
+                const away = combat.normalize(combat.sub(self.enemies.pos[e], self.enemies.pos[i]));
+                self.enemies.kb[e][0] += away[0] * 6.0;
+                self.enemies.kb[e][1] += away[1] * 6.0;
+            }
+        }
+    }
+
+    /// Resolve hostile (enemy-owned) projectiles against the players.
+    ///
+    /// A hostile projectile damages the player it overlaps, reduced by armor
+    /// and absorbed by shield exactly as contact damage is, then is spent.
+    fn updateHostileProjectiles(self: *Simulation) void {
+        const half = root.player_half_extent;
+        var i: usize = 0;
+        while (i < self.projectiles.count) : (i += 1) {
+            if (self.projectiles.owner_id[i] != 0xff) continue;
+            if (self.projectiles.ttl_ticks[i] == 0) continue;
+            for (&self.players) |*p| {
+                if (!p.active or !p.flags.alive) continue;
+                if (p.flags.invulnerable or p.invuln_ticks > 0) continue;
+                if (!combat.boxCircleOverlap(
+                    p.pos,
+                    half,
+                    self.projectiles.pos[i],
+                    self.projectiles.spec[i].radius,
+                )) continue;
+
+                const stats = upgrade.resolveStats(&p.weapons, &p.passives, &p.overclock);
+                var taken = @max(self.projectiles.damage[i] - stats.armor_flat, 1.0);
+                if (p.shield > 0.0) {
+                    const absorbed = @min(p.shield, taken);
+                    p.shield -= absorbed;
+                    taken -= absorbed;
+                }
+                p.hp -= taken;
+                self.projectiles.ttl_ticks[i] = 0;
+
+                if (p.hp <= 0.0) {
+                    p.hp = 0.0;
+                    p.flags.alive = false;
+                    self.killPlayer(p.id);
+                }
+                break;
             }
         }
     }
@@ -926,25 +1277,42 @@ pub const Simulation = struct {
         for (&self.players) |*p| {
             if (!p.active or !p.flags.alive) continue;
             if (p.xp < p.xp_next) continue;
-
-            p.level += 1;
             p.xp -= p.xp_next;
-            p.xp_next = upgrade.xpForLevel(p.level);
-            const options = upgrade.generateOptions(&p.weapons, &p.passives, &p.overclock, &self.upgrade_rng);
-            self.pending_levelups[self.pending_count] = .{
-                .event_id = self.next_event_id,
-                .player_id = p.id,
-                .new_level = p.level,
-                .options = options,
-                .timeout_ticks = levelup_timeout_ticks,
-                .resolved = false,
-                .sent = false,
-            };
-            self.next_event_id +%= 1;
-            self.pending_count += 1;
-            self.loadout_dirty[p.id] = true;
+            self.offerDraft(p);
         }
         if (self.pending_count > 0) self.state = .level_up_pause;
+    }
+
+    /// A boss died: offer every living player an immediate evolution/upgrade
+    /// draft, reusing the level-up machinery (DESIGN.md §4). The boss's 250 XP
+    /// cache is a separate gem, dropped with its corpse and collected normally.
+    fn offerBossChest(self: *Simulation) void {
+        for (&self.players) |*p| {
+            if (!p.active or !p.flags.alive) continue;
+            self.offerDraft(p);
+        }
+        if (self.pending_count > 0) self.state = .level_up_pause;
+    }
+
+    /// Queue one level-up draft for a player: a level, three weighted choices
+    /// and the pause. Shared by a filled XP bar and a boss chest, so the two
+    /// paths cannot drift apart.
+    fn offerDraft(self: *Simulation, p: *PlayerState) void {
+        p.level += 1;
+        p.xp_next = upgrade.xpForLevel(p.level);
+        const options = upgrade.generateOptions(&p.weapons, &p.passives, &p.overclock, &self.upgrade_rng);
+        self.pending_levelups[self.pending_count] = .{
+            .event_id = self.next_event_id,
+            .player_id = p.id,
+            .new_level = p.level,
+            .options = options,
+            .timeout_ticks = levelup_timeout_ticks,
+            .resolved = false,
+            .sent = false,
+        };
+        self.next_event_id +%= 1;
+        self.pending_count += 1;
+        self.loadout_dirty[p.id] = true;
     }
 
     /// Advance a paused run: count down the offer timeouts and auto-select
@@ -1136,6 +1504,8 @@ pub const Simulation = struct {
         // opposing arcs, which only works if every enemy is measured from the
         // same direction.
         const axis = enemy.surgeAxis(&self.rng, self.tick);
+        // The difficulty curve (DESIGN.md §1) scales every spawn's health.
+        const hp_mult = enemy.hpMultiplier(t);
 
         while (owed > 0) : (owed -= 1) {
             if (self.enemies.count >= cap) {
@@ -1151,10 +1521,77 @@ pub const Simulation = struct {
             const angle = enemy.spawnAngle(&self.rng, axis);
             const dist = self.rng.range(enemy.spawn_min_radius, enemy.spawn_max_radius);
             const pos = placeFrom(centroid, angle, dist);
-            // A full pool stops the loop rather than being skipped: the next
-            // evaluation will try again.
-            if (self.enemies.spawn(archetype, pos) == null) break;
+            self.spawnEnemy(archetype, pos, hp_mult);
         }
+
+        // Boss cadence: every 180 s, if none is alive (DESIGN.md §4).
+        if (self.tick >= enemy.boss.interval_ticks and
+            @mod(self.tick, enemy.boss.interval_ticks) == 0 and
+            self.enemies.bossCount() == 0)
+        {
+            const angle = self.rng.range(0.0, 2.0 * std.math.pi);
+            const dist = self.rng.range(enemy.spawn_min_radius, enemy.spawn_max_radius);
+            self.spawnBoss(placeFrom(centroid, angle, dist), hp_mult, players);
+        }
+    }
+
+    /// Spawn one enemy of `archetype` at `pos`, applying the difficulty curve's
+    /// health multiplier and the elite roll (DESIGN.md §1, §4).
+    fn spawnEnemy(self: *Simulation, archetype: enemy.Archetype, pos: [2]f32, hp_mult: f32) void {
+        const t = @as(f32, @floatFromInt(self.tick)) /
+            (@as(f32, @floatFromInt(root.tick_hz)) * 60.0);
+
+        // The endless curve's move-speed escalation (DESIGN.md §1 Phase D) is
+        // baked in at spawn, exactly as the health curve is: below 20:00 the
+        // multiplier is 1.0, so a standard run is unaffected, and past it the
+        // horde that keeps respawning gets faster instead of the escalation
+        // being defined and never applied.
+        var opts = enemy.Pool.SpawnOpts{
+            .hp_mult = hp_mult,
+            .speed_mult = enemy.speedMultiplier(t),
+        };
+        var elite_mask: u8 = 0;
+        if (self.rng.unit() < enemy.eliteChance(t)) {
+            // One modifier per elite, drawn uniformly from the four.
+            elite_mask = switch (self.rng.below(4)) {
+                0 => enemy.elite.vampiric,
+                1 => enemy.elite.splitter,
+                2 => enemy.elite.shielded,
+                else => enemy.elite.haste_aura,
+            };
+            opts.elite_mask = elite_mask;
+            opts.hp_mult *= enemy.elite.hp_mult;
+            opts.radius_mult = enemy.elite.radius_mult;
+            if (elite_mask & enemy.elite.vampiric != 0) {
+                opts.speed_mult *= enemy.elite.vampiric_speed_mult;
+            }
+        }
+
+        const i = self.enemies.spawnWith(archetype, pos, opts) orelse return;
+
+        // Shielded: a barrier of 50% max HP, regenerated after 3.0 s without
+        // damage (DESIGN.md §4).
+        if (elite_mask & enemy.elite.shielded != 0) {
+            self.enemies.barrier[i] = enemy.elite.shield_barrier * self.enemies.max_hp[i];
+        }
+    }
+
+    /// Place a boss at `pos` (DESIGN.md §4): `2500 x M_HP(t) x (1 + 0.75(P-1))`
+    /// HP, 100% knockback and freeze immunity.
+    fn spawnBoss(self: *Simulation, pos: [2]f32, hp_mult: f32, players: u8) void {
+        const t = @as(f32, @floatFromInt(self.tick)) /
+            (@as(f32, @floatFromInt(root.tick_hz)) * 60.0);
+        const party = 1.0 + enemy.boss.party_hp_step * (@as(f32, @floatFromInt(players)) - 1.0);
+        const i = self.enemies.spawnWith(.boss, pos, .{
+            .hp_mult = hp_mult * party,
+            // A boss is an enemy too, so the endless move-speed escalation
+            // reaches it the same way it reaches the horde.
+            .speed_mult = enemy.speedMultiplier(t),
+            .knockback_resist = 1.0,
+            .status_immune = true,
+        }) orelse return;
+        // First attack one interval after the spawn.
+        self.enemies.ai_timer[i] = enemy.boss.attack_interval_ticks;
     }
 
     /// Last applied input sequence per player slot, for `acked_seq`.
@@ -1200,15 +1637,19 @@ pub const Simulation = struct {
     /// Quantized wire form of one enemy (PROTOCOL.md "EnemyNet", 12 bytes).
     pub fn enemyNet(pool: *const enemy.Pool, i: usize) wire.EnemyNet {
         const pos = pool.pos[i];
-        const vel = pool.vel[i];
+        const facing = pool.facing[i];
+        // A Shielded elite's barrier is reported as part of its HP, so the
+        // client's health bar reflects the total damage the enemy can still
+        // absorb. Capped at 100% because `hp_pct` is a percentage.
+        const hp = pool.hp[i] + pool.barrier[i];
         return .{
             .id = pool.id[i],
             .archetype = pool.archetype[i],
             .elite_mask = pool.elite_mask[i],
             .pos_x = wire.quantize(pos[0]),
             .pos_y = wire.quantize(pos[1]),
-            .vel_angle = wire.angleToByte(std.math.atan2(vel[1], vel[0])),
-            .hp_pct = hpPercent(pool.hp[i], pool.max_hp[i]),
+            .vel_angle = wire.angleToByte(std.math.atan2(facing[1], facing[0])),
+            .hp_pct = hpPercent(hp, pool.max_hp[i]),
         };
     }
 
@@ -1274,6 +1715,61 @@ pub const Simulation = struct {
             .server_tick = self.tick,
             // Full snapshots carry no baseline; delta snapshots set this in
             // phase 4.
+            .baseline_tick = 0,
+            .run_time_ms = self.runTimeMs(),
+            .acked_seq = self.ackedSeq(),
+            .game_state = @intFromEnum(self.state),
+            .counts = .{
+                @intCast(np),
+                @intCast(ne),
+                @intCast(nk),
+                @intCast(ng),
+            },
+            .players = self.net_scratch[0..np],
+            .enemies = self.net_enemies[0..ne],
+            .projs = self.net_projs[0..nk],
+            .gems = self.net_gems[0..ng],
+        };
+    }
+
+    /// Interest-filtered snapshot contents: only the entities within `radius`
+    /// of `centre`, which is what a snapshot — full or delta — actually carries
+    /// (PROTOCOL.md "Interest management"). The receiver's neighbourhood, not
+    /// the whole arena.
+    pub fn snapshotViewFor(self: *Simulation, centre: [2]f32, radius: f32) wire.SnapshotView {
+        const r2 = radius * radius;
+
+        var np: usize = 0;
+        for (&self.players) |*p| {
+            if (!p.active) continue;
+            if (!inRadius(p.pos, centre, r2)) continue;
+            self.net_scratch[np] = playerNet(p);
+            np += 1;
+        }
+
+        var ne: usize = 0;
+        for (0..self.enemies.count) |i| {
+            if (!inRadius(self.enemies.pos[i], centre, r2)) continue;
+            self.net_enemies[ne] = enemyNet(&self.enemies, i);
+            ne += 1;
+        }
+
+        var nk: usize = 0;
+        for (0..self.projectiles.count) |k| {
+            if (!inRadius(self.projectiles.pos[k], centre, r2)) continue;
+            self.net_projs[nk] = projNet(&self.projectiles, k);
+            nk += 1;
+        }
+
+        var ng: usize = 0;
+        for (0..self.gems.count) |k| {
+            if (!inRadius(self.gems.pos[k], centre, r2)) continue;
+            self.net_gems[ng] = gemNet(&self.gems, k);
+            ng += 1;
+        }
+
+        return .{
+            .server_tick = self.tick,
             .baseline_tick = 0,
             .run_time_ms = self.runTimeMs(),
             .acked_seq = self.ackedSeq(),
@@ -2441,4 +2937,119 @@ test "the smoke test's difficulty escalation is unbounded" {
     try std.testing.expect(enemy.activeCap(20.0) > enemy.activeCap(5.0));
     try std.testing.expectEqual(root.max_enemies, enemy.activeCap(1000.0));
     try std.testing.expect(enemy.spawnRate(100.0, 1) > 1000.0);
+}
+
+/// A player at the origin with no weapons, so nothing it does can kill the
+/// shooter the test is setting up.
+fn disarmedPlayerAtOrigin(sim: *Simulation) *PlayerState {
+    const p = sim.spawnPlayer(0).?;
+    p.pos = .{ 0.0, 0.0 };
+    disarm(p);
+    return p;
+}
+
+test "a spitter's shot travels at its stated speed" {
+    var sim = Simulation.init();
+    _ = disarmedPlayerAtOrigin(&sim);
+
+    // A spitter 10 units away, halted and due to fire this tick.
+    const s = sim.enemies.spawn(.triangle_t2, .{ 10.0, 0.0 }).?;
+    sim.enemies.ai_state[s] = @intFromEnum(enemy.AiState.halt);
+    sim.enemies.ai_timer[s] = 1;
+    sim.updateEnemies(1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, 1), sim.projectiles.count);
+    const shot = sim.projectiles.count - 1;
+    try std.testing.expectEqual(@as(u8, 0xff), sim.projectiles.owner_id[shot]);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, enemy.spitter.shot_speed),
+        std.math.hypot(sim.projectiles.vel[shot][0], sim.projectiles.vel[shot][1]),
+        1e-4,
+    );
+
+    const x0 = sim.projectiles.pos[shot][0];
+    var k: usize = 0;
+    while (k < 10) : (k += 1) sim.advance();
+
+    // Ten ticks at 9.0 u/s is 1.5 units of ground, not a shot sitting on the
+    // muzzle for its whole lifetime.
+    try std.testing.expectApproxEqAbs(
+        @as(f32, enemy.spitter.shot_speed * 10.0 / 60.0),
+        x0 - sim.projectiles.pos[shot][0],
+        0.01,
+    );
+    try std.testing.expect(sim.projectiles.ttl_ticks[shot] > 0);
+}
+
+test "the boss's radial burst travels at its stated speed" {
+    var sim = Simulation.init();
+    _ = disarmedPlayerAtOrigin(&sim);
+
+    const b = sim.enemies.spawn(.boss, .{ 30.0, 0.0 }).?;
+    sim.enemies.ai_timer[b] = 1;
+    sim.enemies.boss_parity[b] = 0;
+    sim.updateEnemies(1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, enemy.boss.burst_count), sim.projectiles.count);
+    // The shot the burst fired along +x: the one with no y velocity.
+    var along_x: ?usize = null;
+    for (0..sim.projectiles.count) |j| {
+        if (sim.projectiles.vel[j][1] == 0.0 and sim.projectiles.vel[j][0] > 0.0) along_x = j;
+    }
+    const shot = along_x orelse return error.NoRadialShot;
+
+    const x0 = sim.projectiles.pos[shot][0];
+    var k: usize = 0;
+    while (k < 10) : (k += 1) sim.advance();
+
+    try std.testing.expectApproxEqAbs(
+        @as(f32, enemy.boss.burst_speed * 10.0 / 60.0),
+        sim.projectiles.pos[shot][0] - x0,
+        0.01,
+    );
+}
+
+test "the endless move-speed escalation is applied when an enemy spawns" {
+    var sim = Simulation.init();
+    _ = disarmedPlayerAtOrigin(&sim);
+
+    // Below 20:00 the multiplier is 1.0, so the curve changes nothing.
+    sim.tick = 10 * 60 * root.tick_hz;
+    sim.topUpLoad(1, 0, 5.0);
+    try std.testing.expectEqual(@as(usize, 1), sim.enemies.count);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.5), sim.enemies.move_speed[0], 1e-5);
+
+    // Past 20:00 a spawn carries the curve's multiplier.
+    sim.tick = 25 * 60 * root.tick_hz;
+    sim.topUpLoad(2, 0, 5.0);
+    const want = 4.5 * enemy.speedMultiplier(25.0);
+    try std.testing.expectApproxEqAbs(want, sim.enemies.move_speed[1], 1e-5);
+    try std.testing.expect(sim.enemies.move_speed[1] > 4.5);
+
+    // The boss takes it too — it is an enemy, and its spawn has no elite roll
+    // to muddy the value.
+    sim.spawnBoss(.{ 50.0, 0.0 }, 1.0, 1);
+    try std.testing.expectEqual(@as(usize, 3), sim.enemies.count);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 5.5 * enemy.speedMultiplier(25.0)),
+        sim.enemies.move_speed[2],
+        1e-5,
+    );
+
+    // And the wave spawner, where the elite roll can only ever add speed: every
+    // enemy it places past 20:00 is at least as fast as the curve demands, and
+    // at most the Vampiric modifier faster. Both bounds fail if the curve is
+    // not applied at all, and the elite roll's composition cannot break them.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) sim.spawnEnemy(.circle_t1, .{ 50.0, 0.0 }, 1.0);
+    try std.testing.expectEqual(@as(usize, 203), sim.enemies.count);
+    var slowest: f32 = std.math.inf(f32);
+    var fastest: f32 = 0.0;
+    for (3..sim.enemies.count) |k| {
+        slowest = @min(slowest, sim.enemies.move_speed[k]);
+        fastest = @max(fastest, sim.enemies.move_speed[k]);
+    }
+    try std.testing.expect(slowest >= want - 1e-4);
+    try std.testing.expect(fastest <= want * enemy.elite.vampiric_speed_mult + 1e-4);
+    try std.testing.expect(fastest > 4.5);
 }

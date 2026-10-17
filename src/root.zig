@@ -40,8 +40,32 @@ pub const max_weapon_level: u8 = 8;
 /// Base XP gem pickup radius in world units (DESIGN.md §1).
 pub const xp_pickup_radius: f32 = 3.0;
 
+/// Interest-management radius in world units (PROTOCOL.md "Interest
+/// management"). A snapshot — full or delta — carries only entities within
+/// this distance of the receiving player. It is sent to the client in
+/// `S2C_WELCOME` as a `u16`.
+///
+/// The orthographic viewport covers 80 x 45 units (DESIGN.md §1), so this is
+/// sized to cover the screen: a circle of this radius reaches the viewport's
+/// left and right edges (40 units) and its top and bottom (22.5) with margin,
+/// while leaving the far corners — the least valuable, hardest-to-see part of
+/// the screen — outside the radius. A smaller radius is what makes the phase-4
+/// bandwidth budget reachable at all: the wire carries only this neighbourhood,
+/// not the whole horde.
+pub const interest_radius: f32 = 40.0;
+
 /// Number of simulation ticks between snapshots.
 pub const ticks_per_snapshot: u32 = tick_hz / snapshot_hz;
+
+/// Wire budget for one delta snapshot frame, in bytes.
+///
+/// DESIGN.md §6 sets the phase-4 definition of done at *"bandwidth stays under
+/// 25 KB/s during a 2,500-enemy 20:00 stress test"*. At the 20 Hz snapshot rate
+/// that is 1,250 bytes per snapshot; this takes 80% of it, so a single frame —
+/// not merely the mean of many — stays inside the budget, with the remainder
+/// left as headroom for the full snapshots a connection starts on and for the
+/// `spawned`/`destroyed` records, which are never dropped to fit.
+pub const snapshot_budget_bytes: usize = 1000;
 
 /// Player movement speed in units per second (DESIGN.md §1).
 pub const move_speed: f32 = 12.0;

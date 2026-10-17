@@ -42,6 +42,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const wire = @import("wire.zig");
 const sim = @import("sim.zig");
+const delta = @import("delta.zig");
 const net_opt = @import("net_opt.zig");
 
 const net = std.Io.net;
@@ -76,11 +77,15 @@ const max_queued_bytes: usize = 256 * 1024;
 pub const unassigned_player: u8 = 0xff;
 
 /// A decoded client message, queued for the simulation thread.
+///
+/// `C2S_ACK_SNAPSHOT` is deliberately not here: an acknowledgement is pure
+/// connection state, never simulation state, and the broadcast has to be able
+/// to see the newest one at the instant it encodes. See
+/// `ClientConn.last_recv_server_tick`.
 pub const Incoming = union(enum) {
     hello: wire.Hello,
     input: wire.Input,
     levelup_choice: wire.LevelupChoice,
-    ack_snapshot: u32,
     restart: void,
 };
 
@@ -113,6 +118,15 @@ const Frame = struct {
     }
 };
 
+/// Wrap `bytes` in a frame, freeing them if the frame cannot be allocated so
+/// a failed encode never leaks its payload.
+fn frameOrFree(gpa: std.mem.Allocator, bytes: []u8) !*Frame {
+    return Frame.create(gpa, bytes) catch |e| {
+        gpa.free(bytes);
+        return e;
+    };
+}
+
 /// One accepted TCP connection and its parse/write state.
 ///
 /// Always heap allocated: the connection threads hold a raw pointer to it, and
@@ -134,8 +148,55 @@ pub const ClientConn = struct {
     accum_offset: usize = 0,
     name: [16]u8 = std.mem.zeroes([16]u8),
     session_token: u64 = 0,
-    /// Last `server_tick` this client acknowledged; drives FULL vs DELTA later.
-    last_recv_server_tick: u32 = 0,
+    /// Newest `server_tick` this client has acknowledged, and the tick it is
+    /// expected to hold a complete state for.
+    ///
+    /// Both are written by the reader thread the instant an ack is decoded, not
+    /// queued for the simulation thread: an acknowledgement is pure connection
+    /// state, and the encoder has to see the freshest one the server has
+    /// processed *at the moment it encodes*.
+    ///
+    /// The acknowledgement alone cannot name the baseline. The client only
+    /// flushes an ack when the next snapshot lands, so the ack for tick N
+    /// reaches the server a few hundred microseconds *after* the broadcast for
+    /// N+3 has been built; a delta diffed against it names a tick the client
+    /// left a whole snapshot ago, and the client refuses it under PROTOCOL.md
+    /// "Baseline rules". Measured against the real client over a live run, 48%
+    /// of every delta was refused that way. So the server carries the tick
+    /// forward itself: a client holds exactly one complete state and moves it to
+    /// any snapshot it applies, so `held_tick` advances to each snapshot's own
+    /// tick as that snapshot is sent, and the acknowledgement is what corrects
+    /// the model whenever the two ever disagree.
+    acked_tick: std.atomic.Value(u32) = .init(0),
+    held_tick: std.atomic.Value(u32) = .init(0),
+    /// The tick the model held before the snapshot it most recently sent
+    /// advanced it — the baseline that snapshot was diffed against, or, for a
+    /// full snapshot, the tick the client held before it arrived.
+    ///
+    /// It is the second of the two ticks `noteAck` lets the model account for
+    /// without assuming the client is stuck: a client that has not processed
+    /// that snapshot yet, or that refused it, still holds this one. Written by
+    /// the simulation thread as it builds a frame, read by the reader thread as
+    /// it decodes an ack.
+    held_baseline: std.atomic.Value(u32) = .init(0),
+    /// Where this connection's per-snapshot update budget starts inside the
+    /// candidate set. Advanced by the number of records each snapshot actually
+    /// carried, so the entities one snapshot could not afford lead the next.
+    /// The simulation thread is its only writer.
+    update_rotation: u32 = 0,
+    /// The state this client holds: its own interest-filtered neighbourhood,
+    /// entity for entity. Built from a full snapshot, rebuilt from the history
+    /// ring when the model is corrected, and thereafter changed only by the
+    /// records that actually went out — never by the ones the per-snapshot
+    /// budget deferred, which is what makes the next diff offer them again.
+    ///
+    /// A few hundred kilobytes, because it is sized for the whole world and
+    /// holds only a neighbourhood. The simulation thread is its only writer.
+    held: delta.FilteredWorld = .{},
+    /// The tick `held` describes. Diverging from `held_tick` means the model was
+    /// corrected since the state was built, so the state has to be rebuilt from
+    /// the ring before the next diff. The simulation thread is its only writer.
+    held_tick_content: u32 = 0,
 
     /// Set when the connection must stop: the peer closed, a read or write
     /// failed, or the server decided the connection is unusable. Written by
@@ -166,6 +227,69 @@ pub const ClientConn = struct {
         gpa.free(c.read_buf);
         gpa.free(c.write_buf);
     }
+
+    /// Record an acknowledgement of `tick`, correcting the held-state model.
+    ///
+    /// Caller holds the lock. Called from the reader thread as the ack is
+    /// decoded, so the correction is in place before the next frame is encoded.
+    ///
+    /// The rule, in full: an ack corrects the model when it names a tick the
+    /// model cannot account for, and it does so on the first such ack.
+    ///
+    /// What the model can account for, once it has sent a snapshot, is exactly
+    /// two ticks — the tick that snapshot carried, which the client holds if it
+    /// applied it, and the tick it was diffed against, which the client still
+    /// holds if it has not processed it yet. An ack naming either is a client
+    /// that is keeping up, or lagging by the one snapshot the model has just
+    /// carried it past, and it changes nothing: the model's advance onto each
+    /// snapshot is what keeps the baseline where the client's next apply needs
+    /// it, and pulling it back for every ack that trails would put it a whole
+    /// snapshot behind and make the client refuse the next delta — the 48%
+    /// refusal the carry-forward model exists to remove.
+    ///
+    /// Any other tick is a client holding a state the model cannot explain: it
+    /// has run further ahead than one unprocessed snapshot accounts for, so the
+    /// model is wrong and the ack is the truth. Correcting there and then is
+    /// the point of the rule. The predicate this replaced waited for the client
+    /// to repeat itself before it would believe an ack, which meant the first
+    /// corrective ack of a drifted model — the one that is different from the
+    /// previous ack — was ignored, and the model went on diffing against a tick
+    /// the client had already refused for another whole round trip.
+    ///
+    /// A repeat is still a correction in its own right, whether or not it names
+    /// the last baseline: a client that applied the snapshot it is answering
+    /// holds a newer tick and cannot ack the same one twice, so a repeat is the
+    /// client insisting on the state it really holds.
+    ///
+    /// The tolerance is exactly one snapshot, because one send is all the model
+    /// advances at a time and so the only older tick a single unprocessed
+    /// snapshot explains. A client whose acks trail by more than that — which
+    /// takes a round trip plus a client frame longer than the 50 ms between
+    /// snapshots — is read as disagreeing, and correcting to an ack two
+    /// snapshots stale costs a refused delta before the client's own re-ack
+    /// settles the model on the tick it really holds. Measured against the real
+    /// client over a 6,000-frame run, the acks trail by no more than that one
+    /// snapshot: 828 deltas applied, one refused, and that one inside the
+    /// seeding transient.
+    pub fn noteAck(c: *ClientConn, tick: u32) void {
+        const previous = c.acked_tick.swap(tick, .acq_rel);
+        const held = c.held_tick.load(.acquire);
+        const baseline = c.held_baseline.load(.acquire);
+        if (tick > held or (tick != held and tick != baseline) or
+            (tick == previous and tick != held))
+        {
+            c.held_tick.store(tick, .release);
+        }
+    }
+
+    /// Drop the held-state model: the run it described has ended.
+    ///
+    /// Caller holds the lock.
+    pub fn forgetRun(c: *ClientConn) void {
+        c.acked_tick.store(0, .release);
+        c.held_tick.store(0, .release);
+        c.held_baseline.store(0, .release);
+    }
 };
 
 pub const Server = struct {
@@ -175,6 +299,12 @@ pub const Server = struct {
     /// allocated with `gpa` so that they can be released individually.
     arena: *std.heap.ArenaAllocator,
     sim: sim.Simulation,
+    /// The 32-snapshot history ring a delta baseline is diffed against. Heap
+    /// allocated: at 32 full-world snapshots it is a few megabytes, far too
+    /// large to keep inline in a `Server` that tests put on the stack.
+    snapshots: *delta.SnapshotRing,
+    /// Reusable scratch for the per-client snapshot diff, also heap allocated.
+    diff_scratch: *delta.DiffScratch,
     mu: std.Io.Mutex = .init,
     /// Pointers, not values: a connection's address has to stay put for the
     /// whole life of its threads, so removing one can never move another.
@@ -188,11 +318,27 @@ pub const Server = struct {
         gpa: std.mem.Allocator,
         arena: *std.heap.ArenaAllocator,
     ) Server {
+        // The history ring and the diff scratch are allocated from the arena,
+        // which outlives the server and is deinited by the caller.
+        const snapshots = arena.allocator().create(delta.SnapshotRing) catch @panic("out of memory");
+        snapshots.* = .{};
+        // The ring starts empty: every slot tick 0, which is not a valid
+        // snapshot tick, so a baseline lookup finds nothing until a snapshot
+        // has actually been stored.
+        @memset(
+            @as([*]u8, @ptrCast(&snapshots.slots))[0..@sizeOf(@TypeOf(snapshots.slots))],
+            0,
+        );
+        const diff_scratch = arena.allocator().create(delta.DiffScratch) catch @panic("out of memory");
+        diff_scratch.* = .{};
+
         return .{
             .io = io,
             .gpa = gpa,
             .arena = arena,
             .sim = sim.Simulation.init(),
+            .snapshots = snapshots,
+            .diff_scratch = diff_scratch,
         };
     }
 
@@ -420,7 +566,11 @@ pub const Server = struct {
         }
     }
 
-    /// Encode one snapshot and queue it on every connection that wants it.
+    /// Encode one snapshot per connection that wants it and queue them.
+    ///
+    /// Each connection gets its own frame, because a delta is diffed against
+    /// that connection's acknowledged baseline and filtered to its own
+    /// neighbourhood — two clients rarely want the same bytes any more.
     fn broadcast(self: *Server) void {
         // Encoding for nobody is worth avoiding: a snapshot carrying a thousand
         // enemies is around 18 KB, and a client that has dropped mid-run would
@@ -436,29 +586,133 @@ pub const Server = struct {
         self.unlock();
         if (!wanted) return;
 
-        const bytes = wire.encodeSnapshotFull(self.gpa, self.sim.snapshotView()) catch |e| {
-            std.debug.print("[server] error: could not encode snapshot: {s}\n", .{@errorName(e)});
-            return;
-        };
-        const frame = Frame.create(self.gpa, bytes) catch |e| {
-            std.debug.print("[server] error: could not allocate a snapshot frame: {s}\n", .{@errorName(e)});
-            self.gpa.free(bytes);
-            return;
-        };
+        // Record the whole world at this tick in the history ring. The slot is
+        // a stable copy, so it is what a later acknowledgement correction is
+        // rebuilt from, and the interest-filtered snapshots below — which reuse
+        // the sim's scratch — cannot disturb it.
+        const view = self.sim.snapshotView();
+        self.snapshots.store(view);
+
+        var frames: [root.max_players]struct { conn: *ClientConn, frame: *Frame } = undefined;
+        var n_frames: usize = 0;
+        for (self.clients.items) |conn| {
+            if (!receivesSnapshots(conn)) continue;
+            if (self.snapshotFrame(conn)) |frame| {
+                frames[n_frames] = .{ .conn = conn, .frame = frame };
+                n_frames += 1;
+            } else |e| {
+                std.debug.print("[server] error: could not encode snapshot: {s}\n", .{@errorName(e)});
+            }
+        }
 
         self.lock();
         defer self.unlock();
+        for (frames[0..n_frames]) |f| {
+            self.enqueue(f.conn, f.frame);
+        }
+    }
 
-        for (self.clients.items) |conn| {
-            if (!receivesSnapshots(conn)) continue;
-            frame.retain();
-            self.enqueue(conn, frame);
+    /// Encode the one snapshot this connection wants: a delta against the model
+    /// of what its client holds, or a full snapshot of its neighbourhood when
+    /// there is no usable model.
+    fn snapshotFrame(self: *Server, conn: *ClientConn) !*Frame {
+        const centre = self.sim.players[conn.player_id].pos;
+        const tick = self.sim.tick;
+        const held = &conn.held;
+
+        // Read at the moment of encoding, not at the top of the tick: an ack
+        // that landed while the tick was being simulated is exactly the one
+        // this frame should be diffed against.
+        var model = conn.held_tick.load(.acquire);
+        if (model > tick) {
+            // A restart took the server's tick back to zero, so a tick held
+            // from the dead run names nothing this client has any more.
+            model = 0;
+            conn.held_tick.store(0, .release);
+        }
+        // Record what the model holds going into this frame, before the frame
+        // advances it. It is the baseline a delta is diffed against, and it is
+        // what `noteAck` reads to tell an ack that is merely lagging behind this
+        // snapshot from one naming a state the model cannot account for.
+        conn.held_baseline.store(model, .release);
+
+        // Bring the held state in line with the model — a no-op while the two
+        // already agree. When they do not, there is no usable model at all and
+        // the client gets a full snapshot: the only honest answer, and one it
+        // keeps getting until an acknowledgement proves it is holding it.
+        if (!self.syncHeld(conn, model)) {
+            conn.held_tick.store(0, .release);
+            return self.fullSnapshotFrame(conn, centre, tick);
         }
 
-        // Drop this thread's own reference. When no connection was eligible the
-        // frame is freed right here, so an idle server does not leak a frame
-        // per snapshot.
-        frame.release(self.gpa);
+        const current = self.sim.snapshotViewFor(centre, root.interest_radius);
+        const d = delta.computeDelta(current, held, .{
+            .rotation = conn.update_rotation,
+        }, self.diff_scratch);
+        const bytes = wire.encodeSnapshotDelta(self.gpa, .{
+            .server_tick = tick,
+            .baseline_tick = model,
+            .run_time_ms = self.sim.runTimeMs(),
+            .acked_seq = self.sim.ackedSeq(),
+            .game_state = @intFromEnum(self.sim.state),
+            .spawned = d.spawned,
+            .updated = d.updated,
+            .destroyed = d.destroyed,
+        }) catch |e| return e;
+
+        // The model moves onto the records that actually went out, and only
+        // those: the budget's deferred updates stay un-applied, so the next diff
+        // still finds them changed and offers them again.
+        held.apply(d);
+        conn.held_tick_content = tick;
+        conn.held_tick.store(tick, .release);
+        // Start the next snapshot where this one stopped, so the entities the
+        // budget deferred lead the next window instead of trailing it forever.
+        conn.update_rotation +%= @intCast(d.updated.len);
+        return frameOrFree(self.gpa, bytes);
+    }
+
+    /// Bring `conn`'s held state in line with the model tick `model`.
+    ///
+    /// The model is corrected by an acknowledgement that disagrees with it
+    /// (PROTOCOL.md "Baseline rules"), so the state it used to describe is no
+    /// longer the state the client holds. When the two disagree, the state is
+    /// rebuilt from the ring's snapshot of that tick, filtered around the
+    /// position the receiver's player held *then* — which is the neighbourhood
+    /// the client's own state was filtered around.
+    ///
+    /// Returns false when there is no usable model: tick 0, a tick the ring no
+    /// longer holds, or one whose snapshot did not carry the player. The caller
+    /// answers that with a full snapshot.
+    fn syncHeld(self: *Server, conn: *ClientConn, model: u32) bool {
+        if (model != 0 and model == conn.held_tick_content and
+            self.snapshots.baseline(model) != null)
+        {
+            return true;
+        }
+        const slot = self.snapshots.baseline(model) orelse return false;
+        const centre = delta.playerPosInSlot(slot, conn.player_id) orelse return false;
+        conn.held.setFromSlot(slot, centre, root.interest_radius);
+        conn.held_tick_content = model;
+        // The candidate set changed wholesale, so the rotation starts over.
+        conn.update_rotation = 0;
+        return true;
+    }
+
+    /// A full snapshot of `conn`'s neighbourhood, which replaces whatever the
+    /// client held outright.
+    ///
+    /// The model tick is deliberately left alone: a client that has not
+    /// acknowledged anything keeps getting full snapshots until it proves it is
+    /// holding one. The state the full snapshot describes *is* recorded, so an
+    /// acknowledgement of this very snapshot finds the model already in place.
+    fn fullSnapshotFrame(self: *Server, conn: *ClientConn, centre: [2]f32, tick: u32) !*Frame {
+        const full = self.sim.snapshotViewFor(centre, root.interest_radius);
+        const bytes = wire.encodeSnapshotFull(self.gpa, full) catch |e| return e;
+        conn.held.setFromView(full);
+        conn.held_tick_content = tick;
+        conn.update_rotation = 0;
+        return frameOrFree(self.gpa, bytes);
     }
 
     /// Queue a frame on one connection, taking ownership of its reference.
@@ -611,9 +865,13 @@ fn dispatch(self: *Server, conn: *ClientConn, message: Incoming) void {
         .restart => {
             if (conn.player_id == unassigned_player) return;
             self.sim.restart(conn.player_id);
-        },
-        .ack_snapshot => |server_tick| {
-            conn.last_recv_server_tick = server_tick;
+            // The run's tick goes back to zero, so every connection's
+            // held-state model names a tick of the dead run. Left alone, a model
+            // whose tick happened to coincide with the new run's would diff
+            // against it, and the client — which drops its own baseline with the
+            // run — refuses a delta whose baseline it does not hold *without
+            // acknowledging*, so the two could never re-converge.
+            for (self.clients.items) |c| c.forgetRun();
         },
     }
 }
@@ -667,7 +925,18 @@ fn handleHello(self: *Server, conn: *ClientConn, hello: wire.Hello) void {
         return;
     });
 
-    const snapshot = wire.encodeSnapshotFull(self.gpa, self.sim.snapshotView()) catch |e| {
+    // The client has no baseline yet, so this is a full snapshot of its
+    // neighbourhood (PROTOCOL.md: a baseline of 0 gets a full snapshot). The
+    // state it describes is recorded as the client's held state, so the
+    // acknowledgement of this very snapshot needs no rebuild from the ring —
+    // and this one is taken outside a broadcast, so the ring may never hold it.
+    const first = self.sim.snapshotViewFor(player.pos, root.interest_radius);
+    conn.held.setFromView(first);
+    conn.held_tick_content = self.sim.tick;
+    const snapshot = wire.encodeSnapshotFull(
+        self.gpa,
+        first,
+    ) catch |e| {
         std.debug.print("[server] snapshot encode failed: {s}\n", .{@errorName(e)});
         markClosed(self, conn);
         return;
@@ -703,6 +972,8 @@ fn welcomeFrame(
     try payload.byte(gpa, root.tick_hz);
     try payload.byte(gpa, root.snapshot_hz);
     try payload.leU16(gpa, @as(u16, @intFromFloat(root.arena_half_size)));
+    try payload.leU16(gpa, @as(u16, @intFromFloat(root.interest_radius)));
+    try payload.leU16(gpa, 0); // reserved
     try payload.leU32(gpa, server_tick);
 
     return wire.encodeFrame(gpa, wire.msg.s2c_welcome, payload.bytes(), 0);
@@ -1036,21 +1307,31 @@ fn accumulateAndParse(self: *Server, conn: *ClientConn, bytes: []const u8) bool 
     return true;
 }
 
-/// Decode one client frame and queue it for the simulation thread.
+/// Decode one client frame and hand it to the right consumer.
 ///
-/// Every message type goes through the queue, including `C2S_HELLO`: the
+/// Simulation messages go through the queue, including `C2S_HELLO`: the
 /// simulation is only ever touched by the simulation thread, so a reader thread
 /// can never be applying an input while a step is integrating.
+///
+/// `C2S_ACK_SNAPSHOT` is the exception. It names no simulation state at all —
+/// it only tells the server which tick this connection holds — and the
+/// broadcast has to see the newest one at the instant it encodes, so it is
+/// stored here, under the lock, the moment it is decoded.
 fn routeClient(self: *Server, conn: *ClientConn, msg_type: u8, payload: []const u8) void {
+    if (msg_type == wire.msg.c2s_ack_snapshot) {
+        const ack = wire.decodePayload(wire.AckSnapshot, payload) orelse return;
+        self.lock();
+        defer self.unlock();
+        if (conn.closed.load(.acquire)) return;
+        conn.noteAck(ack.last_recv_server_tick);
+        return;
+    }
+
     const message: Incoming = switch (msg_type) {
         wire.msg.c2s_hello => .{ .hello = wire.decodeHello(payload) orelse return },
         wire.msg.c2s_input => .{ .input = wire.decodePayload(wire.Input, payload) orelse return },
         wire.msg.c2s_levelup_choice => .{
             .levelup_choice = wire.decodePayload(wire.LevelupChoice, payload) orelse return,
-        },
-        wire.msg.c2s_ack_snapshot => .{
-            .ack_snapshot = (wire.decodePayload(wire.AckSnapshot, payload) orelse return)
-                .last_recv_server_tick,
         },
         wire.msg.c2s_restart => .{ .restart = {} },
         else => {
@@ -1334,13 +1615,14 @@ test "a HELLO with the wrong protocol version is refused" {
     try std.testing.expectEqual(@as(usize, 0), conn.outgoing.items.len);
 }
 
-test "a snapshot frame is shared safely and freed exactly once" {
+test "a broadcast gives each connection its own snapshot frame" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var server = Server.init(std.Io.failing, gpa, &arena);
 
-    // Two connections, both past the handshake, so both are eligible.
+    // Two connections, both past the handshake, so both are eligible. Neither
+    // has acknowledged a baseline, so both get a full snapshot.
     var conns: [2]*ClientConn = undefined;
     for (&conns) |*slot| {
         const conn = try gpa.create(ClientConn);
@@ -1357,25 +1639,23 @@ test "a snapshot frame is shared safely and freed exactly once" {
     _ = server.sim.spawnPlayer(0);
     server.broadcast();
 
-    // One frame, two references: each consumer owns the same bytes and the last
-    // release is the one that frees them. `std.testing.allocator` fails the
-    // test on a double free or a leak.
+    // Each connection gets its own frame now: a delta is diffed against that
+    // connection's baseline and filtered to its neighbourhood, so two clients
+    // rarely want the same bytes. Each frame has one reference, owned by its
+    // connection, and the release is the one that frees it.
+    // `std.testing.allocator` fails the test on a double free or a leak.
     try std.testing.expectEqual(@as(usize, 1), conns[0].outgoing.items.len);
     try std.testing.expectEqual(@as(usize, 1), conns[1].outgoing.items.len);
-    try std.testing.expect(conns[0].outgoing.items[0] == conns[1].outgoing.items[0]);
-    try std.testing.expectEqual(@as(u32, 2), conns[0].outgoing.items[0].refs.load(.acquire));
-    try std.testing.expectEqual(
-        conns[0].outgoing.items[0].bytes.len,
-        conns[0].queued_bytes,
-    );
-
-    conns[0].outgoing.items[0].release(gpa);
-    conns[0].outgoing.clearRetainingCapacity();
-    // Still readable by the other consumer after the first one is done.
-    const header = wire.decodeFrameHeader(conns[1].outgoing.items[0].bytes).?;
-    try std.testing.expectEqual(wire.msg.s2c_snapshot_full, header.msg_type);
-    conns[1].outgoing.items[0].release(gpa);
-    conns[1].outgoing.clearRetainingCapacity();
+    try std.testing.expect(conns[0].outgoing.items[0] != conns[1].outgoing.items[0]);
+    for (conns) |conn| {
+        const frame = conn.outgoing.items[0];
+        try std.testing.expectEqual(@as(u32, 1), frame.refs.load(.acquire));
+        const header = wire.decodeFrameHeader(frame.bytes).?;
+        try std.testing.expectEqual(wire.msg.s2c_snapshot_full, header.msg_type);
+        try std.testing.expectEqual(frame.bytes.len, conn.queued_bytes);
+        frame.release(gpa);
+        conn.outgoing.clearRetainingCapacity();
+    }
 }
 
 test "a broadcast with no eligible connection frees its frame" {
@@ -1531,6 +1811,17 @@ const TestClient = struct {
         try std.Io.Writer.flush(&self.writer.interface);
     }
 
+    /// Send a `C2S_ACK_SNAPSHOT` for `server_tick`.
+    fn ack(self: *TestClient, server_tick: u32) !void {
+        var payload = wire.Sink.init();
+        defer payload.deinit(self.gpa);
+        try payload.leU32(self.gpa, server_tick);
+        const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_ack_snapshot, payload.bytes(), 0);
+        defer self.gpa.free(frame);
+        try self.writer.interface.writeAll(frame);
+        try std.Io.Writer.flush(&self.writer.interface);
+    }
+
     /// Send a `C2S_RESTART`.
     fn restart(self: *TestClient) !void {
         const frame = try wire.encodeFrame(self.gpa, wire.msg.c2s_restart, &.{}, 0);
@@ -1597,6 +1888,29 @@ fn waitForIncoming(server: *Server, want: usize) !void {
         std.Thread.yield() catch {};
     }
     return error.MessageNeverArrived;
+}
+
+/// Spin until every accepted connection has acknowledged `tick`.
+///
+/// An acknowledgement is applied by the reader thread the moment it is decoded
+/// rather than queued for the simulation thread, so there is nothing for
+/// `waitForIncoming` to count: the atomic the reader stored is what a test has
+/// to watch.
+fn waitForAck(server: *Server, tick: u32) !void {
+    var spins: usize = 0;
+    while (spins < 2_000_000) : (spins += 1) {
+        server.lock();
+        var seen: usize = 0;
+        var done = true;
+        for (server.clients.items) |conn| {
+            seen += 1;
+            if (conn.acked_tick.load(.acquire) != tick) done = false;
+        }
+        server.unlock();
+        if (done and seen > 0) return;
+        std.Thread.yield() catch {};
+    }
+    return error.AckNeverArrived;
 }
 
 /// True when `frame` is a full snapshot whose first player has moved in +x.
@@ -1912,4 +2226,428 @@ test "game over goes out, and a restart returns to a running game" {
 
     const view = loop.server.sim.snapshotView();
     try std.testing.expectEqual(@as(u8, @intFromEnum(sim.GameState.running)), view.game_state);
+}
+
+test "a client that acknowledges a baseline gets a delta against it" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    const full = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    _ = try client.readFrame(&got); // loadout
+
+    // The handshake's immediate full snapshot is at tick 0, which is not a
+    // valid delta baseline. Acknowledging it gets a full snapshot back.
+    const full_payload = full[wire.header_size..];
+    const full_tick = wire.readLe(u32, full_payload, 0);
+    try client.ack(full_tick);
+    try waitForAck(&loop.server, full_tick);
+
+    // Step to the first broadcast tick (3): a full snapshot, because tick 0 is
+    // not a baseline the ring holds.
+    loop.server.step();
+    loop.server.step();
+    const full2 = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const full2_payload = full2[wire.header_size..];
+    const full2_tick = wire.readLe(u32, full2_payload, 0);
+    try std.testing.expect(full2_tick != 0);
+    try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, full2_payload, 4)); // baseline_tick = 0
+
+    // Acknowledge the tick-3 full snapshot. The next broadcast is a delta
+    // against it.
+    try client.ack(full2_tick);
+    try waitForAck(&loop.server, full2_tick);
+    loop.server.step();
+    loop.server.step();
+    loop.server.step();
+
+    const d = try client.expectFrame(&got, wire.msg.s2c_snapshot_delta, 4);
+    const d_payload = d[wire.header_size..];
+    try std.testing.expectEqual(full2_tick, wire.readLe(u32, d_payload, 4)); // baseline_tick
+    try std.testing.expectEqual(wire.readLe(u32, d_payload, 0), full2_tick + root.ticks_per_snapshot);
+}
+
+test "a delta baseline the ring no longer holds falls back to a full snapshot" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got); // immediate full snapshot
+    _ = try client.readFrame(&got); // loadout
+
+    // Acknowledge a tick far outside the 32-snapshot window: the server must
+    // answer with a full snapshot, not a delta against a stale baseline.
+    try client.ack(30 * root.ticks_per_snapshot);
+    try waitForAck(&loop.server, 30 * root.ticks_per_snapshot);
+    loop.server.step();
+    loop.server.step();
+
+    const full = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const full_payload = full[wire.header_size..];
+    try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, full_payload, 4)); // baseline_tick = 0
+}
+
+test "the held-state model follows a forward acknowledgement" {
+    var conn: ClientConn = .{};
+
+    // Nothing acknowledged yet: no state the client is known to hold.
+    try std.testing.expectEqual(@as(u32, 0), conn.held_tick.load(.acquire));
+
+    // The first ack seeds it.
+    conn.noteAck(30);
+    try std.testing.expectEqual(@as(u32, 30), conn.held_tick.load(.acquire));
+
+    // Acks that run ahead of the model move it forward.
+    conn.noteAck(33);
+    try std.testing.expectEqual(@as(u32, 33), conn.held_tick.load(.acquire));
+    conn.noteAck(36);
+    try std.testing.expectEqual(@as(u32, 36), conn.held_tick.load(.acquire));
+
+    // The model then carries itself forward onto the snapshots it sends, which
+    // is what `snapshotFrame` does: each send advances the model to its own
+    // tick and records the tick it left behind as the baseline the next ack is
+    // measured against. Two sends take it from 36 to 42.
+    conn.held_baseline.store(36, .release);
+    conn.held_tick.store(39, .release);
+    conn.held_baseline.store(39, .release);
+    conn.held_tick.store(42, .release);
+
+    // The ack that send left in flight names the baseline it was diffed
+    // against — the client holds it until it processes that snapshot — and it
+    // must not drag the model backwards.
+    conn.noteAck(39);
+    try std.testing.expectEqual(@as(u32, 42), conn.held_tick.load(.acquire));
+
+    // Repeating it is not lag, it is the client refusing and re-acknowledging:
+    // that is the drift correction, and it is the test below.
+    conn.noteAck(39);
+    try std.testing.expectEqual(@as(u32, 39), conn.held_tick.load(.acquire));
+}
+
+test "a repeated acknowledgement pulls a model that ran ahead back" {
+    var conn: ClientConn = .{};
+    conn.noteAck(30);
+
+    // The model advances the way `snapshotFrame` does, onto each snapshot it
+    // sends, without any further acknowledgement.
+    conn.held_baseline.store(42, .release);
+    conn.held_tick.store(45, .release);
+
+    // An ack naming the baseline the last snapshot was diffed against is that
+    // snapshot's own send coming back: lag, not correction.
+    conn.noteAck(42);
+    try std.testing.expectEqual(@as(u32, 45), conn.held_tick.load(.acquire));
+
+    // Repeating it means the client refused the delta the model expected it to
+    // apply and is re-acknowledging the state it really holds: without this the
+    // model would refuse forever.
+    conn.noteAck(42);
+    try std.testing.expectEqual(@as(u32, 42), conn.held_tick.load(.acquire));
+}
+
+test "a corrected model rebuilds the held state from the ring" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var server = Server.init(std.Io.failing, gpa, &arena);
+
+    // A player with a neighbourhood: one enemy in interest, one far outside it.
+    const p = server.sim.spawnPlayer(0).?;
+    p.pos = .{ 0.0, 0.0 };
+    _ = server.sim.enemies.spawn(.circle_t1, .{ 5.0, 0.0 }).?;
+    _ = server.sim.enemies.spawn(.circle_t1, .{ 500.0, 0.0 }).?;
+
+    server.sim.tick = 30;
+    server.snapshots.store(server.sim.snapshotView());
+
+    var conn = ClientConn{ .player_id = 0 };
+
+    // Tick 0 is never a model, and neither is a tick the ring never stored.
+    try std.testing.expect(!server.syncHeld(&conn, 0));
+    try std.testing.expect(!server.syncHeld(&conn, 27));
+
+    // A tick the ring holds: the state is rebuilt from it, filtered to the
+    // receiver's own neighbourhood rather than to the whole world.
+    try std.testing.expect(server.syncHeld(&conn, 30));
+    try std.testing.expectEqual(@as(u32, 30), conn.held_tick_content);
+    try std.testing.expectEqual(@as(u16, 1), conn.held.counts[1]);
+    try std.testing.expectEqual(@as(u32, 1), conn.held.enemies[0].id);
+
+    // Already in line: a no-op that stays true.
+    try std.testing.expect(server.syncHeld(&conn, 30));
+
+    // A tick that has fallen out of the 32-snapshot window is no model either.
+    server.sim.tick = 30 + delta.ring_size * root.ticks_per_snapshot;
+    server.snapshots.store(server.sim.snapshotView());
+    try std.testing.expect(!server.syncHeld(&conn, 30));
+}
+
+test "a delta is diffed against the held state, not the last acknowledgement" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got); // immediate full snapshot
+    _ = try client.readFrame(&got); // loadout
+
+    // Reach the first broadcast tick and acknowledge the full snapshot it sends.
+    loop.server.step();
+    loop.server.step();
+    const first = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const first_tick = wire.readLe(u32, first[wire.header_size..], 0);
+    try client.ack(first_tick);
+    try waitForAck(&loop.server, first_tick);
+
+    // From here the client acknowledges nothing more. The server still carries
+    // the held state forward, so every delta names the snapshot the client is
+    // holding rather than the one it last acknowledged: with the ack alone as
+    // the baseline, every delta after the first would name `first_tick` again.
+    var expected_baseline = first_tick;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        loop.server.step();
+        loop.server.step();
+        loop.server.step();
+        const d = try client.expectFrame(&got, wire.msg.s2c_snapshot_delta, 4);
+        const payload = d[wire.header_size..];
+        try std.testing.expectEqual(expected_baseline, wire.readLe(u32, payload, 4));
+        try std.testing.expectEqual(
+            expected_baseline + root.ticks_per_snapshot,
+            wire.readLe(u32, payload, 0),
+        );
+        expected_baseline += root.ticks_per_snapshot;
+    }
+}
+
+test "the first corrective acknowledgement pulls the model back" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got); // immediate full snapshot
+    _ = try client.readFrame(&got); // loadout
+
+    // Reach the first broadcast tick and acknowledge the full snapshot it sends:
+    // the model seeds from that ack.
+    loop.server.step();
+    loop.server.step();
+    const first = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const first_tick = wire.readLe(u32, first[wire.header_size..], 0);
+    try client.ack(first_tick);
+    try waitForAck(&loop.server, first_tick);
+
+    // The client then acknowledges nothing for three broadcasts while the
+    // server carries the model forward onto each snapshot it sends, so the
+    // model runs ahead of the tick the client really holds.
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        loop.server.step();
+        loop.server.step();
+        loop.server.step();
+    }
+    const held = first_tick + 3 * root.ticks_per_snapshot;
+
+    // The client's first corrective ack names a tick it does hold, behind the
+    // model and — this is the case the old predicate got wrong — different from
+    // the ack before it, so the repeat test could not see it. It is also older
+    // than the baseline of the most recent snapshot, so it is not an ack still
+    // in flight either: it is a state the model cannot account for.
+    const corrective = first_tick + root.ticks_per_snapshot;
+    try client.ack(corrective);
+    try waitForAck(&loop.server, corrective);
+
+    loop.server.lock();
+    const model = loop.server.clients.items[0].held_tick.load(.acquire);
+    loop.server.unlock();
+    try std.testing.expectEqual(corrective, model);
+
+    // The three deltas the model carried itself through are still queued; read
+    // them, so what follows is unambiguously the response to the correction.
+    i = 0;
+    while (i < 3) : (i += 1) {
+        const d = try client.expectFrame(&got, wire.msg.s2c_snapshot_delta, 4);
+        const payload = d[wire.header_size..];
+        try std.testing.expectEqual(
+            first_tick + @as(u32, @intCast(i)) * root.ticks_per_snapshot,
+            wire.readLe(u32, payload, 4),
+        );
+    }
+
+    // And the next response is usable: a delta diffed against the tick the
+    // client just named, which is the tick it holds, so it applies. Left
+    // uncorrected, the model would have diffed against `held` instead.
+    loop.server.step();
+    loop.server.step();
+    loop.server.step();
+    const d = try client.expectFrame(&got, wire.msg.s2c_snapshot_delta, 4);
+    const payload = d[wire.header_size..];
+    try std.testing.expectEqual(corrective, wire.readLe(u32, payload, 4));
+    try std.testing.expectEqual(held + root.ticks_per_snapshot, wire.readLe(u32, payload, 0));
+}
+
+test "a corrective acknowledgement the ring has lost still recovers" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var server = Server.init(std.Io.failing, gpa, &arena);
+
+    const p = server.sim.spawnPlayer(0).?;
+    p.pos = .{ 0.0, 0.0 };
+    _ = server.sim.enemies.spawn(.circle_t1, .{ 5.0, 0.0 }).?;
+
+    var conn = ClientConn{ .player_id = 0 };
+
+    // The client acknowledges tick 3 and the model seeds from it.
+    server.sim.tick = 3;
+    server.snapshots.store(server.sim.snapshotView());
+    conn.noteAck(3);
+    try std.testing.expectEqual(@as(u32, 3), conn.held_tick.load(.acquire));
+
+    // The server then carries the model forward onto each snapshot it sends,
+    // the way a broadcast does, for long enough that the tick the client really
+    // holds has fallen out of the 32-snapshot ring.
+    var tick: u32 = 3;
+    var i: usize = 0;
+    while (i < delta.ring_size + 2) : (i += 1) {
+        tick += root.ticks_per_snapshot;
+        server.sim.tick = tick;
+        server.snapshots.store(server.sim.snapshotView());
+        const frame = try server.snapshotFrame(&conn);
+        frame.release(gpa);
+    }
+    const ahead = conn.held_tick.load(.acquire);
+    try std.testing.expect(ahead > 3 + root.ticks_per_snapshot);
+
+    // The first corrective ack: different from the previous ack, behind the
+    // model, and naming a tick the ring no longer holds. The model still
+    // corrects — the ack is the truth about what the client holds, and holding
+    // the model where it was would leave it diffing against a tick the client
+    // has refused for as long as it takes the client to insist again.
+    conn.noteAck(3 + root.ticks_per_snapshot);
+    try std.testing.expectEqual(
+        @as(u32, 3 + root.ticks_per_snapshot),
+        conn.held_tick.load(.acquire),
+    );
+
+    // What follows is a full snapshot, baseline 0: there is no state to diff
+    // against, so the client is handed one outright rather than a delta against
+    // the model the correction just abandoned.
+    tick += root.ticks_per_snapshot;
+    server.sim.tick = tick;
+    server.snapshots.store(server.sim.snapshotView());
+    const full = try server.snapshotFrame(&conn);
+    defer full.release(gpa);
+    const header = wire.decodeFrameHeader(full.bytes).?;
+    try std.testing.expectEqual(wire.msg.s2c_snapshot_full, header.msg_type);
+    try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, full.bytes[wire.header_size..], 4));
+
+    // And that is a recovery rather than a wedge: acknowledging the full
+    // snapshot re-seeds the model, and the delta after it names the tick.
+    try std.testing.expectEqual(@as(u32, 0), conn.held_tick.load(.acquire));
+    conn.noteAck(tick);
+    try std.testing.expectEqual(tick, conn.held_tick.load(.acquire));
+
+    server.sim.tick = tick + root.ticks_per_snapshot;
+    server.snapshots.store(server.sim.snapshotView());
+    const d = try server.snapshotFrame(&conn);
+    defer d.release(gpa);
+    try std.testing.expectEqual(
+        wire.msg.s2c_snapshot_delta,
+        wire.decodeFrameHeader(d.bytes).?.msg_type,
+    );
+    try std.testing.expectEqual(tick, wire.readLe(u32, d.bytes[wire.header_size..], 4));
+}
+
+test "a restart takes the held state back to nothing" {
+    const gpa = std.testing.allocator;
+    const loop = try Loopback.start(gpa);
+    defer loop.stop(gpa);
+
+    var client: TestClient = .{};
+    try client.init(loop, gpa);
+    defer client.close();
+
+    try client.hello("tester", 0x1234);
+    try waitForClients(&loop.server, 1);
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+
+    var got: [4096]u8 = undefined;
+    _ = try client.expectFrame(&got, wire.msg.s2c_welcome, 4);
+    _ = try client.readFrame(&got); // immediate full snapshot
+    _ = try client.readFrame(&got); // loadout
+
+    loop.server.step();
+    loop.server.step();
+    const first = try client.expectFrame(&got, wire.msg.s2c_snapshot_full, 4);
+    const first_tick = wire.readLe(u32, first[wire.header_size..], 0);
+    try client.ack(first_tick);
+    try waitForAck(&loop.server, first_tick);
+
+    // The run restarts: the server's tick goes back to zero, so a held tick from
+    // the dead run names nothing the client has, and the client must be given a
+    // full snapshot rather than a delta against it. The new run reaches the same
+    // tick the client had acknowledged, which is exactly the case a model that
+    // was only clamped by the tick going backwards would get wrong.
+    try client.restart();
+    try waitForIncoming(&loop.server, 1);
+    loop.server.step();
+    loop.server.step();
+    loop.server.step();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const frame = try client.readFrame(&got);
+        const header = wire.decodeFrameHeader(frame).?;
+        if (header.msg_type == wire.msg.s2c_snapshot_delta) return error.DeltaAfterRestart;
+        if (header.msg_type == wire.msg.s2c_snapshot_full) {
+            try std.testing.expectEqual(@as(u32, 0), wire.readLe(u32, frame[wire.header_size..], 4));
+            return;
+        }
+    }
+    return error.FrameNeverArrived;
 }
