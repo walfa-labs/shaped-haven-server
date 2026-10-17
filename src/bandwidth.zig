@@ -13,6 +13,12 @@
 //! times `Simulation.advance`; this times nothing, it just counts the bytes
 //! the encoder emits, which is the quantity the DoD is about.
 //!
+//! The measurement also keeps the same model of what the client holds that the
+//! server keeps, and applies to it only the records that went out. Without
+//! that, the deferred updates the budget leaves behind would be treated as
+//! delivered and the deferred count and refresh latency below would describe a
+//! path the server does not take.
+//!
 //! Mean *and* peak. The DoD is a bound on the run, not on its average, so the
 //! test asserts both. Asserting only the mean is what let a peak 40% over
 //! budget stand: the mean was inside it while a single frame was not.

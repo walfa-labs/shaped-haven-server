@@ -35,7 +35,7 @@ pub const ring_size = 32;
 /// Largest single entity kind, for the per-kind match scratch.
 const max_kind = root.max_enemies;
 
-/// Largest total in-interest set across every kind, for the output scratch.
+/// Largest total candidate set across every kind, for the output scratch.
 const max_total = root.max_enemies + root.max_projectiles + root.max_gems + root.max_players;
 
 /// Bytes large enough to hold any net record, for the comparison scratch.
