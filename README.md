@@ -339,22 +339,23 @@ and a single final disconnect).
 
 A normal run (no stress flags) against the real client at its `phase-4-delta`
 branch, driven by `--input-script` (a wide circle, so the interest neighbourhood
-churns as the player walks) and `--choice-script`: two runs of 6,000 frames, in
-42.17 s and 41.90 s, at **142.3 and 143.2 fps**, 841 and 834 snapshots received,
-**833 and 828 deltas applied with one refused each** — the one refusal is inside
-the first 60 frames, while the model seeds from the first acknowledgements, and
-the counter never moves again. The worst prediction error is 0.039 world units,
-an order of magnitude inside the 2.0-unit snap threshold. `interest_radius=40`
-decoded from the 21-byte welcome, three level-ups were offered and answered, and
-the run reported `stale=0 staleoffers=0 malformed=0 qdropped=0 sendfail=0
-ackretry=0` throughout, with the only paused steps being the level-up drafts
-themselves.
+churns as the player walks) and `--choice-script`: three runs of 6,000 frames,
+in 42.17 s, 41.90 s and 41.92 s, at **142.3, 143.2 and 143.1 fps**, 841, 834 and
+839 snapshots received, and **833, 828 and 834 deltas applied** with one refused
+in the first two runs and none in the third. Both refusals are inside the first
+60 frames, while the model seeds from the first acknowledgements, and the
+counter never moves again. The worst prediction error is 0.089, 0.085 and 0.092
+world units — the pre-change build measured 0.098 on the same script, and the
+2.0-unit snap threshold is an order of magnitude further out.
+`interest_radius=40` decoded from the 21-byte welcome, three level-ups were
+offered and answered, and the runs reported `stale=0 staleoffers=0 malformed=0
+qdropped=0 sendfail=0 ackretry=0` throughout, with the only paused steps being
+the level-up drafts themselves.
 
-That single seeding refusal is the client's connect timing rather than the
-correction rule: the same 300-frame run against the pre-change predicate refused
-0, 4 and 3 deltas across three runs, and against this one 0, 2 and 1. It is
-reported rather than claimed away, and the steady state after seeding is 0 for
-both.
+The seeding refusal is the client's connect timing rather than the correction
+rule: the same 300-frame run against the pre-change predicate refused 0, 4 and 3
+deltas across three runs, and against this one 0, 2 and 1. It is reported rather
+than claimed away, and the steady state after seeding is 0 for both.
 
 The correction rule itself is verified on the wire rather than only in a test. A
 probe that falls behind the way a real client does — it applies a delta, does
