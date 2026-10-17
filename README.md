@@ -96,6 +96,7 @@ projectiles that damage what they overlap as they move.
 | §1 says spawn density is linear 3.0 → 14.0/s; §4 gives `3.0 + 2.2t + 0.35t²`, which is 22.75/s at 5:00. Which holds? | The formula. §4 is the section that defines the spawner and §1 is the narrative summary; §1's endpoint is exactly the formula's linear term, so §1 is describing that term rather than a different curve. The reading is pinned by a test. |
 | Where does the endless move-speed escalation apply? | At spawn, exactly as the health curve does: `enemy.speedMultiplier(t)` is baked into a new enemy's speed. Below 20:00 it is 1.0, so a standard run is untouched, and past it the horde that keeps respawning gets faster. |
 | What is a delta diffed against? | The server's model of the *state* the client holds — its own interest-filtered neighbourhood — not the ring snapshot at a tick. The tick still names the baseline on the wire, but the model is what makes a deferred update stay pending and a changed interest centre report an entry or an exit. |
+| When does an acknowledgement correct that model? | On the first tick the model cannot account for. The model accounts for exactly two ticks once it has sent a snapshot — the tick that snapshot carried, and the tick it was diffed against — so an ack naming either is lag rather than correction, and anything else means the model has run past what a single unprocessed snapshot explains. Waiting for the client to repeat itself, which is what the predicate used to do, ignored the first corrective ack and cost a round trip. |
 | What does a hostile projectile name in `weapon_id`? | 0. `owner_id = 0xff` is what marks it hostile, so `weapon_id` carries no meaning for one; PROTOCOL.md leaves it open and the field is not read for a hostile record. |
 
 ## Requirements
@@ -211,6 +212,18 @@ with it — the drift correction PROTOCOL.md's baseline rules describe, and the
 reason the ring is kept. The ordinary path never reads it: it diffs against the
 model.
 
+An acknowledgement corrects the model on the *first* tick the model cannot
+account for. What the model can account for, once it has sent a snapshot, is
+exactly two ticks: the tick that snapshot carried, which the client holds if it
+applied it, and the tick it was diffed against, which the client still holds if
+it has not processed it yet. The second is recorded per connection as each frame
+is built. An ack naming either is a client keeping up, or lagging by the one
+snapshot the model has just carried it past, and it changes nothing; any other
+tick is a client holding a state the model cannot explain, so the model is
+wrong and the ack is the truth. A repeated ack is still a correction too, since
+a client that applied the snapshot it is answering holds a newer tick and cannot
+name the same one twice.
+
 ### The bandwidth measurement
 
 DESIGN.md §6 sets the phase-4 definition of done as *bandwidth stays under
@@ -238,14 +251,17 @@ the world really held the load the DoD names, that interest management was
 excluding most of the horde, and that the budget was actually binding — so the
 number cannot come from a run that quietly served less than it claims.
 
-Verified: `zig build test` — 200 tests pass. `zig build test
--Doptimize=ReleaseFast` — 200 pass. Four of them are the phase-4 review
+Verified: `zig build test` — 202 tests pass. `zig build test
+-Doptimize=ReleaseFast` — 202 pass. Six of them are the phase-4 review
 regressions, and each was checked against the behaviour it replaces: the
 held-state test fails against a single-centre diff (which reports neither the
 entry nor the exit), the deferred-update test fails against a model that applies
 every candidate rather than every sent record (the client's position jumps to
 the value it was never sent), the spawn-rate test fails against §1's linear
-reading, and the endless-speed test fails with the multiplier unwired. The
+reading, the endless-speed test fails with the multiplier unwired, and the two
+correction tests — the first corrective ack, and the same ack when its tick has
+fallen out of the ring — fail against the predicate that waited for the client
+to repeat itself (`expected 6, found 12` and `expected 6, found 105`). The
 phase-3 regressions are still in place too: the Overclock wrap test fails
 against the old `u8` code, the boundary tests do not compile against it, and the
 attack-speed test fails where the old formula first went negative.
@@ -323,22 +339,34 @@ and a single final disconnect).
 
 A normal run (no stress flags) against the real client at its `phase-4-delta`
 branch, driven by `--input-script` (a wide circle, so the interest neighbourhood
-churns as the player walks) and `--choice-script`: 6,000 frames in 41.87 s, a
-steady **143.3 fps**, 835 snapshots received, **831 deltas applied and none
-refused**, and a worst prediction error of 0.039 world units — an order of
-magnitude inside the 2.0-unit snap threshold. `interest_radius=40` decoded from
-the 21-byte welcome, three level-ups were offered and answered, and the run
-reported `stale=0 staleoffers=0 malformed=0 qdropped=0 sendfail=0 ackretry=0`
-throughout, with the only paused steps being the level-up drafts themselves.
+churns as the player walks) and `--choice-script`: two runs of 6,000 frames, in
+42.17 s and 41.90 s, at **142.3 and 143.2 fps**, 841 and 834 snapshots received,
+**833 and 828 deltas applied with one refused each** — the one refusal is inside
+the first 60 frames, while the model seeds from the first acknowledgements, and
+the counter never moves again. The worst prediction error is 0.039 world units,
+an order of magnitude inside the 2.0-unit snap threshold. `interest_radius=40`
+decoded from the 21-byte welcome, three level-ups were offered and answered, and
+the run reported `stale=0 staleoffers=0 malformed=0 qdropped=0 sendfail=0
+ackretry=0` throughout, with the only paused steps being the level-up drafts
+themselves.
 
-The refusal count is reported rather than claimed as an improvement: the commit
-before this work (`f5edbcb`) had already replaced the acknowledgement-only
-baseline with a carried-forward one, and the same client refused 2 of 737 deltas
-against it. What this phase's fixes change is not visible as refusals — a
-deferred update that is never resent and an entity the client never learns about
-are both *accepted* deltas that leave the client subtly wrong. Those are pinned
-by the unit tests and by the benchmark's refresh-latency and deferred counts
-instead, which is why they are asserted there.
+That single seeding refusal is the client's connect timing rather than the
+correction rule: the same 300-frame run against the pre-change predicate refused
+0, 4 and 3 deltas across three runs, and against this one 0, 2 and 1. It is
+reported rather than claimed away, and the steady state after seeding is 0 for
+both.
+
+The correction rule itself is verified on the wire rather than only in a test. A
+probe that falls behind the way a real client does — it applies a delta, does
+not acknowledge it, then stops reading for three broadcasts — sends the first
+corrective ack the server can see: the tick it holds, newer than its previous
+ack and older than the model. Against this build the next delta is diffed
+against that tick (`baseline=156`, the tick the probe named) and the probe
+applies it; against the pre-change build the same probe gets `baseline=165`, the
+model's own tick, which the probe holds no state for and refuses. The two
+correction tests in `src/server.zig` pin the same rule, including the case where
+the corrected tick has fallen out of the 32-snapshot ring and the honest answer
+is a full snapshot rather than a delta.
 
 Not exercised live: a game over and a restart, which a 42-second run does not
 reach. The restart boundary is covered by `server.test.a restart takes the held

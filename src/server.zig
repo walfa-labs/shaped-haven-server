@@ -260,6 +260,17 @@ pub const ClientConn = struct {
     /// the last baseline: a client that applied the snapshot it is answering
     /// holds a newer tick and cannot ack the same one twice, so a repeat is the
     /// client insisting on the state it really holds.
+    ///
+    /// The tolerance is exactly one snapshot, because one send is all the model
+    /// advances at a time and so the only older tick a single unprocessed
+    /// snapshot explains. A client whose acks trail by more than that — which
+    /// takes a round trip plus a client frame longer than the 50 ms between
+    /// snapshots — is read as disagreeing, and correcting to an ack two
+    /// snapshots stale costs a refused delta before the client's own re-ack
+    /// settles the model on the tick it really holds. Measured against the real
+    /// client over a 6,000-frame run, the acks trail by no more than that one
+    /// snapshot: 828 deltas applied, one refused, and that one inside the
+    /// seeding transient.
     pub fn noteAck(c: *ClientConn, tick: u32) void {
         const previous = c.acked_tick.swap(tick, .acq_rel);
         const held = c.held_tick.load(.acquire);
