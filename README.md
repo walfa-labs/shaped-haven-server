@@ -27,11 +27,12 @@ Source layout:
 | File | Contents |
 | --- | --- |
 | `root.zig` | Tick rate, entity caps and the other DESIGN.md constants. |
-| `wire.zig` | Protocol v1: framing, payload layouts, quantization, and the byte values for the enums PROTOCOL.md leaves open. |
-| `sim.zig` | The tick loop, the player pool, the integrator and the level-up pause. |
+| `wire.zig` | Protocol v2: framing, payload layouts, quantization, and the byte values for the enums PROTOCOL.md leaves open. |
+| `races.zig` | The ten playable races: their stat rows, dash behaviour, and the names and lore the character select shows. |
+| `sim.zig` | The tick loop, the player pool, the integrator, the dash state and the level-up pause. |
 | `enemy.zig` | Enemy pool, all six archetypes plus the boss, the difficulty and spawn curves, the four elite modifiers and the archetype AI. |
 | `weapon.zig` | The weapon table: all four weapons across eight levels, plus the eight evolutions. |
-| `upgrade.zig` | The item id space, the ten passives, the eight evolutions, the five synergies, the XP curve, stat resolution and the level-up choice generator. |
+| `upgrade.zig` | The item id space, the ten passives, the eight evolutions, the five synergies, the XP curve, stat resolution, the level-up choice generator and the per-option stat deltas. |
 | `combat.zig` | Projectile pool, arc/circle/ray hit detection, damage, knockback and the projectile-level evolution effects. |
 | `evolve.zig` | The evolved weapons' lingering effects: ground rifts and Cryo Flechette shatters. |
 | `loadout.zig` | The `--debug-loadout` **test affordance**: parse a starting loadout and apply it to a run. Not part of the game. |
@@ -70,14 +71,16 @@ rebuilt again before the Cryo Flechette shatter query reads it.
 
 ### Protocol values this repository had to choose
 
-`PROTOCOL.md` fixes the byte layout of `EnemyNet` and `ProjNet` but not the
-meaning of their enum bytes. This repository chooses:
+`PROTOCOL.md` fixes the byte layout of the entity records but not the meaning of
+their enum bytes. This repository chooses:
 
 | Field | Values |
 | --- | --- |
 | `EnemyNet.archetype` | 0 Circle T1, 1 Circle T2, 2 Circle T3, 3 Triangle T1, 4 Triangle T2, 5 Triangle T3, 6 Boss — the order DESIGN.md §2 lists them in. Phase 2 emits only 0 and 3. |
+| `EnemyNet.telegraph_shape` | 0 None, 1 CircleAoE, 2 ConeSlash, 3 LineCharge. A darter's lunge and the boss's dash are both a `LineCharge`; the other two are reserved for a future telegraphed attack and are not emitted yet. |
 | `ProjNet.shape` | 0 ARC, 1 CIRCLE, 2 RAY — the order DESIGN.md §2 lists them in. |
 | `ProjNet.weapon_id` | 0 Sword, 1 Axe, 2 Bow, 3 Gun — the order DESIGN.md §3 lists them in. |
+| `UpgradeOptionNet.stat_type` | 0 damage, 1 armor, 2 max HP, 3 move speed, 4 cooldown, 5 area, 6 projectiles, 7 crit chance, 8 max mana, 9 max shield. |
 
 `shape = ARC` is the melee sweep: the sword and axe apply their damage
 instantaneously through a sector test and then emit a short-lived, non-colliding
@@ -99,6 +102,54 @@ projectiles that damage what they overlap as they move.
 | What is a delta diffed against? | The server's model of the *state* the client holds — its own interest-filtered neighbourhood — not the ring snapshot at a tick. The tick still names the baseline on the wire, but the model is what makes a deferred update stay pending and a changed interest centre report an entry or an exit. |
 | When does an acknowledgement correct that model? | On the first tick the model cannot account for. The model accounts for exactly two ticks once it has sent a snapshot — the tick that snapshot carried, and the tick it was diffed against — so an ack naming either is lag rather than correction, and anything else means the model has run past what a single unprocessed snapshot explains. Waiting for the client to repeat itself, which is what the predicate used to do, ignored the first corrective ack and cost a round trip. |
 | What does a hostile projectile name in `weapon_id`? | 0. `owner_id = 0xff` is what marks it hostile, so `weapon_id` carries no meaning for one; PROTOCOL.md leaves it open and the field is not read for a hostile record. |
+
+## Protocol v2
+
+Protocol v2 is the current wire format. The client repo's `PROTOCOL.md` is the
+authoritative byte layout and both repos must agree on it. On top of the
+phase-4 messages it adds the race and weapon ids to the handshake, the player's
+dash, mana and shield state to `PlayerNet`, the enemy telegraph to `EnemyNet`,
+and the per-option stat deltas to `S2C_LEVELUP_OFFER`. The frame header, the
+snapshot header, `S2C_WELCOME`, the projectile and gem records, and every other
+message are unchanged.
+
+### Races
+
+`C2S_HELLO` carries a `race_id` (0..9) and a `starting_weapon_id` (0 sword,
+1 axe, 2 bow, 3 gun). The race picks one row of `RACE_SPECS` in `races.zig` —
+max HP, max shield, max mana, the move-speed and damage multipliers, the dash
+cooldown, mana cost, distance and i-frame ticks, flat armor, and the XP and
+pickup-radius multipliers. A race id the server does not know is rejected, not
+defaulted. The race's multipliers scale on top of the loadout's own, so a race
+and a passive that both raise damage multiply together. The run starts with the
+one picked weapon; the other three stay empty until the draft offers them.
+
+### Dash
+
+A dash spends `dash_mana_cost` mana, translates the player `dash_distance` world
+units along the direction of travel (or the held aim when standing still), grants
+`dash_iframe_ticks` of real invulnerability, and then starts a
+`dash_cooldown_ticks` cooldown. Mana refills at a flat 4.0 per second, the same
+for every race. The player's current mana, shield and dash cooldown are on the
+wire — `PlayerNet.mana_pct`, `shield_pct`, `dash_cd_remaining` and
+`dash_cd_total` — so the client can draw them without the cost being sent back.
+
+### Telegraphs
+
+An enemy that is about to attack carries a windup on the wire:
+`telegraph_progress` (0 = none, 1..255 = the fraction of the windup elapsed),
+`telegraph_shape`, `telegraph_angle` (milliradians) and `telegraph_radius`. A
+darter's pause before its lunge and the boss's stand-still before its dash are
+both a `LineCharge`; the client draws the shape, oriented by the angle and
+sized by the radius, so the attack is visible before it lands.
+
+### Stat deltas
+
+Each option in `S2C_LEVELUP_OFFER` carries a `stat_type` and a pair of
+fixed-point values (`current_stat_fp`, `upgraded_stat_fp`) scaled by 100, so the
+client can show what the purchase changes — "12 ATK → 15 ATK (+25%)" — without
+recomputing the whole stat table. A negative delta is a reduction, as with
+cooldown per level.
 
 ## Requirements
 
@@ -169,6 +220,14 @@ needed to name one. A weapon slot fuses into the first evolution it qualifies
 for in DESIGN.md §3 order. An empty spec starts a run with the normal loadout.
 
 ## Status
+
+Phase 7 — protocol v2 and the race system. The server now speaks protocol v2:
+`C2S_HELLO` carries the race and starting weapon, `PlayerNet` the mana, shield
+and dash state, `EnemyNet` the telegraph fields, and `S2C_LEVELUP_OFFER` the
+per-option stat deltas (see [Protocol v2](#protocol-v2)). It simulates the ten
+races with their distinct stat rows and lore, the dash with its mana cost,
+cooldown and i-frames, and the enemy telegraph state machine. `zig build test`
+reports **230 tests, 0 failures**.
 
 Phase 4 — the delta protocol and the endless escalation. The server simulates
 the phase-2 combat core, the whole phase-3 upgrade system of DESIGN.md §3, and:
@@ -286,9 +345,11 @@ the world really held the load the DoD names, that interest management was
 excluding most of the horde, and that the budget was actually binding — so the
 number cannot come from a run that quietly served less than it claims.
 
-Verified: `zig build test` — 202 tests pass. `zig build test
--Doptimize=ReleaseFast` — 202 pass. Six of them are the phase-4 review
-regressions, and each was checked against the behaviour it replaces: the
+Verified: `zig build test` — 230 tests pass. `zig build test
+-Doptimize=ReleaseFast` — 230 pass. The phase-7 additions are the ten race rows
+and their lore, the dash cost/cooldown/i-frames, the telegraph fields and the
+level-up stat deltas; six of the phase-4 review regressions, and each was
+checked against the behaviour it replaces: the
 held-state test fails against a single-centre diff (which reports neither the
 entry nor the exit), the deferred-update test fails against a model that applies
 every candidate rather than every sent record (the client's position jumps to
