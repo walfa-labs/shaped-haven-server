@@ -271,7 +271,7 @@ pub const EnemyNet = packed struct {
     hp_pct: u8,
     telegraph_progress: u8,
     telegraph_shape: u8,
-    telegraph_angle: u16,
+    telegraph_angle: i16,
     telegraph_radius: u16,
 };
 

@@ -520,23 +520,26 @@ pub const Simulation = struct {
             const spec = races.RACE_SPECS[p.race_id];
             p.integrate(dt, stats.move_speed_mult * spec.move_speed_mult);
 
+            // Cooldowns tick first, so a dash activated this tick is not
+            // decremented on its activation tick.
+            if (p.dash_cd_ticks > 0) p.dash_cd_ticks -= 1;
+            if (p.dash_iframe_ticks > 0) {
+                p.dash_iframe_ticks -= 1;
+                if (p.dash_iframe_ticks == 0) p.is_dashing = false;
+            }
+            if (p.invuln_ticks > 0) p.invuln_ticks -= 1;
+
             // The race's dash: on the buttons' dash bit, when the cooldown has
             // elapsed and the mana is there to pay for it.
             if (p.input.buttons & wire.button.dash != 0) PlayerState.tryDash(p);
 
             // Mana refills flat, so the dash stays available over a long run.
             p.mana = @min(p.mana + races.mana_regen_per_sec * dt, p.max_mana);
-            if (p.dash_cd_ticks > 0) p.dash_cd_ticks -= 1;
-            if (p.dash_iframe_ticks > 0) {
-                p.dash_iframe_ticks -= 1;
-                if (p.dash_iframe_ticks == 0) p.is_dashing = false;
-            }
 
             // Nano Repair (DESIGN.md §3): HP restored per second.
             if (stats.regen_per_sec > 0.0 and p.hp < p.max_hp) {
                 p.hp = @min(p.hp + stats.regen_per_sec * dt, p.max_hp);
             }
-            if (p.invuln_ticks > 0) p.invuln_ticks -= 1;
             if (p.carapace_cd > 0) p.carapace_cd -= 1;
             // Shield is temporary and decays back to nothing over a few
             // seconds, so it cannot be banked indefinitely.
@@ -1878,7 +1881,7 @@ pub const Simulation = struct {
             .telegraph_shape = pool.telegraph_shape[i],
             // The pool keeps the angle as a signed i16; the wire field is a
             // u16 carrying the same two's-complement bit pattern.
-            .telegraph_angle = @as(u16, @bitCast(pool.telegraph_angle[i])),
+            .telegraph_angle = pool.telegraph_angle[i],
             .telegraph_radius = pool.telegraph_radius[i],
         };
     }
@@ -2166,8 +2169,8 @@ test "the dash spends mana, starts the cooldown and translates the player" {
     try std.testing.expectApproxEqAbs(@as(f32, 180.2), p.pos[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), p.pos[1], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f32, 75.07), p.mana, 0.01);
-    try std.testing.expectEqual(@as(u16, 209), p.dash_cd_ticks);
-    try std.testing.expectEqual(@as(u16, 11), p.dash_iframe_ticks);
+    try std.testing.expectEqual(@as(u16, 210), p.dash_cd_ticks);
+    try std.testing.expectEqual(@as(u16, 12), p.dash_iframe_ticks);
     try std.testing.expect(p.is_dashing);
 
     // The i-frames are real invulnerability: a swarmer on top of the player
@@ -2186,7 +2189,7 @@ test "the dash spends mana, starts the cooldown and translates the player" {
     sim.advance();
     try std.testing.expectEqual(mana_before, p.mana);
     try std.testing.expectApproxEqAbs(pos_before + 0.2, p.pos[0], 0.001);
-    try std.testing.expectEqual(@as(u16, 207), p.dash_cd_ticks);
+    try std.testing.expectEqual(@as(u16, 208), p.dash_cd_ticks);
 }
 
 test "a dash without the mana does not fire" {
@@ -2213,9 +2216,10 @@ test "the dash cooldown is reported in milliseconds on the wire" {
 
     const net = Simulation.playerNet(p);
     try std.testing.expectEqual(@as(u8, 0), net.race_id);
-    // Race 0's cooldown is 210 ticks; 210 x 1000 / 60 = 3500 ms, and 209
-    // ticks remain after the tick that fired it.
-    try std.testing.expectEqual(@as(u16, 209 * 1000 / 60), net.dash_cd_remaining);
+    // Race 0's cooldown is 210 ticks; 210 x 1000 / 60 = 3500 ms, and 210
+    // ticks remain after the tick that fired it (the activation tick is not
+    // decremented).
+    try std.testing.expectEqual(@as(u16, 210 * 1000 / 60), net.dash_cd_remaining);
     try std.testing.expectEqual(@as(u16, 210 * 1000 / 60), net.dash_cd_total);
     try std.testing.expectEqual(@as(u8, 1), net.is_dashing);
     try std.testing.expectEqual(@as(u16, 110), net.max_hp);
@@ -2324,7 +2328,7 @@ test "a boss's telegraph faces the locked dash direction" {
     try std.testing.expectEqual(@as(u16, 22), net.telegraph_radius); // 22 u/s x 1.0 s
     // The boss faces the player at (-30, 0) from (30, 0): an angle of pi, so
     // the milliradians are clamped to the i16 range's positive end.
-    try std.testing.expectEqual(@as(u16, @bitCast(@as(i16, 3142))), net.telegraph_angle);
+    try std.testing.expectEqual(@as(i16, 3142), net.telegraph_angle);
 }
 
 test "simulation is deterministic for a fixed input script" {
