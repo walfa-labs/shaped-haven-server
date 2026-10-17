@@ -161,14 +161,21 @@ pub fn run(gpa: std.mem.Allocator) !Report {
     // The connection's update rotation, advanced exactly as the server advances
     // it, so this measures the real encoder path.
     var rotation: u32 = 0;
+    // The model of what the client holds, kept exactly as the server keeps it:
+    // a full snapshot seeds it, and each delta changes it by the records that
+    // actually went out. Nothing the budget deferred is applied, so those
+    // records stay candidates for the next snapshot.
+    var held = delta.FilteredWorld{};
 
     // Refresh latency: an entity that needed an update and did not get one this
     // snapshot carries its wait into the next. `waiting` is rebuilt from the
     // candidate set every snapshot, so an entity that stops needing updates
-    // drops out instead of banking a stale count.
-    var waiting = std.AutoHashMap(u32, u32).init(gpa);
+    // drops out instead of banking a stale count. The key carries the entity
+    // kind as well as the id: the four id spaces are separate, so an enemy and a
+    // gem can share a number.
+    var waiting = std.AutoHashMap(u64, u32).init(gpa);
     defer waiting.deinit();
-    var next_waiting = std.AutoHashMap(u32, u32).init(gpa);
+    var next_waiting = std.AutoHashMap(u64, u32).init(gpa);
     defer next_waiting.deinit();
     var sum_refresh: u64 = 0;
     var count_refresh: u64 = 0;
@@ -194,7 +201,6 @@ pub fn run(gpa: std.mem.Allocator) !Report {
 
         const view = s.snapshotView();
         ring.store(view);
-        const current = &ring.slots[(view.server_tick / root.ticks_per_snapshot) % delta.ring_size];
 
         var n_spawned: usize = 0;
         var n_updated: usize = 0;
@@ -203,15 +209,17 @@ pub fn run(gpa: std.mem.Allocator) !Report {
         if (baseline_tick == 0) {
             // No baseline yet: a full snapshot of the neighbourhood. Not bounded
             // by the per-snapshot budget — it is the state the client starts
-            // from — so it is measured separately from the sustained stream.
+            // from — so it is measured separately from the sustained stream. It
+            // is also the state the client ends up holding.
             const full = s.snapshotViewFor(player.pos, root.interest_radius);
             frame = try wire.encodeSnapshotFull(gpa, full);
             full_frame_bytes = frame.len;
+            held.setFromView(full);
         } else {
-            // The steady state: a delta against the snapshot the client is
-            // holding, which is the one before this.
-            const base = ring.baseline(baseline_tick).?;
-            const d = delta.computeDelta(current, base, player.pos, root.interest_radius, .{
+            // The steady state: a delta against the model of what the client
+            // holds, which is what the server diffs against too.
+            const current_view = s.snapshotViewFor(player.pos, root.interest_radius);
+            const d = delta.computeDelta(current_view, &held, .{
                 .rotation = rotation,
             }, &scratch);
             n_spawned = d.spawned.len;
@@ -227,31 +235,34 @@ pub fn run(gpa: std.mem.Allocator) !Report {
                 }
             }
 
-            // Refresh latency, over the records the diff found changed.
+            // Refresh latency, over the records the diff found changed. The
+            // candidate set is read before the budget trims `updated`, and it is
+            // a copy rather than a view of `updated` — otherwise every candidate
+            // would already look sent and the latency would read as zero.
             next_waiting.clearRetainingCapacity();
             for (d.candidates) |c| {
-                const id = c.recordId();
+                const key = candidateKey(c);
                 var sent = false;
                 for (d.updated) |u| {
-                    if (u.recordId() == id) {
+                    if (candidateKey(u) == key) {
                         sent = true;
                         break;
                     }
                 }
-                const waited = waiting.get(id) orelse 0;
+                const waited = waiting.get(key) orelse 0;
                 if (sent) {
                     sum_refresh += waited;
                     count_refresh += 1;
                     worst_refresh = @max(worst_refresh, waited);
                 } else {
-                    try next_waiting.put(id, waited + 1);
+                    try next_waiting.put(key, waited + 1);
                 }
             }
-            std.mem.swap(std.AutoHashMap(u32, u32), &waiting, &next_waiting);
+            std.mem.swap(std.AutoHashMap(u64, u32), &waiting, &next_waiting);
 
             frame = try wire.encodeSnapshotDelta(gpa, .{
                 .server_tick = view.server_tick,
-                .baseline_tick = base.tick,
+                .baseline_tick = baseline_tick,
                 .run_time_ms = view.run_time_ms,
                 .acked_seq = view.acked_seq,
                 .game_state = view.game_state,
@@ -259,6 +270,8 @@ pub fn run(gpa: std.mem.Allocator) !Report {
                 .updated = d.updated,
                 .destroyed = d.destroyed,
             });
+            // Only what went out moves the model, exactly as on the server.
+            held.apply(d);
             rotation +%= @intCast(d.updated.len);
             max_delta_frame_bytes = @max(max_delta_frame_bytes, frame.len);
         }
@@ -307,6 +320,11 @@ pub fn run(gpa: std.mem.Allocator) !Report {
 /// Zero the history ring so every slot starts invalid.
 fn zeroRing(ring: *delta.SnapshotRing) void {
     @memset(@as([*]u8, @ptrCast(&ring.slots))[0..@sizeOf(@TypeOf(ring.slots))], 0);
+}
+
+/// A refresh-latency key that names one entity across the four id spaces.
+fn candidateKey(r: wire.DeltaRecord) u64 {
+    return (@as(u64, r.kindByte()) << 32) | r.recordId();
 }
 
 /// How many enemies are inside the interest radius of `centre`.

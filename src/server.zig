@@ -170,10 +170,23 @@ pub const ClientConn = struct {
     acked_tick: std.atomic.Value(u32) = .init(0),
     held_tick: std.atomic.Value(u32) = .init(0),
     /// Where this connection's per-snapshot update budget starts inside the
-    /// in-interest set. Advanced by the number of records each snapshot actually
+    /// candidate set. Advanced by the number of records each snapshot actually
     /// carried, so the entities one snapshot could not afford lead the next.
     /// The simulation thread is its only writer.
     update_rotation: u32 = 0,
+    /// The state this client holds: its own interest-filtered neighbourhood,
+    /// entity for entity. Built from a full snapshot, rebuilt from the history
+    /// ring when the model is corrected, and thereafter changed only by the
+    /// records that actually went out — never by the ones the per-snapshot
+    /// budget deferred, which is what makes the next diff offer them again.
+    ///
+    /// A few hundred kilobytes, because it is sized for the whole world and
+    /// holds only a neighbourhood. The simulation thread is its only writer.
+    held: delta.FilteredWorld = .{},
+    /// The tick `held` describes. Diverging from `held_tick` means the model was
+    /// corrected since the state was built, so the state has to be rebuilt from
+    /// the ring before the next diff. The simulation thread is its only writer.
+    held_tick_content: u32 = 0,
 
     /// Set when the connection must stop: the peer closed, a read or write
     /// failed, or the server decided the connection is unusable. Written by
@@ -526,17 +539,17 @@ pub const Server = struct {
         if (!wanted) return;
 
         // Record the whole world at this tick in the history ring. The slot is
-        // a stable copy, so the per-client diffs below are not disturbed by the
-        // interest-filtered full snapshots, which reuse the sim's scratch.
+        // a stable copy, so it is what a later acknowledgement correction is
+        // rebuilt from, and the interest-filtered snapshots below — which reuse
+        // the sim's scratch — cannot disturb it.
         const view = self.sim.snapshotView();
         self.snapshots.store(view);
-        const current = &self.snapshots.slots[(view.server_tick / root.ticks_per_snapshot) % delta.ring_size];
 
         var frames: [root.max_players]struct { conn: *ClientConn, frame: *Frame } = undefined;
         var n_frames: usize = 0;
         for (self.clients.items) |conn| {
             if (!receivesSnapshots(conn)) continue;
-            if (self.snapshotFrame(conn, current)) |frame| {
+            if (self.snapshotFrame(conn)) |frame| {
                 frames[n_frames] = .{ .conn = conn, .frame = frame };
                 n_frames += 1;
             } else |e| {
@@ -551,55 +564,89 @@ pub const Server = struct {
         }
     }
 
-    /// Encode the one snapshot this connection wants: a delta against the tick
-    /// its client is expected to hold, or a full snapshot of its neighbourhood
-    /// when there is no such baseline the ring still holds.
-    fn snapshotFrame(self: *Server, conn: *ClientConn, current: *const delta.RingSlot) !*Frame {
+    /// Encode the one snapshot this connection wants: a delta against the model
+    /// of what its client holds, or a full snapshot of its neighbourhood when
+    /// there is no usable model.
+    fn snapshotFrame(self: *Server, conn: *ClientConn) !*Frame {
         const centre = self.sim.players[conn.player_id].pos;
         const tick = self.sim.tick;
+        const held = &conn.held;
 
         // Read at the moment of encoding, not at the top of the tick: an ack
         // that landed while the tick was being simulated is exactly the one
         // this frame should be diffed against.
-        var held = conn.held_tick.load(.acquire);
-        if (held > tick) {
+        var model = conn.held_tick.load(.acquire);
+        if (model > tick) {
             // A restart took the server's tick back to zero, so a tick held
             // from the dead run names nothing this client has any more.
-            held = 0;
+            model = 0;
             conn.held_tick.store(0, .release);
         }
-        const baseline = self.snapshots.baseline(held);
 
-        if (baseline) |base| {
-            const d = delta.computeDelta(current, base, centre, root.interest_radius, .{
-                .rotation = conn.update_rotation,
-            }, self.diff_scratch);
-            const bytes = wire.encodeSnapshotDelta(self.gpa, .{
-                .server_tick = tick,
-                .baseline_tick = base.tick,
-                .run_time_ms = self.sim.runTimeMs(),
-                .acked_seq = self.sim.ackedSeq(),
-                .game_state = @intFromEnum(self.sim.state),
-                .spawned = d.spawned,
-                .updated = d.updated,
-                .destroyed = d.destroyed,
-            }) catch |e| return e;
-            // The client moves its one complete state onto a delta it applies,
-            // which is every delta diffed against what it holds.
-            conn.held_tick.store(tick, .release);
-            // Start the next snapshot where this one stopped, so the entities
-            // the budget deferred lead the next window instead of trailing it
-            // forever.
-            conn.update_rotation +%= @intCast(d.updated.len);
-            return frameOrFree(self.gpa, bytes);
+        // Nothing the client is known to hold: a full snapshot is the only
+        // honest answer, and the connection keeps getting them until an
+        // acknowledgement proves the client is holding one.
+        if (model == 0) return self.fullSnapshotFrame(conn, centre, tick);
+
+        // The model names a tick the ring has to still hold. When the model was
+        // corrected since the held state was built — an acknowledgement that
+        // disagreed with it — the state is rebuilt from the ring, so the diff
+        // starts from what the client really has rather than from a guess.
+        if (model != conn.held_tick_content or self.snapshots.baseline(model) == null) {
+            const slot = self.snapshots.baseline(model) orelse {
+                conn.held_tick.store(0, .release);
+                return self.fullSnapshotFrame(conn, centre, tick);
+            };
+            const held_centre = delta.playerPosInSlot(slot, conn.player_id) orelse {
+                conn.held_tick.store(0, .release);
+                return self.fullSnapshotFrame(conn, centre, tick);
+            };
+            held.setFromSlot(slot, held_centre, root.interest_radius);
+            conn.held_tick_content = model;
+            // The candidate set changed wholesale, so the rotation starts over.
+            conn.update_rotation = 0;
         }
 
+        const current = self.sim.snapshotViewFor(centre, root.interest_radius);
+        const d = delta.computeDelta(current, held, .{
+            .rotation = conn.update_rotation,
+        }, self.diff_scratch);
+        const bytes = wire.encodeSnapshotDelta(self.gpa, .{
+            .server_tick = tick,
+            .baseline_tick = model,
+            .run_time_ms = self.sim.runTimeMs(),
+            .acked_seq = self.sim.ackedSeq(),
+            .game_state = @intFromEnum(self.sim.state),
+            .spawned = d.spawned,
+            .updated = d.updated,
+            .destroyed = d.destroyed,
+        }) catch |e| return e;
+
+        // The model moves onto the records that actually went out, and only
+        // those: the budget's deferred updates stay un-applied, so the next diff
+        // still finds them changed and offers them again.
+        held.apply(d);
+        conn.held_tick_content = tick;
+        conn.held_tick.store(tick, .release);
+        // Start the next snapshot where this one stopped, so the entities the
+        // budget deferred lead the next window instead of trailing it forever.
+        conn.update_rotation +%= @intCast(d.updated.len);
+        return frameOrFree(self.gpa, bytes);
+    }
+
+    /// A full snapshot of `conn`'s neighbourhood, which replaces whatever the
+    /// client held outright.
+    ///
+    /// The model tick is deliberately left alone: a client that has not
+    /// acknowledged anything keeps getting full snapshots until it proves it is
+    /// holding one. The state the full snapshot describes *is* recorded, so an
+    /// acknowledgement of this very snapshot finds the model already in place.
+    fn fullSnapshotFrame(self: *Server, conn: *ClientConn, centre: [2]f32, tick: u32) !*Frame {
         const full = self.sim.snapshotViewFor(centre, root.interest_radius);
         const bytes = wire.encodeSnapshotFull(self.gpa, full) catch |e| return e;
-        // A full snapshot replaces the client's state outright. While nothing
-        // has been acknowledged the model stays at zero, so the connection keeps
-        // getting full snapshots until the client has proved it is holding one.
-        if (held != 0) conn.held_tick.store(tick, .release);
+        conn.held.setFromView(full);
+        conn.held_tick_content = tick;
+        conn.update_rotation = 0;
         return frameOrFree(self.gpa, bytes);
     }
 
@@ -814,10 +861,16 @@ fn handleHello(self: *Server, conn: *ClientConn, hello: wire.Hello) void {
     });
 
     // The client has no baseline yet, so this is a full snapshot of its
-    // neighbourhood (PROTOCOL.md: a baseline of 0 gets a full snapshot).
+    // neighbourhood (PROTOCOL.md: a baseline of 0 gets a full snapshot). The
+    // state it describes is recorded as the client's held state, so the
+    // acknowledgement of this very snapshot needs no rebuild from the ring —
+    // and this one is taken outside a broadcast, so the ring may never hold it.
+    const first = self.sim.snapshotViewFor(player.pos, root.interest_radius);
+    conn.held.setFromView(first);
+    conn.held_tick_content = self.sim.tick;
     const snapshot = wire.encodeSnapshotFull(
         self.gpa,
-        self.sim.snapshotViewFor(player.pos, root.interest_radius),
+        first,
     ) catch |e| {
         std.debug.print("[server] snapshot encode failed: {s}\n", .{@errorName(e)});
         markClosed(self, conn);
